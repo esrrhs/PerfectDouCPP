@@ -42,6 +42,7 @@ struct Args {
     uint64_t seed = 1;
     std::string out = "ckpt";
     std::string resume;
+    std::string backend = "auto";  // auto | gpu | cpu
 };
 
 const char* argValue(int argc, char** argv, const char* key, const char* def) {
@@ -74,6 +75,7 @@ void parseArgs(int argc, char** argv, Args& a) {
     a.rewardScale = float(std::atof(argValue(argc, argv, "--reward-scale", "50")));
     a.seed = std::atoll(argValue(argc, argv, "--seed", "1"));
     a.out = argValue(argc, argv, "--out", "ckpt");
+    a.backend = argValue(argc, argv, "--backend", "auto");
     const char* res = argValue(argc, argv, "--resume", "");
     if (*res) a.resume = res;
 }
@@ -85,7 +87,12 @@ int main(int argc, char** argv) {
     parseArgs(argc, argv, args);
     if (args.threads <= 0) args.threads = 1;
 
+    nn::gemmInit();
+    if (args.backend == "cpu") nn::gemmSetGpu(false);
+    if (args.backend == "gpu") nn::gemmSetGpu(true);
     std::cout << "PerfectDou CPP training\n";
+    std::cout << "  GEMM backend: "
+              << (nn::gemmGpuEnabled() ? "GPU (Metal/MPS)" : "CPU") << "\n";
     std::cout << "  updates=" << args.updates << " games/update=" << args.games
               << " threads=" << args.threads << " hidden=" << args.hidden
               << " lstm=" << args.lstmHidden << " lr=" << args.lr

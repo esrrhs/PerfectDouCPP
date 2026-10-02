@@ -6,6 +6,8 @@
 #include <cstring>
 #include <vector>
 
+#include "nn/gemm.h"
+
 namespace nn {
 
 struct Mat {
@@ -22,40 +24,25 @@ struct Mat {
     const float* row(int i) const { return d.data() + size_t(i) * c; }
 };
 
-// C = A * B, shapes [r x k] * [k x c] -> [r x c]. i-k-j loop order for cache
-// friendliness; weights are stored [out x in], so B is often transposed via
-// dedicated helpers in Linear/Lstm.
+// C = A * B, shapes [M x K] * [K x N] -> [M x N].
 inline void matmul(const Mat& A, const Mat& B, Mat& C) {
-    const int r = A.r, k = A.c, c = B.c;
-    C.resize(r, c);
-    std::fill(C.d.begin(), C.d.end(), 0.0f);
-    for (int i = 0; i < r; ++i) {
-        const float* ai = A.row(i);
-        float* ci = C.row(i);
-        for (int t = 0; t < k; ++t) {
-            float a = ai[t];
-            if (a == 0.0f) continue;
-            const float* bt = B.row(t);
-            for (int j = 0; j < c; ++j) ci[j] += a * bt[j];
-        }
-    }
+    const int M = A.r, K = A.c, N = B.c;
+    C.resize(M, N);
+    sgemm('N', 'N', M, N, K, A.d.data(), A.c, B.d.data(), B.c, C.d.data(), C.c);
 }
 
-// C = A * W^T where W is stored [k x out] (its rows are contiguous).
-// Equivalently C[i,t] = dot(A row i, W row t), which vectorizes well.
-inline void matmulWT(const Mat& A, const Mat& W, Mat& C) {
-    const int r = A.r, out = A.c, k = W.r;
-    C.resize(r, k);
-    for (int i = 0; i < r; ++i) {
-        const float* ai = A.row(i);
-        float* ci = C.row(i);
-        for (int t = 0; t < k; ++t) {
-            const float* wt = W.row(t);
-            float s = 0.0f;
-            for (int j = 0; j < out; ++j) s += ai[j] * wt[j];
-            ci[t] = s;
-        }
-    }
+// C = A * B^T, B physical [N x K] -> [M x N].
+inline void matmulABt(const Mat& A, const Mat& B, Mat& C) {
+    const int M = A.r, K = A.c, N = B.r;
+    C.resize(M, N);
+    sgemm('N', 'T', M, N, K, A.d.data(), A.c, B.d.data(), B.c, C.d.data(), C.c);
+}
+
+// C = A^T * B, A physical [M x K], B [M x N] -> [K x N].
+inline void matmulAtB(const Mat& A, const Mat& B, Mat& C) {
+    const int M = A.r, K = A.c, N = B.c;
+    C.resize(K, N);
+    sgemm('T', 'N', K, N, M, A.d.data(), A.c, B.d.data(), B.c, C.d.data(), C.c);
 }
 
 inline void addBiasRows(Mat& X, const std::vector<float>& b) {

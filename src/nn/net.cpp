@@ -50,22 +50,6 @@ void loadParams(FILE* f, const std::vector<Param*>& ps) {
     for (Param* p : ps) loadParam(f, *p);
 }
 
-// C = A^T * B, A [r x ka], B [r x kb] -> [ka x kb], a-i-b order for SIMD.
-void matmulAtB(const Mat& A, const Mat& B, Mat& C) {
-    const int r = A.r, ka = A.c, kb = B.c;
-    C.resize(ka, kb);
-    std::fill(C.d.begin(), C.d.end(), 0.0f);
-    for (int a = 0; a < ka; ++a) {
-        float* ca = C.row(a);
-        for (int i = 0; i < r; ++i) {
-            float va = A.row(i)[a];
-            if (va == 0.0f) continue;
-            const float* bi = B.row(i);
-            for (int b = 0; b < kb; ++b) ca[b] += va * bi[b];
-        }
-    }
-}
-
 }  // namespace
 
 // ---------------------------------------------------------------------------
@@ -105,19 +89,9 @@ void Linear::backward(const Mat& gOut, Mat& gIn) {
     for (size_t i = 0; i < dwTmp.d.size(); ++i) W.dw[i] += dwTmp.d[i];
     for (int i = 0; i < r; ++i)
         for (int q = 0; q < o; ++q) b.dw[q] += gOut.row(i)[q];
-    // gIn = gOut * W, i-q-t order (no horizontal reduction, vectorizes)
+    // gIn = gOut * W, physical W [o x k] -> [r x o] * [o x k]
     gIn.resize(r, k);
-    std::fill(gIn.d.begin(), gIn.d.end(), 0.0f);
-    for (int i = 0; i < r; ++i) {
-        const float* gi = gOut.row(i);
-        float* go = gIn.row(i);
-        for (int q = 0; q < o; ++q) {
-            float g = gi[q];
-            if (g == 0.0f) continue;
-            const float* wq = &W.w[size_t(q) * k];
-            for (int t = 0; t < k; ++t) go[t] += g * wq[t];
-        }
-    }
+    sgemm('N', 'N', r, k, o, gOut.d.data(), o, W.w.data(), k, gIn.d.data(), k);
 }
 
 void Linear::zeroGrad() {
@@ -273,18 +247,9 @@ void Lstm::backward(const Mat& ghAll) {
                 bi.dw[q] += dg.row(ib)[q];
                 bh.dw[q] += dg.row(ib)[q];
             }
-        // recurrent gradient (input gradient is not needed): dg * Wh^T
-        dhTmp.resize(B, h);
-        for (int ib = 0; ib < B; ++ib) {
-            const float* dgb = dg.row(ib);
-            float* ho = dhTmp.row(ib);
-            for (int u = 0; u < h; ++u) {
-                float s = 0.0f;
-                for (int q = 0; q < H; ++q)
-                    s += dgb[q] * Wh.w[size_t(q) * h + u];
-                ho[u] = s;
-            }
-        }
+        // recurrent gradient (input gradient is not needed): dh = dg * Wh
+        sgemm('N', 'N', B, h, H, dg.d.data(), H, Wh.w.data(), h,
+              dhTmp.d.data(), h);
         dhNext = dhTmp;
     }
 }

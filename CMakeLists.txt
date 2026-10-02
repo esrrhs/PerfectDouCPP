@@ -21,11 +21,20 @@ add_library(perfectdou STATIC
   src/ddz/game.cpp
   src/ddz/features.cpp
   src/nn/net.cpp
+  src/nn/gemm_cpu.cpp
   src/algo/rollout.cpp
   src/algo/ppo.cpp
 )
 target_include_directories(perfectdou PUBLIC src)
 target_link_libraries(perfectdou PUBLIC Threads::Threads)
+
+if(APPLE)
+  enable_language(OBJCXX)
+  target_sources(perfectdou PRIVATE src/nn/gemm_mps.mm)
+  target_compile_definitions(perfectdou PUBLIC PD_HAVE_MPS)
+  target_link_libraries(perfectdou PUBLIC
+    "-framework Metal" "-framework MetalPerformanceShaders" "-framework Foundation")
+endif()
 
 add_executable(perfectdou_train src/train.cpp)
 target_link_libraries(perfectdou_train PRIVATE perfectdou)
@@ -38,3 +47,7 @@ add_test(NAME rules COMMAND test_rules)
 add_executable(test_grad tests/test_grad.cpp)
 target_link_libraries(test_grad PRIVATE perfectdou)
 add_test(NAME gradients COMMAND test_grad)
+
+add_executable(test_gemm tests/test_gemm.cpp)
+target_link_libraries(test_gemm PRIVATE perfectdou)
+add_test(NAME gemm COMMAND test_gemm)

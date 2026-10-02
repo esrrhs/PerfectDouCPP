@@ -62,6 +62,10 @@ void runWorker(const ModelSet& models, const RolloutConfig& cfg, int nGames,
     using namespace nn;
     using namespace ddz;
 
+    // Self-play inference stays on CPU: the GPU is reserved for PPO learning,
+    // and many worker threads issuing synchronous GPU encodings serialize.
+    gemmSetThreadGpu(0);
+
     Rng dealRng(seed ^ 0xabcdef123456789ULL);
     Rng sampleRng(seed ^ 0x123456789abcdef0ULL);
 
