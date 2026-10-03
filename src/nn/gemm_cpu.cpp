@@ -36,6 +36,13 @@ thread_local int t_override = -1;  // -1: follow g_enabled, 0/1: explicit
 constexpr long long kGpuMacThreshold = 1000000;
 }  // namespace
 
+#if defined(_WIN32) && (defined(_M_X64) || defined(__x86_64__))
+bool pdAvx2Available();
+void pdAvx2SgemmPanel(int M, int N, int K, const float* A, int lda,
+                      const float* B, int ldb, float* C, int ldc,
+                      bool transA);
+#endif
+
 // K-sequential FMA, matching the GPU kernels. A row of B is applied to a
 // panel of output rows while it is still in L1/registers, and zero entries
 // of A (binary card features) are skipped.
@@ -83,6 +90,13 @@ inline void zeroN(float* c, int n) {
 // the panel. aAt(i,k) reads A in either NN (row i) or TN (column i) layout.
 void sgemmPanel(int M, int N, int K, const float* A, int lda, const float* B,
                 int ldb, float* C, int ldc, bool transA) {
+#if defined(_WIN32) && (defined(_M_X64) || defined(__x86_64__))
+    static const bool haveAvx2 = pdAvx2Available();
+    if (haveAvx2) {
+        pdAvx2SgemmPanel(M, N, K, A, lda, B, ldb, C, ldc, transA);
+        return;
+    }
+#endif
     constexpr int MR = 4;
     for (int i0 = 0; i0 < M; i0 += MR) {
         int mr = std::min(MR, M - i0);

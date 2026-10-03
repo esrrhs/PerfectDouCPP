@@ -40,9 +40,16 @@ if(APPLE)
 endif()
 
 if(WIN32)
-  target_sources(perfectdou PRIVATE src/nn/gemm_d3d.cpp)
+  target_sources(perfectdou PRIVATE src/nn/gemm_d3d.cpp src/nn/gemm_avx2.cpp)
   target_compile_definitions(perfectdou PUBLIC PD_HAVE_D3D)
   target_link_libraries(perfectdou PUBLIC d3d12 dxgi d3dcompiler)
+  if(MSVC)
+    set_source_files_properties(src/nn/gemm_avx2.cpp PROPERTIES
+      COMPILE_OPTIONS "/arch:AVX2")
+  else()
+    set_source_files_properties(src/nn/gemm_avx2.cpp PROPERTIES
+      COMPILE_OPTIONS "-mavx2;-mfma")
+  endif()
 endif()
 
 add_executable(perfectdou_train src/train.cpp)

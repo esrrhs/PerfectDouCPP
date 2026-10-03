@@ -73,7 +73,8 @@ ctest --test-dir build          # 规则测试 + 神经网络数值梯度检查
   同配置 Metal 学习阶段大约慢一倍。
 - Windows：默认使用 Direct3D 12 计算着色器，和 Metal 同一套分块 GEMM、LSTM、Adam。
   多显卡时选择专用显存最大的一块（笔记本上的独显会优先于核显）。`--backend cpu`
-  退回标量 CPU GEMM。自对弈采样仍固定走 CPU，只有 PPO 学习上 GPU。
+  退回 CPU GEMM。x86-64 Windows 使用运行时检测的 AVX2/FMA 推理内核；自对弈采样
+  固定走该 CPU 路径，只有 PPO 学习上 GPU。
 - 数值为 FP32。`tests/test_gemm` 校验 CPU/GPU GEMM，`tests/test_grad` 校验整网梯度。
 - 没有 GPU 时使用 CPU GEMM（Apple 为 Accelerate，ARM 为 NEON，其余为标量）。
 
