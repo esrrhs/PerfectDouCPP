@@ -149,7 +149,7 @@ static void runNet(Actor& actor, Critic& critic, const Mat& xImp,
 
 static int gpuParity() {
     if (!gemmHasGpu()) {
-        std::printf("GPU parity: SKIP (no Metal)\n");
+        std::printf("GPU parity: SKIP (no GPU)\n");
         return 0;
     }
     NetConfig cfg{16, 8};
@@ -276,7 +276,7 @@ static double maxParamFieldDiff(const std::vector<Param*>& a,
 
 static int trainParity() {
     if (!gemmHasGpu()) {
-        std::printf("train parity: SKIP (no Metal)\n");
+        std::printf("train parity: SKIP (no GPU)\n");
         return 0;
     }
     const NetConfig cfg{128, 64};
@@ -379,7 +379,7 @@ static int concurrentParity() {
     // threads (each worker gets a fresh GPU context). Guards against pointer
     // aliasing / stale device-cache bugs across independent models.
     if (!gemmHasGpu()) {
-        std::printf("concurrent parity: SKIP (no Metal)\n");
+        std::printf("concurrent parity: SKIP (no GPU)\n");
         return 0;
     }
     const int seats = 3, rounds = 4, nBatches = 4, epochs = 2;

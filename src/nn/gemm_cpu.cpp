@@ -2,6 +2,7 @@
 #include "nn/gemm.h"
 
 #include <algorithm>
+#include <cstdio>
 #include <vector>
 
 #if defined(__APPLE__)
@@ -12,6 +13,14 @@
 #define PD_HAVE_ACCEL
 #elif defined(__ARM_NEON)
 #include <arm_neon.h>
+#endif
+
+#if defined(PD_HAVE_MPS)
+#define PD_HAVE_GPU 1
+#define PD_BE(fn) mps##fn
+#elif defined(PD_HAVE_D3D)
+#define PD_HAVE_GPU 1
+#define PD_BE(fn) d3d##fn
 #endif
 
 namespace nn {
@@ -121,35 +130,44 @@ void sgemmCpu(char tA, char tB, int M, int N, int K,
 }
 
 // MPS implementation (Apple only), defined in gemm_mps.mm
-#ifdef PD_HAVE_MPS
-void mpsCommitGemms(int count, const GemmOp* ops, long long macs);
-void mpsCustomGemm(const GemmOp& op, const void* bias, size_t biasBytes,
+#ifdef PD_HAVE_GPU
+void PD_BE(CommitGemms)(int count, const GemmOp* ops, long long macs);
+void PD_BE(CustomGemm)(const GemmOp& op, const void* bias, size_t biasBytes,
                    int epi);
-void mpsWait(bool keepWindow);
-void mpsStageInput(const void* p, size_t bytes);
-void mpsPrintStats(const char* tag);
-void mpsMarkHost(const void* p);
-void mpsDropCache(void** slot);
-void* mpsWeightCache(void** slot, const void* host, size_t bytes);
-void* mpsGradCache(void** slot, const void* host, size_t bytes);
-void mpsFlushGrad(void* slot, void* host, size_t bytes);
+void PD_BE(Wait)(bool keepWindow);
+void PD_BE(StageInput)(const void* p, size_t bytes);
+void PD_BE(PrintStats)(const char* tag);
+void PD_BE(MarkHost)(const void* p);
+void PD_BE(DropCache)(void** slot);
+void* PD_BE(WeightCache)(void** slot, const void* host, size_t bytes);
+void* PD_BE(GradCache)(void** slot, const void* host, size_t bytes);
+void PD_BE(FlushGrad)(void* slot, void* host, size_t bytes);
 #endif
 
 void gemmInit() {
+    // The Windows CRT ignores line buffering, and abort() skips the final
+    // flush. Unbuffered logs stay visible if a GPU call fails mid-run.
+    std::setvbuf(stdout, nullptr, _IONBF, 0);
+    std::setvbuf(stderr, nullptr, _IONBF, 0);
 #ifdef PD_HAVE_ACCEL
     // One BLAS thread per caller. The trainer already runs one thread per
     // seat; a BLAS thread pool on top of that just contends for AMX.
     setenv("VECLIB_MAXIMUM_THREADS", "1", /*overwrite=*/0);
 #endif
-#ifdef PD_HAVE_MPS
-    extern bool mpsInit();
-    if (!mpsInit()) g_enabled = false;
+#if defined(PD_HAVE_D3D)
+    // Scalar CPU GEMM is far slower than a local D3D12 GPU, so auto uses it.
+    // Apple stays on Accelerate unless --backend gpu.
+    extern bool d3dInit();
+    g_enabled = d3dInit();
+#elif defined(PD_HAVE_GPU)
+    extern bool PD_BE(Init)();
+    if (!PD_BE(Init)()) g_enabled = false;
 #endif
 }
 bool gemmHasGpu() {
-#ifdef PD_HAVE_MPS
-    extern bool mpsAvailable();
-    return mpsAvailable();
+#ifdef PD_HAVE_GPU
+    extern bool PD_BE(Available)();
+    return PD_BE(Available)();
 #else
     return false;
 #endif
@@ -159,8 +177,18 @@ void gemmSetThreadGpu(int enabled) { t_override = enabled; }
 bool gemmGpuEnabled() {
     return t_override >= 0 ? (t_override != 0) : g_enabled;
 }
+const char* gemmGpuLabel() {
+#if defined(PD_HAVE_D3D)
+    extern const char* d3dLabel();
+    return d3dLabel();
+#elif defined(PD_HAVE_MPS)
+    return "GPU (Metal)";
+#else
+    return "GPU";
+#endif
+}
 bool gpuActive() {
-#ifdef PD_HAVE_MPS
+#ifdef PD_HAVE_GPU
     return gemmGpuEnabled();
 #else
     return false;
@@ -171,12 +199,12 @@ void sgemm(char tA, char tB, int M, int N, int K,
            const float* A, int lda, const float* B, int ldb,
            float* C, int ldc) {
     long long macs = (long long)M * N * K;
-#ifdef PD_HAVE_MPS
+#ifdef PD_HAVE_GPU
     if (gemmGpuEnabled() && macs >= kGpuMacThreshold) {
         GemmOp g{tA, tB, M, N, K, A, lda, B, ldb, C, ldc};
-        mpsCommitGemms(1, &g, macs);
-        mpsMarkHost(C);  // standalone call: result is read on host
-        mpsWait(false);
+        PD_BE(CommitGemms)(1, &g, macs);
+        PD_BE(MarkHost)(C);  // standalone call: result is read on host
+        PD_BE(Wait)(false);
         return;
     }
 #endif
@@ -184,11 +212,11 @@ void sgemm(char tA, char tB, int M, int N, int K,
 }
 
 void gpuGemm(const GemmOp& g, const float* bias, int biasFloats, int epi) {
-#ifdef PD_HAVE_MPS
+#ifdef PD_HAVE_GPU
     if (gemmGpuEnabled()) {
         size_t bbytes = biasFloats
             ? ((size_t(biasFloats) * 4 + 15) & ~size_t(15)) : 0;
-        mpsCustomGemm(g, bias, bbytes, epi);
+        PD_BE(CustomGemm)(g, bias, bbytes, epi);
         return;
     }
 #else
@@ -210,12 +238,12 @@ void gpuCommitGemms(int count, const GemmOp* ops) {
     long long macs = 0;
     for (int i = 0; i < count; ++i)
         macs += (long long)ops[i].M * ops[i].N * ops[i].K;
-#ifdef PD_HAVE_MPS
+#ifdef PD_HAVE_GPU
     // The residency model keeps intermediates on the device, so even tiny
     // products must go through the GPU (a CPU fallback would read stale
     // memory).
     if (gemmGpuEnabled()) {
-        mpsCommitGemms(count, ops, macs);
+        PD_BE(CommitGemms)(count, ops, macs);
         return;
     }
 #endif
@@ -227,48 +255,48 @@ void gpuCommitGemms(int count, const GemmOp* ops) {
 }
 
 void gpuWaitEx(bool keepWindow) {
-#ifdef PD_HAVE_MPS
-    if (gemmGpuEnabled()) mpsWait(keepWindow);
+#ifdef PD_HAVE_GPU
+    if (gemmGpuEnabled()) PD_BE(Wait)(keepWindow);
 #else
     (void)keepWindow;
 #endif
 }
 
 void gpuStageInput(float* p, int floats) {
-#ifdef PD_HAVE_MPS
-    if (gemmGpuEnabled()) mpsStageInput(p, size_t(floats) * 4);
+#ifdef PD_HAVE_GPU
+    if (gemmGpuEnabled()) PD_BE(StageInput)(p, size_t(floats) * 4);
 #else
     (void)p; (void)floats;
 #endif
 }
 
 void gpuPrintStats(const char* tag) {
-#ifdef PD_HAVE_MPS
-    if (gemmGpuEnabled()) mpsPrintStats(tag);
+#ifdef PD_HAVE_GPU
+    if (gemmGpuEnabled()) PD_BE(PrintStats)(tag);
 #else
     (void)tag;
 #endif
 }
 
 void gpuMarkHost(float* p) {
-#ifdef PD_HAVE_MPS
-    if (gemmGpuEnabled()) mpsMarkHost(p);
+#ifdef PD_HAVE_GPU
+    if (gemmGpuEnabled()) PD_BE(MarkHost)(p);
 #else
     (void)p;
 #endif
 }
 
 void gpuDropCache(void** slot) {
-#ifdef PD_HAVE_MPS
-    if (slot != nullptr && *slot != nullptr) mpsDropCache(slot);
+#ifdef PD_HAVE_GPU
+    if (slot != nullptr && *slot != nullptr) PD_BE(DropCache)(slot);
 #else
     (void)slot;
 #endif
 }
 
 void* gpuWeightCache(void** slot, const void* host, size_t bytes) {
-#ifdef PD_HAVE_MPS
-    if (gemmGpuEnabled()) return mpsWeightCache(slot, host, bytes);
+#ifdef PD_HAVE_GPU
+    if (gemmGpuEnabled()) return PD_BE(WeightCache)(slot, host, bytes);
 #else
     (void)slot; (void)host; (void)bytes;
 #endif
@@ -276,8 +304,8 @@ void* gpuWeightCache(void** slot, const void* host, size_t bytes) {
 }
 
 void* gpuGradCache(void** slot, const void* host, size_t bytes) {
-#ifdef PD_HAVE_MPS
-    if (gemmGpuEnabled()) return mpsGradCache(slot, host, bytes);
+#ifdef PD_HAVE_GPU
+    if (gemmGpuEnabled()) return PD_BE(GradCache)(slot, host, bytes);
 #else
     (void)slot; (void)host; (void)bytes;
 #endif
@@ -285,8 +313,8 @@ void* gpuGradCache(void** slot, const void* host, size_t bytes) {
 }
 
 void gpuFlushGrad(void* slot, void* host, size_t bytes) {
-#ifdef PD_HAVE_MPS
-    if (gemmGpuEnabled()) mpsFlushGrad(slot, host, bytes);
+#ifdef PD_HAVE_GPU
+    if (gemmGpuEnabled()) PD_BE(FlushGrad)(slot, host, bytes);
 #else
     (void)slot; (void)host; (void)bytes;
 #endif

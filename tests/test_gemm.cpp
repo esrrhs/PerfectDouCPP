@@ -1,4 +1,4 @@
-// CPU vs GPU GEMM parity (only meaningful on Apple with Metal/MPS).
+// CPU vs GPU GEMM parity (Apple Metal or Windows D3D12).
 #include <cmath>
 #include <cstdio>
 #include <random>
@@ -31,7 +31,8 @@ int main() {
     gemmInit();
     std::printf("GPU available: %s\n", gemmHasGpu() ? "yes" : "no");
     if (!gemmHasGpu()) {
-        std::printf("SKIP (no Metal/MPS)\n");
+        std::printf("SKIP (no GPU)\n");
+        std::fflush(stdout);
         return 0;
     }
     // large enough to exceed the GPU threshold (>=1e6 MACs)
@@ -41,5 +42,6 @@ int main() {
     std::printf("max diff NN=%.2e TN=%.2e NT=%.2e\n", d1, d2, d3);
     bool ok = d1 < 1e-2 && d2 < 1e-2 && d3 < 1e-2;
     std::printf("%s\n", ok ? "GEMM PARITY OK" : "GEMM PARITY FAIL");
+    std::fflush(stdout);
     return ok ? 0 : 1;
 }

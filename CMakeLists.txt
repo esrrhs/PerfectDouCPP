@@ -39,6 +39,12 @@ if(APPLE)
     "-framework Metal" "-framework MetalPerformanceShaders" "-framework Foundation")
 endif()
 
+if(WIN32)
+  target_sources(perfectdou PRIVATE src/nn/gemm_d3d.cpp)
+  target_compile_definitions(perfectdou PUBLIC PD_HAVE_D3D)
+  target_link_libraries(perfectdou PUBLIC d3d12 dxgi d3dcompiler)
+endif()
+
 add_executable(perfectdou_train src/train.cpp)
 target_link_libraries(perfectdou_train PRIVATE perfectdou)
 

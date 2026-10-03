@@ -1,7 +1,7 @@
 // Dispatch wrappers for the elementwise training kernels.
 //
-// GPU entry points are compiled in the Metal backend (Apple); on other
-// platforms identical loops run on the CPU.
+// GPU entry points are compiled in the Metal (Apple) or D3D12 (Windows)
+// backend; on other platforms identical loops run on the CPU.
 #include <cmath>
 #include <vector>
 
@@ -20,41 +20,49 @@
 #define PD_HAVE_ACCEL
 #endif
 
+#if defined(PD_HAVE_MPS)
+#define PD_HAVE_GPU 1
+#define PD_BE(fn) mps##fn
+#elif defined(PD_HAVE_D3D)
+#define PD_HAVE_GPU 1
+#define PD_BE(fn) d3d##fn
+#endif
+
 namespace nn {
 
-#ifdef PD_HAVE_MPS
-void mpsAddBias(Mat& y, const std::vector<float>& b);
-void mpsRelu(Mat& x);
-void mpsReluBwd(const Mat& pre, const Mat& gout, Mat& gin);
-void mpsGateAdd(Mat& gp, const Mat& gi, const Mat& gh,
+#ifdef PD_HAVE_GPU
+void PD_BE(AddBias)(Mat& y, const std::vector<float>& b);
+void PD_BE(Relu)(Mat& x);
+void PD_BE(ReluBwd)(const Mat& pre, const Mat& gout, Mat& gin);
+void PD_BE(GateAdd)(Mat& gp, const Mat& gi, const Mat& gh,
                 const std::vector<float>& bi, const std::vector<float>& bh);
-void mpsLstmCellFwd(const Mat& gp, const float* cp, Mat& hOut, Mat& cOut,
+void PD_BE(LstmCellFwd)(const Mat& gp, const float* cp, Mat& hOut, Mat& cOut,
                     int hidden);
-void mpsLstmCellBwd(const Mat& gh, const Mat& gp, const Mat& cNow,
+void PD_BE(LstmCellBwd)(const Mat& gh, const Mat& gp, const Mat& cNow,
                     const float* cp, Mat& dh, Mat& dc, Mat& dg, int hidden);
-void mpsConcat(Mat& z, const Mat& a, int n1, const Mat& b, int n2);
-void mpsSplit(const Mat& z, int n1, Mat& a, Mat& b, int n2);
-void mpsZeroAndLast(Mat& all, const Mat& gh, int B, int T, int h);
-void mpsMaskDyn(Mat& logits, const Mat& ds, const Mat& mask, int N);
-void mpsAddTo(float* dst, void** gSlot, int dstCols, const Mat& src);
-void mpsBiasGradAdd(const Mat& g, float* db, void** dbSlot);
-void mpsCopyMat(Mat& dst, const Mat& src);
-void mpsAdam(std::vector<float>& w, std::vector<float>& dw,
+void PD_BE(Concat)(Mat& z, const Mat& a, int n1, const Mat& b, int n2);
+void PD_BE(Split)(const Mat& z, int n1, Mat& a, Mat& b, int n2);
+void PD_BE(ZeroAndLast)(Mat& all, const Mat& gh, int B, int T, int h);
+void PD_BE(MaskDyn)(Mat& logits, const Mat& ds, const Mat& mask, int N);
+void PD_BE(AddTo)(float* dst, void** gSlot, int dstCols, const Mat& src);
+void PD_BE(BiasGradAdd)(const Mat& g, float* db, void** dbSlot);
+void PD_BE(CopyMat)(Mat& dst, const Mat& src);
+void PD_BE(Adam)(std::vector<float>& w, std::vector<float>& dw,
              std::vector<float>& m, std::vector<float>& v, int n, float lr,
              float b1, float b2, float eps, float bc1, float bc2);
 #endif
 
 void kAddBias(Mat& y, const std::vector<float>& b) {
-#ifdef PD_HAVE_MPS
-    if (gpuActive()) { mpsAddBias(y, b); return; }
+#ifdef PD_HAVE_GPU
+    if (gpuActive()) { PD_BE(AddBias)(y, b); return; }
 #endif
     for (int i = 0; i < y.r; ++i)
         for (int j = 0; j < y.c; ++j) y.row(i)[j] += b[j];
 }
 
 void kRelu(Mat& x) {
-#ifdef PD_HAVE_MPS
-    if (gpuActive()) { mpsRelu(x); return; }
+#ifdef PD_HAVE_GPU
+    if (gpuActive()) { PD_BE(Relu)(x); return; }
 #endif
     reluFwd(x);
 }
@@ -63,16 +71,16 @@ void kReluBwd(const Mat& pre, const Mat& gout, Mat& gin) {
     // The GPU path encodes asynchronously and never touches the host Mat, so
     // make sure the output storage/layout exists up front.
     gin.resize(pre.r, pre.c);
-#ifdef PD_HAVE_MPS
-    if (gpuActive()) { mpsReluBwd(pre, gout, gin); return; }
+#ifdef PD_HAVE_GPU
+    if (gpuActive()) { PD_BE(ReluBwd)(pre, gout, gin); return; }
 #endif
     reluBwd(pre, gout, gin);
 }
 
 void kGateAdd(Mat& gp, const Mat& gi, const Mat& gh,
               const std::vector<float>& bi, const std::vector<float>& bh) {
-#ifdef PD_HAVE_MPS
-    if (gpuActive()) { mpsGateAdd(gp, gi, gh, bi, bh); return; }
+#ifdef PD_HAVE_GPU
+    if (gpuActive()) { PD_BE(GateAdd)(gp, gi, gh, bi, bh); return; }
 #endif
     for (int i = 0; i < gp.r; ++i)
         for (int q = 0; q < gp.c; ++q)
@@ -85,8 +93,8 @@ inline float sigm(float x) { return 1.0f / (1.0f + std::exp(-x)); }
 
 void kLstmCellFwd(const Mat& gp, const float* cp, Mat& hOut, Mat& cOut,
                   int h, Mat* gates, Mat* tanhC) {
-#ifdef PD_HAVE_MPS
-    if (gpuActive()) { mpsLstmCellFwd(gp, cp, hOut, cOut, h); return; }
+#ifdef PD_HAVE_GPU
+    if (gpuActive()) { PD_BE(LstmCellFwd)(gp, cp, hOut, cOut, h); return; }
 #endif
 #ifdef PD_HAVE_ACCEL
     // vForce exp/tanh over the whole step. Saved gates let backward skip this.
@@ -168,8 +176,8 @@ void kLstmCellFwd(const Mat& gp, const float* cp, Mat& hOut, Mat& cOut,
 void kLstmCellBwd(const Mat& gh, const Mat& gp, const Mat& cNow,
                   const float* cp, Mat& dh, Mat& dc, Mat& dg, int h,
                   const Mat* gates, const Mat* tanhC) {
-#ifdef PD_HAVE_MPS
-    if (gpuActive()) { mpsLstmCellBwd(gh, gp, cNow, cp, dh, dc, dg, h); return; }
+#ifdef PD_HAVE_GPU
+    if (gpuActive()) { PD_BE(LstmCellBwd)(gh, gp, cNow, cp, dh, dc, dg, h); return; }
 #endif
     if (gates && tanhC) {
         for (int b = 0; b < gp.r; ++b) {
@@ -255,8 +263,8 @@ void kLstmCellBwd(const Mat& gh, const Mat& gp, const Mat& cNow,
 }
 
 void kConcat(Mat& z, const Mat& a, int n1, const Mat& b, int n2) {
-#ifdef PD_HAVE_MPS
-    if (gpuActive()) { mpsConcat(z, a, n1, b, n2); return; }
+#ifdef PD_HAVE_GPU
+    if (gpuActive()) { PD_BE(Concat)(z, a, n1, b, n2); return; }
 #endif
     for (int i = 0; i < z.r; ++i) {
         std::copy(a.row(i), a.row(i) + n1, z.row(i));
@@ -265,8 +273,8 @@ void kConcat(Mat& z, const Mat& a, int n1, const Mat& b, int n2) {
 }
 
 void kSplit(const Mat& z, int n1, Mat& a, Mat& b, int n2) {
-#ifdef PD_HAVE_MPS
-    if (gpuActive()) { mpsSplit(z, n1, a, b, n2); return; }
+#ifdef PD_HAVE_GPU
+    if (gpuActive()) { PD_BE(Split)(z, n1, a, b, n2); return; }
 #endif
     for (int i = 0; i < z.r; ++i) {
         std::copy(z.row(i), z.row(i) + n1, a.row(i));
@@ -275,8 +283,8 @@ void kSplit(const Mat& z, int n1, Mat& a, Mat& b, int n2) {
 }
 
 void kZeroAndLast(Mat& all, const Mat& gh, int B, int T, int h) {
-#ifdef PD_HAVE_MPS
-    if (gpuActive()) { mpsZeroAndLast(all, gh, B, T, h); return; }
+#ifdef PD_HAVE_GPU
+    if (gpuActive()) { PD_BE(ZeroAndLast)(all, gh, B, T, h); return; }
 #endif
     std::fill(all.d.begin(), all.d.end(), 0.0f);
     for (int i = 0; i < B; ++i)
@@ -284,8 +292,8 @@ void kZeroAndLast(Mat& all, const Mat& gh, int B, int T, int h) {
 }
 
 void kMaskDyn(Mat& logits, const Mat& ds, const Mat& mask, int N) {
-#ifdef PD_HAVE_MPS
-    if (gpuActive()) { mpsMaskDyn(logits, ds, mask, N); return; }
+#ifdef PD_HAVE_GPU
+    if (gpuActive()) { PD_BE(MaskDyn)(logits, ds, mask, N); return; }
 #endif
     for (int i = 0; i < logits.r; ++i)
         for (int a = 0; a < N; ++a) {
@@ -297,8 +305,8 @@ void kMaskDyn(Mat& logits, const Mat& ds, const Mat& mask, int N) {
 }
 
 void kAddTo(float* dst, void** gSlot, int dstCols, const Mat& src) {
-#ifdef PD_HAVE_MPS
-    if (gpuActive()) { mpsAddTo(dst, gSlot, dstCols, src); return; }
+#ifdef PD_HAVE_GPU
+    if (gpuActive()) { PD_BE(AddTo)(dst, gSlot, dstCols, src); return; }
 #else
     (void)gSlot;
 #endif
@@ -315,8 +323,8 @@ void kAddTo(float* dst, void** gSlot, int dstCols, const Mat& src) {
 }
 
 void kBiasGradAdd(const Mat& g, float* db, void** dbSlot) {
-#ifdef PD_HAVE_MPS
-    if (gpuActive()) { mpsBiasGradAdd(g, db, dbSlot); return; }
+#ifdef PD_HAVE_GPU
+    if (gpuActive()) { PD_BE(BiasGradAdd)(g, db, dbSlot); return; }
 #else
     (void)dbSlot;
 #endif
@@ -344,26 +352,26 @@ void kCopy(float* dst, int dstStride, const float* src, int srcStride,
 }
 
 void kSlice(Mat& dst, const Mat& src, int off, int h) {
-#ifdef PD_HAVE_MPS
-    extern void mpsSlice(Mat& dst, const Mat& src, int off, int h);
-    if (gpuActive()) { mpsSlice(dst, src, off, h); return; }
+#ifdef PD_HAVE_GPU
+    extern void PD_BE(Slice)(Mat& dst, const Mat& src, int off, int h);
+    if (gpuActive()) { PD_BE(Slice)(dst, src, off, h); return; }
 #endif
     for (int i = 0; i < src.r; ++i)
         std::copy(src.row(i) + off, src.row(i) + off + h, dst.row(i));
 }
 
 void kFlatten(Mat& dst, const Mat& src, int N) {
-#ifdef PD_HAVE_MPS
-    extern void mpsFlatten(Mat& dst, const Mat& src, int N);
-    if (gpuActive()) { mpsFlatten(dst, src, N); return; }
+#ifdef PD_HAVE_GPU
+    extern void PD_BE(Flatten)(Mat& dst, const Mat& src, int N);
+    if (gpuActive()) { PD_BE(Flatten)(dst, src, N); return; }
 #endif
     for (int i = 0; i < src.r; ++i)
         for (int a = 0; a < N; ++a) dst.row(i * N + a)[0] = src.row(i)[a];
 }
 
 void kCopyMat(Mat& dst, const Mat& src) {
-#ifdef PD_HAVE_MPS
-    if (gpuActive()) { mpsCopyMat(dst, src); return; }
+#ifdef PD_HAVE_GPU
+    if (gpuActive()) { PD_BE(CopyMat)(dst, src); return; }
 #endif
     for (int i = 0; i < src.r; ++i)
         std::copy(src.row(i), src.row(i) + src.c, dst.row(i));
@@ -372,9 +380,9 @@ void kCopyMat(Mat& dst, const Mat& src) {
 void kAdam(std::vector<float>& w, std::vector<float>& dw,
            std::vector<float>& m, std::vector<float>& v, int n, float lr,
            float beta1, float beta2, float eps, float bc1, float bc2) {
-#ifdef PD_HAVE_MPS
+#ifdef PD_HAVE_GPU
     if (gpuActive()) {
-        mpsAdam(w, dw, m, v, n, lr, beta1, beta2, eps, bc1, bc2);
+        PD_BE(Adam)(w, dw, m, v, n, lr, beta1, beta2, eps, bc1, bc2);
         return;
     }
 #endif

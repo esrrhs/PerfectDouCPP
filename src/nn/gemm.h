@@ -10,7 +10,9 @@
 // count when matrices are padded).
 //
 // On Apple platforms a Metal implementation (in-house GEMM + compute kernels)
-// is compiled in. The learning graph uses a streaming model: gpuCommitGemms()
+// is compiled in. On Windows the same stream is implemented with Direct3D 12
+// compute shaders (gemm_d3d.cpp); discrete GPUs copy host memory explicitly.
+// The learning graph uses a streaming model: gpuCommitGemms()
 // / the elementwise kernel
 // wrappers encode work onto one per-thread command queue WITHOUT blocking,
 // and gpuWait() fences only at the few points where the host has to read
@@ -24,6 +26,7 @@ void gemmInit();                       // initialize GPU backend (if present)
 bool gemmHasGpu();
 void gemmSetGpu(bool enabled);         // process-wide default
 bool gemmGpuEnabled();
+const char* gemmGpuLabel();            // "GPU (Metal)" / "GPU (D3D12: ...)"
 void gemmSetThreadGpu(int enabled);    // per-thread override (-1 = follow default)
 
 void sgemm(char transA, char transB, int M, int N, int K,

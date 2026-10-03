@@ -11,10 +11,12 @@
 //   perfectdou_train --updates 200 --games 256 --threads 8 --out ckpt
 #include <algorithm>
 #include <chrono>
+#include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
+#include <mutex>
 #include <string>
 #include <thread>
 
@@ -91,7 +93,7 @@ int main(int argc, char** argv) {
     if (args.backend == "cpu") nn::gemmSetGpu(false);
     if (args.backend == "gpu") nn::gemmSetGpu(true);
     std::cout << "PerfectDou CPP training\n";
-    const char* backend = nn::gemmGpuEnabled() ? "GPU (Metal)" :
+    const char* backend = nn::gemmGpuEnabled() ? nn::gemmGpuLabel() :
 #ifdef __APPLE__
                           "CPU (Accelerate)";
 #else
@@ -138,6 +140,49 @@ int main(int argc, char** argv) {
     // warm up the shared (read-only) oracle DP table before spawning workers
     ddz::minSteps(ddz::CardSet::parse("34567"));
 
+    // One GPU context per seat for the whole run. Destroying a D3D12 compute
+    // queue takes several seconds on this driver, and a queue cannot be
+    // handed to another thread, so the learners stay alive across updates.
+    const int nLearn = std::getenv("PD_ONE_LEARNER") ? 1 : 3;
+    struct SeatJob {
+        std::mutex mu;
+        std::condition_variable cv;
+        int generation = 0;
+        int done = 0;
+        int upd = 0;
+        bool stop = false;
+    } job;
+    std::array<std::vector<algo::Transition>, 3> streams;
+    std::array<algo::PPOStats, 3> ps;
+    std::vector<std::thread> learners;
+    for (int s = 0; s < nLearn; ++s) {
+        learners.emplace_back([&, s] {
+            int seen = 0;
+            while (true) {
+                int upd = 0;
+                {
+                    std::unique_lock<std::mutex> lock(job.mu);
+                    job.cv.wait(lock, [&] {
+                        return job.stop || job.generation > seen;
+                    });
+                    if (job.stop && job.generation == seen) return;
+                    upd = job.upd;
+                    seen = job.generation;
+                }
+                nn::Rng64 ur(args.seed * 100000 + upd * 31 + s);
+                algo::ppoUpdate(actor[s], critic[s], streams[s], ppo, aOpt[s],
+                                cOpt[s], ur, ps[s]);
+                actor[s].prepareInference();
+                critic[s].prepareInference();
+                {
+                    std::lock_guard<std::mutex> lock(job.mu);
+                    ++job.done;
+                }
+                job.cv.notify_all();
+            }
+        });
+    }
+
     for (int upd = 1; upd <= args.updates; ++upd) {
         auto t0 = std::chrono::steady_clock::now();
         algo::ModelSet models{{&actor[0], &actor[1], &actor[2]},
@@ -148,7 +193,6 @@ int main(int argc, char** argv) {
         rc.rewardScale = args.rewardScale;
         rc.seed = args.seed + uint64_t(upd) * 7919ULL;
 
-        std::array<std::vector<algo::Transition>, 3> streams;
         algo::RolloutStats rs;
         algo::collectRollout(models, rc, streams, rs);
 
@@ -157,19 +201,16 @@ int main(int argc, char** argv) {
                               .count();
         auto t1 = std::chrono::steady_clock::now();
 
-        std::array<algo::PPOStats, 3> ps;
-        // The three seat models are independent: update them in parallel.
-        std::vector<std::thread> learners;
-        for (int s = 0; s < (getenv("PD_ONE_LEARNER") ? 1 : 3); ++s) {
-            learners.emplace_back([&, s] {
-                nn::Rng64 ur(args.seed * 100000 + upd * 31 + s);
-                algo::ppoUpdate(actor[s], critic[s], streams[s], ppo, aOpt[s],
-                                cOpt[s], ur, ps[s]);
-                actor[s].prepareInference();
-                critic[s].prepareInference();
-            });
+        {
+            std::lock_guard<std::mutex> lock(job.mu);
+            job.upd = upd;
+            ++job.generation;
         }
-        for (auto& th : learners) th.join();
+        job.cv.notify_all();
+        {
+            std::unique_lock<std::mutex> lock(job.mu);
+            job.cv.wait(lock, [&] { return job.done == job.generation * nLearn; });
+        }
 
         double learnSecs = std::chrono::duration<double>(
                                std::chrono::steady_clock::now() - t1)
@@ -195,6 +236,13 @@ int main(int argc, char** argv) {
         }
         // bound memory: nothing needed (oracle memo is per rollout worker)
     }
+
+    {
+        std::lock_guard<std::mutex> lock(job.mu);
+        job.stop = true;
+    }
+    job.cv.notify_all();
+    for (auto& th : learners) th.join();
 
     saveAll(args.out);
     std::cout << "models saved to " << args.out << "/\n";
