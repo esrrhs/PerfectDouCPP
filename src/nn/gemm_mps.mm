@@ -1,9 +1,11 @@
 // Metal backend: resident GEMM + compute-kernel stream.
 //
-// * Dense products run on an in-house tiled Metal GEMM kernel (see
-//   gemm_tiled). MPSMatrixMultiplication was evaluated and rejected because
-//   it silently returned wrong results / NaNs when chained inside the
-//   residency windows.
+// * Dense products run on in-house tiled Metal GEMM kernels (see gemm_block,
+//   gemm_blockn and gemm_tiled), dispatched by shape: register-blocked
+//   32x32 for tall-M products, 16x32 for short-M/wide-N products, and the
+//   scalar 16x16 kernel for small tiles with long K. MPSMatrixMultiplication
+//   was evaluated and rejected because it silently returned wrong results /
+//   NaNs when chained inside the residency windows.
 // * Model weights and gradients keep their device buffer in a cache slot
 //   owned by the host Param/Mat, so its lifetime can never alias freed or
 //   reused host storage. All other intermediates live in per-fence residency
@@ -289,6 +291,205 @@ kernel void gemm_tiled(device const float* A, device const float* B,
             v = v > 0.0f ? v : 0.0f;
         }
         C[row * p.ldc + col] = v;
+    }
+}
+
+// Register-blocked fp32 GEMM. One threadgroup owns a BM x BN output tile;
+// each of the 8x8 threads accumulates MR x NR outputs in registers while K is
+// streamed through threadgroup memory in BK slices. Compared with the scalar
+// 16x16 kernel this halves threadgroup traffic per MAC, vectorizes the
+// epilogue and keeps many more threads resident; optional fused bias+ReLU.
+constant constexpr int GEMM_BM = 32;
+constant constexpr int GEMM_BN = 32;
+constant constexpr int GEMM_BK = 16;
+constant constexpr int GEMM_BW = 8;              // threads per tile dimension
+constant constexpr int GEMM_MR = GEMM_BM / GEMM_BW;  // 4 rows/thread
+constant constexpr int GEMM_NR = GEMM_BN / GEMM_BW;  // 4 cols/thread
+kernel void gemm_block(device const float* A, device const float* B,
+                       device float* C, constant const float* bias,
+                       constant GemmP& p,
+                       uint2 tpos [[thread_position_in_threadgroup]],
+                       uint2 gpos [[threadgroup_position_in_grid]]) {
+    threadgroup float As[GEMM_BM][GEMM_BK];
+    threadgroup float Bs[GEMM_BK][GEMM_BN];
+    float acc[GEMM_MR][GEMM_NR];
+    #pragma unroll
+    for (int a = 0; a < GEMM_MR; ++a)
+        #pragma unroll
+        for (int b = 0; b < GEMM_NR; ++b) acc[a][b] = 0.0f;
+
+    const uint i0 = gpos.y * GEMM_BM;
+    const uint j0 = gpos.x * GEMM_BN;
+    const uint tr = tpos.y, tc = tpos.x;
+    const uint tid = tr * GEMM_BW + tc;  // 0..63
+    const uint nLoadsA = (GEMM_BM * GEMM_BK) / 64;  // 8
+    const uint nLoadsB = (GEMM_BK * GEMM_BN) / 64;  // 8
+
+    for (int k0 = 0; k0 < p.K; k0 += GEMM_BK) {
+        #pragma unroll
+        for (uint q = 0; q < nLoadsA; ++q) {
+            uint idx = tid + 64u * q;
+            uint r = idx / GEMM_BK, c = idx % GEMM_BK;
+            uint ar = i0 + r, ak = uint(k0) + c;
+            float v = 0.0f;
+            if (ar < uint(p.M) && ak < uint(p.K))
+                v = (p.tA == 0) ? A[ar * p.lda + ak]
+                                : A[ak * p.lda + ar];
+            As[r][c] = v;
+        }
+        #pragma unroll
+        for (uint q = 0; q < nLoadsB; ++q) {
+            uint idx = tid + 64u * q;
+            uint r = idx / GEMM_BN, c = idx % GEMM_BN;
+            uint bk = uint(k0) + r, bj = j0 + c;
+            float v = 0.0f;
+            if (bk < uint(p.K) && bj < uint(p.N))
+                v = (p.tB == 0) ? B[bk * p.ldb + bj]
+                                : B[bj * p.ldb + bk];
+            Bs[r][c] = v;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        #pragma unroll
+        for (int z = 0; z < GEMM_BK; ++z) {
+            float av[GEMM_MR];
+            #pragma unroll
+            for (int a = 0; a < GEMM_MR; ++a) av[a] = As[tr * GEMM_MR + a][z];
+            #pragma unroll
+            for (int a = 0; a < GEMM_MR; ++a)
+                #pragma unroll
+                for (int b = 0; b < GEMM_NR; ++b)
+                    acc[a][b] += av[a] * Bs[z][tc * GEMM_NR + b];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    #pragma unroll
+    for (int a = 0; a < GEMM_MR; ++a) {
+        uint row = i0 + tr * GEMM_MR + a;
+        if (row >= uint(p.M)) continue;
+        uint col = j0 + tc * GEMM_NR;
+        device float* cp = C + row * p.ldc + col;
+        if (p.epi == 0) {
+            if (col + GEMM_NR <= uint(p.N)) {
+                cp[0] = acc[a][0]; cp[1] = acc[a][1];
+                cp[2] = acc[a][2]; cp[3] = acc[a][3];
+            } else {
+                #pragma unroll
+                for (int b = 0; b < GEMM_NR; ++b)
+                    if (col + b < uint(p.N)) cp[b] = acc[a][b];
+            }
+        } else {
+            constant const float* bp = bias + col;
+            if (col + GEMM_NR <= uint(p.N)) {
+                #pragma unroll
+                for (int b = 0; b < GEMM_NR; ++b) {
+                    float v = acc[a][b] + bp[b];
+                    cp[b] = v > 0.0f ? v : 0.0f;
+                }
+            } else {
+                #pragma unroll
+                for (int b = 0; b < GEMM_NR; ++b)
+                    if (col + b < uint(p.N)) {
+                        float v = acc[a][b] + bp[b];
+                        cp[b] = v > 0.0f ? v : 0.0f;
+                    }
+            }
+        }
+    }
+}
+
+// Narrow variant of gemm_block for short-M products (small batch LSTM GEMMs):
+// 16x32 output tile, 8x8 threads, 2x4 outputs/thread. More threadgroups in M
+// keep the GPU busy where the 32x32 tile would launch too few groups.
+constant constexpr int GEMM_NM = 16;
+constant constexpr int GEMM_NN2 = 32;
+constant constexpr int GEMM_NK = 16;
+constant constexpr int GEMM_NW = 8;
+constant constexpr int GEMM_NMR = GEMM_NM / GEMM_NW;  // 2
+constant constexpr int GEMM_NNR = GEMM_NN2 / GEMM_NW; // 4
+kernel void gemm_blockn(device const float* A, device const float* B,
+                        device float* C, constant const float* bias,
+                        constant GemmP& p,
+                        uint2 tpos [[thread_position_in_threadgroup]],
+                        uint2 gpos [[threadgroup_position_in_grid]]) {
+    threadgroup float As[GEMM_NM][GEMM_NK];
+    threadgroup float Bs[GEMM_NK][GEMM_NN2];
+    float acc[GEMM_NMR][GEMM_NNR];
+    #pragma unroll
+    for (int a = 0; a < GEMM_NMR; ++a)
+        #pragma unroll
+        for (int b = 0; b < GEMM_NNR; ++b) acc[a][b] = 0.0f;
+
+    const uint i0 = gpos.y * GEMM_NM;
+    const uint j0 = gpos.x * GEMM_NN2;
+    const uint tr = tpos.y, tc = tpos.x;
+    const uint tid = tr * GEMM_NW + tc;  // 0..63
+    const uint nLoadsA = (GEMM_NM * GEMM_NK) / 64;  // 4
+    const uint nLoadsB = (GEMM_NK * GEMM_NN2) / 64; // 8
+
+    for (int k0 = 0; k0 < p.K; k0 += GEMM_NK) {
+        #pragma unroll
+        for (uint q = 0; q < nLoadsA; ++q) {
+            uint idx = tid + 64u * q;
+            uint r = idx / GEMM_NK, c = idx % GEMM_NK;
+            uint ar = i0 + r, ak = uint(k0) + c;
+            float v = 0.0f;
+            if (ar < uint(p.M) && ak < uint(p.K))
+                v = (p.tA == 0) ? A[ar * p.lda + ak]
+                                : A[ak * p.lda + ar];
+            As[r][c] = v;
+        }
+        #pragma unroll
+        for (uint q = 0; q < nLoadsB; ++q) {
+            uint idx = tid + 64u * q;
+            uint r = idx / GEMM_NN2, c = idx % GEMM_NN2;
+            uint bk = uint(k0) + r, bj = j0 + c;
+            float v = 0.0f;
+            if (bk < uint(p.K) && bj < uint(p.N))
+                v = (p.tB == 0) ? B[bk * p.ldb + bj]
+                                : B[bj * p.ldb + bk];
+            Bs[r][c] = v;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        #pragma unroll
+        for (int z = 0; z < GEMM_NK; ++z) {
+            float av[GEMM_NMR];
+            #pragma unroll
+            for (int a = 0; a < GEMM_NMR; ++a)
+                av[a] = As[tr * GEMM_NMR + a][z];
+            #pragma unroll
+            for (int a = 0; a < GEMM_NMR; ++a)
+                #pragma unroll
+                for (int b = 0; b < GEMM_NNR; ++b)
+                    acc[a][b] += av[a] * Bs[z][tc * GEMM_NNR + b];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    #pragma unroll
+    for (int a = 0; a < GEMM_NMR; ++a) {
+        uint row = i0 + tr * GEMM_NMR + a;
+        if (row >= uint(p.M)) continue;
+        uint col = j0 + tc * GEMM_NNR;
+        device float* cp = C + row * p.ldc + col;
+        if (p.epi == 0) {
+            if (col + GEMM_NNR <= uint(p.N)) {
+                #pragma unroll
+                for (int b = 0; b < GEMM_NNR; ++b) cp[b] = acc[a][b];
+            } else {
+                #pragma unroll
+                for (int b = 0; b < GEMM_NNR; ++b)
+                    if (col + b < uint(p.N)) cp[b] = acc[a][b];
+            }
+        } else {
+            constant const float* bp = bias + col;
+            #pragma unroll
+            for (int b = 0; b < GEMM_NNR; ++b)
+                if (col + b < uint(p.N)) {
+                    float v = acc[a][b] + bp[b];
+                    cp[b] = v > 0.0f ? v : 0.0f;
+                }
+        }
     }
 }
 
@@ -691,6 +892,10 @@ struct GParam {
     int M, N, K, lda, ldb, ldc, tA, tB, epi;
 };
 
+// Must match the gemm_block / gemm_blockn MSL constants.
+static constexpr int GB_M = 32, GB_N = 32, GB_W = 8;
+static constexpr int GB_NM = 16, GB_NN = 32;
+
 // Custom tiled GEMM (one compute dispatch) with fused bias+relu epilogue.
 void mpsCustomGemm(const GemmOp& g, const void* biasV, size_t biasBytes,
                    int epi) {
@@ -713,13 +918,42 @@ void mpsCustomGemm(const GemmOp& g, const void* biasV, size_t biasBytes,
     GParam p{g.M, g.N, g.K, g.lda, g.ldb, g.ldc,
              g.transA == 'T' ? 1 : 0, g.transB == 'T' ? 1 : 0, epi};
     id<MTLComputeCommandEncoder> en = [cx.cb computeCommandEncoder];
-    [en setComputePipelineState:pipeline(@"gemm_tiled")];
+    // Kernel selection (override with PD_GEMM_OLD / PD_GEMM_FORCE):
+    //  gemm_block  (32x32, 4x4 outputs/thread) wins on tall-M / big tiles;
+    //  gemm_blockn (16x32, 2x4) wins on short-M products where 32x32 would
+    //  launch too few threadgroups to hide the K-loop latency;
+    //  gemm_tiled  (16x16 scalar) retained for degenerate shapes.
+    int variant;  // 0=block, 1=blockn, 2=tiled
+    if (getenv("PD_GEMM_OLD")) variant = 2;
+    else if (getenv("PD_GEMM_FORCE"))
+        variant = atoi(getenv("PD_GEMM_FORCE"));
+    else if (g.M >= 192)
+        variant = 0;                 // tall M: 32x32 register block wins
+    else if (g.N >= 512)
+        variant = 1;                 // short M, wide N: 16x32 block wins
+    else
+        variant = 2;                 // small tiles / long K: scalar 16x16
+                                     // launches enough groups to hide latency
+    NSString* names[3] = {@"gemm_block", @"gemm_blockn", @"gemm_tiled"};
+    [en setComputePipelineState:pipeline(names[variant])];
     for (NSUInteger i = 0; i < 4; ++i)
         [en setBuffer:bufs[i]->buf offset:bufs[i]->off atIndex:i];
     [en setBytes:&p length:sizeof(p) atIndex:4];
-    NSUInteger gx = (g.N + 15) / 16, gy = (g.M + 15) / 16;
-    [en dispatchThreadgroups:MTLSizeMake(gx, gy, 1)
-              threadsPerThreadgroup:MTLSizeMake(16, 16, 1)];
+    if (variant == 0) {
+        NSUInteger gx = (g.N + GB_N - 1) / GB_N;
+        NSUInteger gy = (g.M + GB_M - 1) / GB_M;
+        [en dispatchThreadgroups:MTLSizeMake(gx, gy, 1)
+                  threadsPerThreadgroup:MTLSizeMake(GB_W, GB_W, 1)];
+    } else if (variant == 1) {
+        NSUInteger gx = (g.N + GB_NN - 1) / GB_NN;
+        NSUInteger gy = (g.M + GB_NM - 1) / GB_NM;
+        [en dispatchThreadgroups:MTLSizeMake(gx, gy, 1)
+                  threadsPerThreadgroup:MTLSizeMake(GB_W, GB_W, 1)];
+    } else {
+        NSUInteger gx = (g.N + 15) / 16, gy = (g.M + 15) / 16;
+        [en dispatchThreadgroups:MTLSizeMake(gx, gy, 1)
+                  threadsPerThreadgroup:MTLSizeMake(16, 16, 1)];
+    }
     [en endEncoding];
     cx.enc = nil;
     ++cx.nCommit;
