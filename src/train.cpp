@@ -92,7 +92,7 @@ int main(int argc, char** argv) {
     if (args.backend == "gpu") nn::gemmSetGpu(true);
     std::cout << "PerfectDou CPP training\n";
     std::cout << "  GEMM backend: "
-              << (nn::gemmGpuEnabled() ? "GPU (Metal/MPS)" : "CPU") << "\n";
+              << (nn::gemmGpuEnabled() ? "GPU (Metal)" : "CPU") << "\n";
     std::cout << "  updates=" << args.updates << " games/update=" << args.games
               << " threads=" << args.threads << " hidden=" << args.hidden
               << " lstm=" << args.lstmHidden << " lr=" << args.lr
@@ -154,7 +154,7 @@ int main(int argc, char** argv) {
         std::array<algo::PPOStats, 3> ps;
         // The three seat models are independent: update them in parallel.
         std::vector<std::thread> learners;
-        for (int s = 0; s < 3; ++s) {
+        for (int s = 0; s < (getenv("PD_ONE_LEARNER") ? 1 : 3); ++s) {
             learners.emplace_back([&, s] {
                 nn::Rng64 ur(args.seed * 100000 + upd * 31 + s);
                 algo::ppoUpdate(actor[s], critic[s], streams[s], ppo, aOpt[s],

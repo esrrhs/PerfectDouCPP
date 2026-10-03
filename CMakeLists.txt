@@ -22,6 +22,7 @@ add_library(perfectdou STATIC
   src/ddz/features.cpp
   src/nn/net.cpp
   src/nn/gemm_cpu.cpp
+  src/nn/kernels.cpp
   src/algo/rollout.cpp
   src/algo/ppo.cpp
 )
@@ -31,6 +32,7 @@ target_link_libraries(perfectdou PUBLIC Threads::Threads)
 if(APPLE)
   enable_language(OBJCXX)
   target_sources(perfectdou PRIVATE src/nn/gemm_mps.mm)
+  set_source_files_properties(src/nn/gemm_mps.mm PROPERTIES COMPILE_FLAGS "-fobjc-arc")
   target_compile_definitions(perfectdou PUBLIC PD_HAVE_MPS)
   target_link_libraries(perfectdou PUBLIC
     "-framework Metal" "-framework MetalPerformanceShaders" "-framework Foundation")

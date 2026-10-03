@@ -1,0 +1,231 @@
+// Dispatch wrappers for the elementwise training kernels.
+//
+// GPU entry points are compiled in the Metal backend (Apple); on other
+// platforms identical loops run on the CPU.
+#include <cmath>
+
+#include "nn/gemm.h"
+#include "nn/kernels.h"
+
+namespace nn {
+
+#ifdef PD_HAVE_MPS
+void mpsAddBias(Mat& y, const std::vector<float>& b);
+void mpsRelu(Mat& x);
+void mpsReluBwd(const Mat& pre, const Mat& gout, Mat& gin);
+void mpsGateAdd(Mat& gp, const Mat& gi, const Mat& gh,
+                const std::vector<float>& bi, const std::vector<float>& bh);
+void mpsLstmCellFwd(const Mat& gp, const float* cp, Mat& hOut, Mat& cOut,
+                    int hidden);
+void mpsLstmCellBwd(const Mat& gh, const Mat& gp, const Mat& cNow,
+                    const float* cp, Mat& dh, Mat& dc, Mat& dg, int hidden);
+void mpsConcat(Mat& z, const Mat& a, int n1, const Mat& b, int n2);
+void mpsSplit(const Mat& z, int n1, Mat& a, Mat& b, int n2);
+void mpsZeroAndLast(Mat& all, const Mat& gh, int B, int T, int h);
+void mpsMaskDyn(Mat& logits, const Mat& ds, const Mat& mask, int N);
+void mpsAddTo(float* dst, void** gSlot, int dstCols, const Mat& src);
+void mpsBiasGradAdd(const Mat& g, float* db, void** dbSlot);
+void mpsCopyMat(Mat& dst, const Mat& src);
+void mpsAdam(std::vector<float>& w, std::vector<float>& dw,
+             std::vector<float>& m, std::vector<float>& v, int n, float lr,
+             float b1, float b2, float eps, float bc1, float bc2);
+#endif
+
+void kAddBias(Mat& y, const std::vector<float>& b) {
+#ifdef PD_HAVE_MPS
+    if (gpuActive()) { mpsAddBias(y, b); return; }
+#endif
+    for (int i = 0; i < y.r; ++i)
+        for (int j = 0; j < y.c; ++j) y.row(i)[j] += b[j];
+}
+
+void kRelu(Mat& x) {
+#ifdef PD_HAVE_MPS
+    if (gpuActive()) { mpsRelu(x); return; }
+#endif
+    reluFwd(x);
+}
+
+void kReluBwd(const Mat& pre, const Mat& gout, Mat& gin) {
+    // The GPU path encodes asynchronously and never touches the host Mat, so
+    // make sure the output storage/layout exists up front.
+    gin.resize(pre.r, pre.c);
+#ifdef PD_HAVE_MPS
+    if (gpuActive()) { mpsReluBwd(pre, gout, gin); return; }
+#endif
+    reluBwd(pre, gout, gin);
+}
+
+void kGateAdd(Mat& gp, const Mat& gi, const Mat& gh,
+              const std::vector<float>& bi, const std::vector<float>& bh) {
+#ifdef PD_HAVE_MPS
+    if (gpuActive()) { mpsGateAdd(gp, gi, gh, bi, bh); return; }
+#endif
+    for (int i = 0; i < gp.r; ++i)
+        for (int q = 0; q < gp.c; ++q)
+            gp.row(i)[q] = gi.row(i)[q] + gh.row(i)[q] + bi[q] + bh[q];
+}
+
+namespace {
+inline float sigm(float x) { return 1.0f / (1.0f + std::exp(-x)); }
+}
+
+void kLstmCellFwd(const Mat& gp, const float* cp, Mat& hOut, Mat& cOut,
+                  int h) {
+#ifdef PD_HAVE_MPS
+    if (gpuActive()) { mpsLstmCellFwd(gp, cp, hOut, cOut, h); return; }
+#endif
+    for (int b = 0; b < gp.r; ++b) {
+        for (int u = 0; u < h; ++u) {
+            float iv = sigm(gp.row(b)[u]);
+            float fv = sigm(gp.row(b)[h + u]);
+            float gv = std::tanh(gp.row(b)[2 * h + u]);
+            float ov = sigm(gp.row(b)[3 * h + u]);
+            float pc = cp ? cp[b * h + u] : 0.0f;
+            float cc = fv * pc + iv * gv;
+            cOut.row(b)[u] = cc;
+            hOut.row(b)[u] = ov * std::tanh(cc);
+        }
+    }
+}
+
+void kLstmCellBwd(const Mat& gh, const Mat& gp, const Mat& cNow,
+                  const float* cp, Mat& dh, Mat& dc, Mat& dg, int h) {
+#ifdef PD_HAVE_MPS
+    if (gpuActive()) { mpsLstmCellBwd(gh, gp, cNow, cp, dh, dc, dg, h); return; }
+#endif
+    for (int b = 0; b < gp.r; ++b) {
+        for (int u = 0; u < h; ++u) {
+            float tc = std::tanh(cNow.row(b)[u]);
+            float iv = sigm(gp.row(b)[u]);
+            float fv = sigm(gp.row(b)[h + u]);
+            float gv = std::tanh(gp.row(b)[2 * h + u]);
+            float ov = sigm(gp.row(b)[3 * h + u]);
+            float dhn = gh.row(b)[u] + dh.row(b)[u];
+            float pc = cp ? cp[b * h + u] : 0.0f;
+            float dct = dhn * ov * (1.0f - tc * tc) + dc.row(b)[u];
+            dg.row(b)[u] = dct * gv * iv * (1.0f - iv);
+            dg.row(b)[h + u] = dct * pc * fv * (1.0f - fv);
+            dg.row(b)[2 * h + u] = dct * iv * (1.0f - gv * gv);
+            dg.row(b)[3 * h + u] = dhn * tc * ov * (1.0f - ov);
+            dc.row(b)[u] = dct * fv;
+        }
+    }
+}
+
+void kConcat(Mat& z, const Mat& a, int n1, const Mat& b, int n2) {
+#ifdef PD_HAVE_MPS
+    if (gpuActive()) { mpsConcat(z, a, n1, b, n2); return; }
+#endif
+    for (int i = 0; i < z.r; ++i) {
+        std::copy(a.row(i), a.row(i) + n1, z.row(i));
+        std::copy(b.row(i), b.row(i) + n2, z.row(i) + n1);
+    }
+}
+
+void kSplit(const Mat& z, int n1, Mat& a, Mat& b, int n2) {
+#ifdef PD_HAVE_MPS
+    if (gpuActive()) { mpsSplit(z, n1, a, b, n2); return; }
+#endif
+    for (int i = 0; i < z.r; ++i) {
+        std::copy(z.row(i), z.row(i) + n1, a.row(i));
+        std::copy(z.row(i) + n1, z.row(i) + n1 + n2, b.row(i));
+    }
+}
+
+void kZeroAndLast(Mat& all, const Mat& gh, int B, int T, int h) {
+#ifdef PD_HAVE_MPS
+    if (gpuActive()) { mpsZeroAndLast(all, gh, B, T, h); return; }
+#endif
+    std::fill(all.d.begin(), all.d.end(), 0.0f);
+    for (int i = 0; i < B; ++i)
+        std::copy(gh.row(i), gh.row(i) + h, all.row((T - 1) * B + i));
+}
+
+void kMaskDyn(Mat& logits, const Mat& ds, const Mat& mask, int N) {
+#ifdef PD_HAVE_MPS
+    if (gpuActive()) { mpsMaskDyn(logits, ds, mask, N); return; }
+#endif
+    for (int i = 0; i < logits.r; ++i)
+        for (int a = 0; a < N; ++a) {
+            if (mask.row(i)[a] > 0.5f)
+                logits.row(i)[a] += ds.row(i * N + a)[0];
+            else
+                logits.row(i)[a] = -1e9f;
+        }
+}
+
+void kAddTo(float* dst, void** gSlot, int dstCols, const Mat& src) {
+#ifdef PD_HAVE_MPS
+    if (gpuActive()) { mpsAddTo(dst, gSlot, dstCols, src); return; }
+#else
+    (void)gSlot;
+#endif
+    for (int i = 0; i < src.r; ++i)
+        for (int j = 0; j < src.c; ++j) dst[i * dstCols + j] += src.row(i)[j];
+}
+
+void kBiasGradAdd(const Mat& g, float* db, void** dbSlot) {
+#ifdef PD_HAVE_MPS
+    if (gpuActive()) { mpsBiasGradAdd(g, db, dbSlot); return; }
+#else
+    (void)dbSlot;
+#endif
+    for (int i = 0; i < g.r; ++i)
+        for (int j = 0; j < g.c; ++j) db[j] += g.row(i)[j];
+}
+
+void kCopy(float* dst, int dstStride, const float* src, int srcStride,
+           int rows, int cols) {
+    for (int i = 0; i < rows; ++i)
+        std::copy(src + size_t(i) * srcStride,
+                  src + size_t(i) * srcStride + cols,
+                  dst + size_t(i) * dstStride);
+}
+
+void kSlice(Mat& dst, const Mat& src, int off, int h) {
+#ifdef PD_HAVE_MPS
+    extern void mpsSlice(Mat& dst, const Mat& src, int off, int h);
+    if (gpuActive()) { mpsSlice(dst, src, off, h); return; }
+#endif
+    for (int i = 0; i < src.r; ++i)
+        std::copy(src.row(i) + off, src.row(i) + off + h, dst.row(i));
+}
+
+void kFlatten(Mat& dst, const Mat& src, int N) {
+#ifdef PD_HAVE_MPS
+    extern void mpsFlatten(Mat& dst, const Mat& src, int N);
+    if (gpuActive()) { mpsFlatten(dst, src, N); return; }
+#endif
+    for (int i = 0; i < src.r; ++i)
+        for (int a = 0; a < N; ++a) dst.row(i * N + a)[0] = src.row(i)[a];
+}
+
+void kCopyMat(Mat& dst, const Mat& src) {
+#ifdef PD_HAVE_MPS
+    if (gpuActive()) { mpsCopyMat(dst, src); return; }
+#endif
+    for (int i = 0; i < src.r; ++i)
+        std::copy(src.row(i), src.row(i) + src.c, dst.row(i));
+}
+
+void kAdam(std::vector<float>& w, std::vector<float>& dw,
+           std::vector<float>& m, std::vector<float>& v, int n, float lr,
+           float beta1, float beta2, float eps, float bc1, float bc2) {
+#ifdef PD_HAVE_MPS
+    if (gpuActive()) {
+        mpsAdam(w, dw, m, v, n, lr, beta1, beta2, eps, bc1, bc2);
+        return;
+    }
+#endif
+    for (int i = 0; i < n; ++i) {
+        float g = dw[i];
+        float mh = (beta1 * m[i] + (1.0f - beta1) * g) / bc1;
+        float vh = (beta2 * v[i] + (1.0f - beta2) * g * g) / bc2;
+        m[i] = beta1 * m[i] + (1.0f - beta1) * g;
+        v[i] = beta2 * v[i] + (1.0f - beta2) * g * g;
+        w[i] -= lr * mh / (std::sqrt(vh) + eps);
+    }
+}
+
+}  // namespace nn

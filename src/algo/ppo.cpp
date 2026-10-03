@@ -90,6 +90,8 @@ void ppoUpdate(nn::Actor& actor, nn::Critic& critic,
 
             // ---- actor ----
             nn::Mat& logits = actor.forward(xImp, seq, mask, dynFeat);
+            nn::gpuMarkHost(logits.data());
+            nn::gpuWaitEx(true);  // flush logits; keep fwd binds for backward
             nn::Mat dLogits(B, nn::kNumActions);
             std::fill(dLogits.d.begin(), dLogits.d.end(), 0.0f);
             for (int i = 0; i < B; ++i) {
@@ -135,6 +137,8 @@ void ppoUpdate(nn::Actor& actor, nn::Critic& critic,
 
             // ---- critic ----
             nn::Mat& values = critic.forward(xImp, seq, extra);
+            nn::gpuMarkHost(values.data());
+            nn::gpuWaitEx(true);  // flush values; binds stay for backward
             nn::Mat dValue(B, 1);
             for (int i = 0; i < B; ++i) {
                 float err = values.row(i)[0] - mb[i]->ret;
@@ -142,12 +146,20 @@ void ppoUpdate(nn::Actor& actor, nn::Critic& critic,
                 dValue.row(i)[0] = cfg.vfCoef * err / float(N);
             }
             critic.backward(dValue);
+            // Fence before this iteration's host buffers (dLogits, inputs) go
+            // out of scope and the next minibatch overwrites them.
+            nn::gpuWait();
             ++mbCount;
         }
     }
 
     actorOpt.applyGradNorm(actor.params(), cfg.maxGradNorm);
     criticOpt.applyGradNorm(critic.params(), cfg.maxGradNorm);
+    // Weights changed on the device; drop their cached device copies (the
+    // transposed wt Mats drop theirs in prepareInference via resize).
+    for (nn::Param* p : actor.params()) nn::gpuDropCache(&p->devW);
+    for (nn::Param* p : critic.params()) nn::gpuDropCache(&p->devW);
+    nn::gpuPrintStats("ppo-update");
 
     double samples = double(N) * cfg.epochs;
     stats.pgLoss = -pgLossSum / samples;

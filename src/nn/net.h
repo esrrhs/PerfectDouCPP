@@ -21,20 +21,38 @@ constexpr int kNumActions = 621;
 constexpr int kActionDyn = 7;
 
 struct Param {
-    std::vector<float> w;   // values
+    std::vector<float> w;   // values (storage rounded up to 4 floats)
     std::vector<float> dw;  // gradients
     std::vector<float> m;   // Adam first moment
     std::vector<float> v;   // Adam second moment
     int rows = 0, cols = 0;
+    // Opaque persistent device caches (weight copy / gradient accumulator),
+    // owned here so they die exactly when the parameter does.
+    mutable void* devW = nullptr;
+    mutable void* devG = nullptr;
+
+    Param() = default;
+    Param(const Param&) : w(), dw(), m(), v() {}  // caches never copied
+    Param& operator=(const Param& o) {
+        w = o.w; dw = o.dw; m = o.m; v = o.v;
+        rows = o.rows; cols = o.cols;
+        return *this;
+    }
+    ~Param();
+
     void init(int r, int c) {
         rows = r;
         cols = c;
-        w.assign(size_t(r) * c, 0.0f);
-        dw.assign(w.size(), 0.0f);
-        m.assign(w.size(), 0.0f);
-        v.assign(w.size(), 0.0f);
+        size_t cap = size_t(padStride(r * c));  // 16-byte aligned allocation
+        gpuDropCache(&devW);
+        gpuDropCache(&devG);
+        w.assign(cap, 0.0f);
+        dw.assign(cap, 0.0f);
+        m.assign(cap, 0.0f);
+        v.assign(cap, 0.0f);
     }
-    void zeroGrad() { std::fill(dw.begin(), dw.end(), 0.0f); }
+    int size() const { return rows * cols; }
+    void zeroGrad();
 };
 
 class Rng64 {
@@ -59,10 +77,13 @@ struct Linear {
     Param W, b;
     Mat inCache;
     Mat outCache;
-    Mat wt;  // transposed W [in x out], rebuilt for fast forward passes
+    Mat wt;     // transposed W [in x out], rebuilt for fast forward passes
+    Mat dwTmp;  // persistent dW workspace
     void init(int in, int out, Rng64& rng);
     void buildWT();
     const Mat& forward(const Mat& x);
+    // Forward fused with bias add + ReLU (training graph).
+    const Mat& forwardAct(const Mat& x);
     void backward(const Mat& gOut, Mat& gIn);
     void zeroGrad();
     void save(FILE* f) const;
@@ -85,13 +106,16 @@ struct Lstm {
     Mat statesH;      // (T+1)*B x h, index (t*B+ib)
     Mat statesC;      // T*B x h
     Mat outCache;     // B*T x h
+    std::vector<Mat> gateICache;  // T reusable input-gate results
+    std::vector<Mat> gwCache;     // T reusable dWi products
+    // backward workspaces
+    Mat dgAll, ghGate, ghRec, dhBuf[2], dcBuf, dgNow, gwh;
+    Mat hlLast;  // last hidden state (forward, persistent for GPU lifetime)
 
     void init(int inputSize, int hiddenSize, Rng64& rng);
     void buildWT();
     // x: B*T rows of length n, time-major (t = row / B)
     const Mat& forward(const Mat& x, int batch, int steps);
-    // copies the hidden state of the LAST time step into out (B x h)
-    void lastHidden(Mat& out) const;
     // ghAll: B*T x h (gradients for every output, may be all zero except
     // last time). Input gradients are discarded.
     void backward(const Mat& ghAll);
@@ -115,7 +139,9 @@ struct Actor {
     Linear l1, l2, l3, l4, head, dyn;
 
     // forward caches
-    Mat z, f1, f2, f3, feat, logits, dynScore;
+    Mat z, f1, f2, f3, feat, logits, gDs;
+    // backward caches (kept as members so GPU encodes outlive function scope)
+    Mat gFeat, gF3, gP3, gF2, gP2, gF1, gP1, gZ, ghLast, ghAll, gDynFeat;
 
     void init(const NetConfig& c, uint64_t seed);
     void prepareInference();  // rebuild transposed weights after an optimizer step
@@ -140,6 +166,9 @@ struct Critic {
     Linear c1, c2, out;     // concat -> hidden -> hidden -> 1
 
     Mat z, f1, f2, imp, pf1, pe, cat, q1, q2, value;
+    // backward caches (persistent for GPU encodes)
+    Mat gQ2, gP2, gQ1, gQ0, gCat, gImp, gPe, gPf1, gPf0, gExtra;
+    Mat giF2, giP3, giF1, giP1, giZ, ghLast, ghAll;
 
     void init(const NetConfig& c, uint64_t seed);
     void prepareInference();
@@ -161,6 +190,7 @@ struct LstmInfer {
     Mat hp, cp; // previous h / c
     Mat hc, cc; // current h / c
     Mat hl;     // last hidden B x h
+    std::vector<Mat> giAll;  // T reusable input-gate results
 };
 void lstmInferForward(const Lstm& l, const Mat& x, int B, int T, LstmInfer& w);
 
