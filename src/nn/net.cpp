@@ -175,19 +175,15 @@ const Mat& Lstm::forward(const Mat& x, int batch, int steps) {
     std::fill(statesH.d.begin(), statesH.d.end(), 0.0f);
     std::fill(statesC.d.begin(), statesC.d.end(), 0.0f);
 
-    // Input-gate products for all steps in one GEMM batch. Per-step matrices
-    // keep the exact (B x n) @ (n x 4h) shape as a step-by-step evaluation.
-    gateICache.resize(T);
-    std::vector<GemmOp> giOps(T);
-    for (int t = 0; t < T; ++t) {
-        gateICache[t].resize(B, H);
-        giOps[t] = GemmOp{'N', 'N', B, H, n,
-                          xCache.data() + size_t(t) * B * xCache.s, xCache.s,
-                          wTi.data(), wTi.s,
-                          gateICache[t].data(), gateICache[t].s};
-        giOps[t].wSlot = const_cast<void**>(&wTi.devCache);
-    }
-    gpuCommitGemms(T, giOps.data());
+    // Input-gate products for all steps in a single batched GEMM: (B*T x n) @ (n x 4h) -> (B*T x 4h).
+    gateIAll.resize(B * T, H);
+    GemmOp giOp{'N', 'N', B * T, H, n,
+                xCache.data(), xCache.s,
+                wTi.data(), wTi.s,
+                gateIAll.data(), gateIAll.s};
+    giOp.wSlot = const_cast<void**>(&wTi.devCache);
+    gpuGemm(giOp, nullptr, 0, 0);
+
     ghGate.resize(B, H);
     for (int t = 0; t < T; ++t) {
         Mat hPrev = viewRows(statesH, t * B, B);
@@ -196,7 +192,8 @@ const Mat& Lstm::forward(const Mat& x, int batch, int steps) {
                  wTh.data(), wTh.s, ghGate.data(), ghGate.s};
         g.wSlot = const_cast<void**>(&wTh.devCache);
         gpuGemm(g, nullptr, 0, 0);
-        kGateAdd(gp, gateICache[t], ghGate, bi.w, bh.w);
+        Mat gi = viewRows(gateIAll, t * B, B);
+        kGateAdd(gp, gi, ghGate, bi.w, bh.w);
 
         Mat cNow = viewRows(statesC, t * B, B);
         Mat hNext = viewRows(statesH, (t + 1) * B, B);
@@ -328,9 +325,25 @@ Mat& Actor::forward(const Mat& xImp, const Mat& seq, const Mat& mask,
 void Actor::backward(const Mat& dLogits) {
     int B = dLogits.r;
     // dynamic action head (gradient w.r.t. its dense input is discarded)
-    gDs.resize(B * kNumActions, 1);
-    kFlatten(gDs, dLogits, kNumActions);
-    dyn.backward(gDs, gDynFeat);
+    // dLogits is on host; dyn.inCache is dynFeat on host.
+    // Illegal actions have dLogits == 0, so computing this on CPU is instantaneous
+    // and eliminates two massive GPU GEMMs (1x7x158976 and 158976x7x1).
+    float db = 0.0f;
+    float dw[kActionDyn] = {0.0f};
+    for (int i = 0; i < B; ++i) {
+        const float* dl_row = dLogits.row(i);
+        for (int a = 0; a < kNumActions; ++a) {
+            float g = dl_row[a];
+            if (g == 0.0f) continue;
+            db += g;
+            const float* f = dyn.inCache.row(i * kNumActions + a);
+            for (int k = 0; k < kActionDyn; ++k) {
+                dw[k] += g * f[k];
+            }
+        }
+    }
+    for (int k = 0; k < kActionDyn; ++k) dyn.W.dw[k] += dw[k];
+    dyn.b.dw[0] += db;
 
     head.backward(dLogits, gFeat);
     l4.backward(gFeat, gF3);

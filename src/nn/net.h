@@ -105,9 +105,10 @@ struct Lstm {
     Mat gpre;         // B*T x 4h
     Mat statesH;      // (T+1)*B x h, index (t*B+ib)
     Mat statesC;      // T*B x h
-    Mat outCache;     // B*T x h
-    std::vector<Mat> gateICache;  // T reusable input-gate results
+    Mat outCache;                 // B*T x h
+    Mat gateIAll;                 // B*T x 4h batched input-gate result
     std::vector<Mat> gwCache;     // T reusable dWi products
+    Mat dwWhTmp, dwWiTmp;         // batched dWh and dWi products
     // backward workspaces
     Mat dgAll, ghGate, ghRec, dhBuf[2], dcBuf, dgNow, gwh;
     Mat hlLast;  // last hidden state (forward, persistent for GPU lifetime)

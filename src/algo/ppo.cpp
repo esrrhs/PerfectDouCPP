@@ -88,10 +88,15 @@ void ppoUpdate(nn::Actor& actor, nn::Critic& critic,
             nn::Mat xImp, seq, mask, dynFeat, extra;
             buildBatch(mb, xImp, seq, mask, dynFeat, extra);
 
-            // ---- actor ----
+            // ---- forward passes (actor & critic back-to-back in single command buffer) ----
             nn::Mat& logits = actor.forward(xImp, seq, mask, dynFeat);
+            nn::Mat& values = critic.forward(xImp, seq, extra);
             nn::gpuMarkHost(logits.data());
-            nn::gpuWaitEx(true);  // flush logits; keep fwd binds for backward
+            nn::gpuMarkHost(values.data());
+            nn::gpuWaitEx(true);  // flush logits & values; keep fwd binds for backward
+
+            // ---- loss gradients on host ----
+            auto tal0 = std::chrono::steady_clock::now();
             nn::Mat dLogits(B, nn::kNumActions);
             std::fill(dLogits.d.begin(), dLogits.d.end(), 0.0f);
             for (int i = 0; i < B; ++i) {
@@ -111,16 +116,11 @@ void ppoUpdate(nn::Actor& actor, nn::Critic& critic,
                     if (probs[a] > 1e-12f) entropy -= probs[a] * std::log(probs[a]);
                 entSum += entropy;
 
-                // We minimize -surrogate + (no entropy in the policy term).
-                // dLoss/dratio is -g in the interior and 0 when clipped.
                 float g;
                 if (l1 <= l2)
-                    g = ratio * s;  // interior: gradient flows
+                    g = ratio * s;
                 else
-                    g = 0.0f;       // clipped region
-                // softmax backprop: the policy term behaves like
-                // L = -s*log p_act, so prob-space upstream v is -s/p_act on
-                // the chosen action and 0 elsewhere (Σ p v = -s).
+                    g = 0.0f;
                 float scale = 1.0f / float(N);
                 float pa = probs[act];
                 float sumW = g * scale +
@@ -133,18 +133,16 @@ void ppoUpdate(nn::Actor& actor, nn::Critic& critic,
                     dLogits.row(i)[a] = probs[a] * (W - sumW);
                 }
             }
-            actor.backward(dLogits);
 
-            // ---- critic ----
-            nn::Mat& values = critic.forward(xImp, seq, extra);
-            nn::gpuMarkHost(values.data());
-            nn::gpuWaitEx(true);  // flush values; binds stay for backward
             nn::Mat dValue(B, 1);
             for (int i = 0; i < B; ++i) {
                 float err = values.row(i)[0] - mb[i]->ret;
                 vLossSum += 0.5 * err * err;
                 dValue.row(i)[0] = cfg.vfCoef * err / float(N);
             }
+
+            // ---- backward passes (actor & critic back-to-back in single command buffer) ----
+            actor.backward(dLogits);
             critic.backward(dValue);
             // Fence before this iteration's host buffers (dLogits, inputs) go
             // out of scope and the next minibatch overwrites them.

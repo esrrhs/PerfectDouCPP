@@ -310,8 +310,8 @@ kernel void gemm_block(device const float* A, device const float* B,
                        constant GemmP& p,
                        uint2 tpos [[thread_position_in_threadgroup]],
                        uint2 gpos [[threadgroup_position_in_grid]]) {
-    threadgroup float As[GEMM_BM][GEMM_BK];
-    threadgroup float Bs[GEMM_BK][GEMM_BN];
+    threadgroup float As[GEMM_BM][GEMM_BK + 1];
+    threadgroup float Bs[GEMM_BK][GEMM_BN + 1];
     float acc[GEMM_MR][GEMM_NR];
     #pragma unroll
     for (int a = 0; a < GEMM_MR; ++a)
@@ -354,11 +354,14 @@ kernel void gemm_block(device const float* A, device const float* B,
             float av[GEMM_MR];
             #pragma unroll
             for (int a = 0; a < GEMM_MR; ++a) av[a] = As[tr * GEMM_MR + a][z];
+            float bv[GEMM_NR];
+            #pragma unroll
+            for (int b = 0; b < GEMM_NR; ++b) bv[b] = Bs[z][tc * GEMM_NR + b];
             #pragma unroll
             for (int a = 0; a < GEMM_MR; ++a)
                 #pragma unroll
                 for (int b = 0; b < GEMM_NR; ++b)
-                    acc[a][b] += av[a] * Bs[z][tc * GEMM_NR + b];
+                    acc[a][b] += av[a] * bv[b];
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
@@ -412,8 +415,8 @@ kernel void gemm_blockn(device const float* A, device const float* B,
                         constant GemmP& p,
                         uint2 tpos [[thread_position_in_threadgroup]],
                         uint2 gpos [[threadgroup_position_in_grid]]) {
-    threadgroup float As[GEMM_NM][GEMM_NK];
-    threadgroup float Bs[GEMM_NK][GEMM_NN2];
+    threadgroup float As[GEMM_NM][GEMM_NK + 1];
+    threadgroup float Bs[GEMM_NK][GEMM_NN2 + 1];
     float acc[GEMM_NMR][GEMM_NNR];
     #pragma unroll
     for (int a = 0; a < GEMM_NMR; ++a)
@@ -457,11 +460,15 @@ kernel void gemm_blockn(device const float* A, device const float* B,
             #pragma unroll
             for (int a = 0; a < GEMM_NMR; ++a)
                 av[a] = As[tr * GEMM_NMR + a][z];
+            float bv[GEMM_NNR];
+            #pragma unroll
+            for (int b = 0; b < GEMM_NNR; ++b)
+                bv[b] = Bs[z][tc * GEMM_NNR + b];
             #pragma unroll
             for (int a = 0; a < GEMM_NMR; ++a)
                 #pragma unroll
                 for (int b = 0; b < GEMM_NNR; ++b)
-                    acc[a][b] += av[a] * Bs[z][tc * GEMM_NNR + b];
+                    acc[a][b] += av[a] * bv[b];
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
