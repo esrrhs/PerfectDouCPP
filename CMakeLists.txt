@@ -30,6 +30,7 @@ target_include_directories(perfectdou PUBLIC src)
 target_link_libraries(perfectdou PUBLIC Threads::Threads)
 
 if(APPLE)
+  target_link_libraries(perfectdou PUBLIC "-framework Accelerate")
   enable_language(OBJCXX)
   target_sources(perfectdou PRIVATE src/nn/gemm_mps.mm)
   set_source_files_properties(src/nn/gemm_mps.mm PROPERTIES COMPILE_FLAGS "-fobjc-arc")

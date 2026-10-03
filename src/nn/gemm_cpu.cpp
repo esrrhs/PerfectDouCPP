@@ -2,16 +2,24 @@
 #include "nn/gemm.h"
 
 #include <algorithm>
+#include <vector>
+
+#if defined(__APPLE__)
+#ifndef ACCELERATE_NEW_LAPACK
+#define ACCELERATE_NEW_LAPACK
+#endif
+#include <Accelerate/Accelerate.h>
+#define PD_HAVE_ACCEL
+#elif defined(__ARM_NEON)
+#include <arm_neon.h>
+#endif
 
 namespace nn {
 
 namespace {
-bool g_enabled =
-#ifdef PD_HAVE_MPS
-    true;
-#else
-    false;
-#endif
+// Accelerate/AMX beats the Metal GEMM kernels on the training shapes, so the
+// default backend is CPU. --backend gpu still opts into Metal.
+bool g_enabled = false;
 thread_local int t_override = -1;  // -1: follow g_enabled, 0/1: explicit
 
 // Above this MAC count the GPU is used; below it, launch/sync overhead would
@@ -19,38 +27,97 @@ thread_local int t_override = -1;  // -1: follow g_enabled, 0/1: explicit
 constexpr long long kGpuMacThreshold = 1000000;
 }  // namespace
 
+// K-sequential FMA, matching the GPU kernels. A row of B is applied to a
+// panel of output rows while it is still in L1/registers, and zero entries
+// of A (binary card features) are skipped.
+#if defined(__ARM_NEON)
+inline void saxpy(float* __restrict__ c, const float* __restrict__ b, float a,
+                  int n) {
+    float32x4_t va = vdupq_n_f32(a);
+    int j = 0;
+    for (; j + 16 <= n; j += 16) {
+        float32x4_t c0 = vld1q_f32(c + j);
+        float32x4_t c1 = vld1q_f32(c + j + 4);
+        float32x4_t c2 = vld1q_f32(c + j + 8);
+        float32x4_t c3 = vld1q_f32(c + j + 12);
+        c0 = vfmaq_f32(c0, va, vld1q_f32(b + j));
+        c1 = vfmaq_f32(c1, va, vld1q_f32(b + j + 4));
+        c2 = vfmaq_f32(c2, va, vld1q_f32(b + j + 8));
+        c3 = vfmaq_f32(c3, va, vld1q_f32(b + j + 12));
+        vst1q_f32(c + j, c0);
+        vst1q_f32(c + j + 4, c1);
+        vst1q_f32(c + j + 8, c2);
+        vst1q_f32(c + j + 12, c3);
+    }
+    for (; j + 4 <= n; j += 4) {
+        float32x4_t cv = vfmaq_f32(vld1q_f32(c + j), va, vld1q_f32(b + j));
+        vst1q_f32(c + j, cv);
+    }
+    for (; j < n; ++j) c[j] += a * b[j];
+}
+inline void zeroN(float* c, int n) {
+    int j = 0;
+    float32x4_t z = vdupq_n_f32(0.0f);
+    for (; j + 4 <= n; j += 4) vst1q_f32(c + j, z);
+    for (; j < n; ++j) c[j] = 0.0f;
+}
+#else
+inline void saxpy(float* c, const float* b, float a, int n) {
+    for (int j = 0; j < n; ++j) c[j] += a * b[j];
+}
+inline void zeroN(float* c, int n) {
+    for (int j = 0; j < n; ++j) c[j] = 0.0f;
+}
+#endif
+
+// C[i,:] += A_panel[i,k] * Brow[k,:], k outer so each B row is reused across
+// the panel. aAt(i,k) reads A in either NN (row i) or TN (column i) layout.
+void sgemmPanel(int M, int N, int K, const float* A, int lda, const float* B,
+                int ldb, float* C, int ldc, bool transA) {
+    constexpr int MR = 4;
+    for (int i0 = 0; i0 < M; i0 += MR) {
+        int mr = std::min(MR, M - i0);
+        for (int i = 0; i < mr; ++i) zeroN(C + size_t(i0 + i) * ldc, N);
+        for (int k = 0; k < K; ++k) {
+            float a[MR];
+            bool any = false;
+            for (int i = 0; i < mr; ++i) {
+                a[i] = transA ? A[size_t(k) * lda + (i0 + i)]
+                              : A[size_t(i0 + i) * lda + k];
+                any = any || a[i] != 0.0f;
+            }
+            if (!any) continue;
+            const float* bk = B + size_t(k) * ldb;
+            for (int i = 0; i < mr; ++i)
+                if (a[i] != 0.0f)
+                    saxpy(C + size_t(i0 + i) * ldc, bk, a[i], N);
+        }
+    }
+}
+
 void sgemmCpu(char tA, char tB, int M, int N, int K,
               const float* A, int lda, const float* B, int ldb,
               float* C, int ldc) {
-    if (tA == 'N' && tB == 'N') {
-        // i-k-j: contiguous inner loops, auto-vectorizes
-        for (int i = 0; i < M; ++i)
-            for (int j = 0; j < N; ++j) C[size_t(i) * ldc + j] = 0.0f;
-        for (int i = 0; i < M; ++i) {
-            const float* ai = A + size_t(i) * lda;
-            float* ci = C + size_t(i) * ldc;
-            for (int t = 0; t < K; ++t) {
-                float a = ai[t];
-                if (a == 0.0f) continue;
-                const float* bt = B + size_t(t) * ldb;
-                for (int j = 0; j < N; ++j) ci[j] += a * bt[j];
-            }
+#ifdef PD_HAVE_ACCEL
+    // Apple AMX. Far above the hand-written NEON kernel on every training
+    // shape (about 1–1.6 TFLOP/s vs ~40 GFLOP/s). beta = 0 overwrites C.
+    cblas_sgemm(CblasRowMajor,
+                tA == 'T' ? CblasTrans : CblasNoTrans,
+                tB == 'T' ? CblasTrans : CblasNoTrans,
+                M, N, K, 1.0f, A, lda, B, ldb, 0.0f, C, ldc);
+#else
+    if (tB == 'T') {
+        thread_local std::vector<float> pack;
+        pack.resize(size_t(K) * N);
+        for (int j = 0; j < N; ++j) {
+            const float* src = B + size_t(j) * ldb;
+            for (int k = 0; k < K; ++k) pack[size_t(k) * N + j] = src[k];
         }
+        sgemmPanel(M, N, K, A, lda, pack.data(), N, C, ldc, tA == 'T');
         return;
     }
-    // transposed cases (only small products reach CPU): plain dot products
-    auto aAt = [&](int i, int t) {
-        return tA == 'N' ? A[size_t(i) * lda + t] : A[size_t(t) * lda + i];
-    };
-    auto bAt = [&](int j, int t) {
-        return tB == 'N' ? B[size_t(t) * ldb + j] : B[size_t(j) * ldb + t];
-    };
-    for (int i = 0; i < M; ++i)
-        for (int j = 0; j < N; ++j) {
-            float s = 0.0f;
-            for (int t = 0; t < K; ++t) s += aAt(i, t) * bAt(j, t);
-            C[size_t(i) * ldc + j] = s;
-        }
+    sgemmPanel(M, N, K, A, lda, B, ldb, C, ldc, tA == 'T');
+#endif
 }
 
 // MPS implementation (Apple only), defined in gemm_mps.mm
@@ -69,6 +136,11 @@ void mpsFlushGrad(void* slot, void* host, size_t bytes);
 #endif
 
 void gemmInit() {
+#ifdef PD_HAVE_ACCEL
+    // One BLAS thread per caller. The trainer already runs one thread per
+    // seat; a BLAS thread pool on top of that just contends for AMX.
+    setenv("VECLIB_MAXIMUM_THREADS", "1", /*overwrite=*/0);
+#endif
 #ifdef PD_HAVE_MPS
     extern bool mpsInit();
     if (!mpsInit()) g_enabled = false;

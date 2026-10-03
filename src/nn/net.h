@@ -107,6 +107,9 @@ struct Lstm {
     Mat statesC;      // T*B x h
     Mat outCache;                 // B*T x h
     Mat gateIAll;                 // B*T x 4h batched input-gate result
+    Mat actCache;                 // B*T x 4h activated i,f,g,o (CPU forward)
+    Mat tanhC;                    // B*T x h tanh(c_t)
+    bool actReady = false;
     std::vector<Mat> gwCache;     // T reusable dWi products
     Mat dwWhTmp, dwWiTmp;         // batched dWh and dWi products
     // backward workspaces

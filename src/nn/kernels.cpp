@@ -3,9 +3,22 @@
 // GPU entry points are compiled in the Metal backend (Apple); on other
 // platforms identical loops run on the CPU.
 #include <cmath>
+#include <vector>
 
 #include "nn/gemm.h"
 #include "nn/kernels.h"
+
+#if defined(__ARM_NEON)
+#include <arm_neon.h>
+#endif
+
+#if defined(__APPLE__)
+#ifndef ACCELERATE_NEW_LAPACK
+#define ACCELERATE_NEW_LAPACK
+#endif
+#include <Accelerate/Accelerate.h>
+#define PD_HAVE_ACCEL
+#endif
 
 namespace nn {
 
@@ -71,10 +84,63 @@ inline float sigm(float x) { return 1.0f / (1.0f + std::exp(-x)); }
 }
 
 void kLstmCellFwd(const Mat& gp, const float* cp, Mat& hOut, Mat& cOut,
-                  int h) {
+                  int h, Mat* gates, Mat* tanhC) {
 #ifdef PD_HAVE_MPS
     if (gpuActive()) { mpsLstmCellFwd(gp, cp, hOut, cOut, h); return; }
 #endif
+#ifdef PD_HAVE_ACCEL
+    // vForce exp/tanh over the whole step. Saved gates let backward skip this.
+    const int B = gp.r;
+    if (B <= 0 || h <= 0) return;
+    const int n3 = B * 3 * h, nh = B * h;
+    thread_local std::vector<float> neg, ex, sig, gin, gout, cc, tc;
+    neg.resize(n3); ex.resize(n3); sig.resize(n3);
+    gin.resize(nh); gout.resize(nh); cc.resize(nh); tc.resize(nh);
+    for (int b = 0; b < B; ++b) {
+        const float* g = gp.row(b);
+        float* n = neg.data() + size_t(b) * 3 * h;
+        float* gi = gin.data() + size_t(b) * h;
+        for (int u = 0; u < h; ++u) {
+            n[u] = -g[u];
+            n[h + u] = -g[h + u];
+            n[2 * h + u] = -g[3 * h + u];
+            gi[u] = g[2 * h + u];
+        }
+    }
+    int ns = n3, nt = nh;
+    vvexpf(ex.data(), neg.data(), &ns);
+    for (int i = 0; i < n3; ++i) ex[i] += 1.0f;
+    vvrecf(sig.data(), ex.data(), &ns);
+    vvtanhf(gout.data(), gin.data(), &nt);
+    for (int b = 0; b < B; ++b) {
+        const float* s = sig.data() + size_t(b) * 3 * h;
+        const float* gv = gout.data() + size_t(b) * h;
+        float* cbuf = cc.data() + size_t(b) * h;
+        float* og = gates ? gates->row(b) : nullptr;
+        for (int u = 0; u < h; ++u) {
+            float iv = s[u], fv = s[h + u], ov = s[2 * h + u];
+            float pc = cp ? cp[size_t(b) * h + u] : 0.0f;
+            float c = fv * pc + iv * gv[u];
+            cOut.row(b)[u] = c;
+            cbuf[u] = c;
+            if (og) {
+                og[u] = iv;
+                og[h + u] = fv;
+                og[2 * h + u] = gv[u];
+                og[3 * h + u] = ov;
+            }
+        }
+    }
+    vvtanhf(tc.data(), cc.data(), &nt);
+    for (int b = 0; b < B; ++b) {
+        const float* s = sig.data() + size_t(b) * 3 * h;
+        const float* th = tc.data() + size_t(b) * h;
+        for (int u = 0; u < h; ++u) {
+            hOut.row(b)[u] = s[2 * h + u] * th[u];
+            if (tanhC) tanhC->row(b)[u] = th[u];
+        }
+    }
+#else
     for (int b = 0; b < gp.r; ++b) {
         for (int u = 0; u < h; ++u) {
             float iv = sigm(gp.row(b)[u]);
@@ -83,17 +149,91 @@ void kLstmCellFwd(const Mat& gp, const float* cp, Mat& hOut, Mat& cOut,
             float ov = sigm(gp.row(b)[3 * h + u]);
             float pc = cp ? cp[b * h + u] : 0.0f;
             float cc = fv * pc + iv * gv;
+            float th = std::tanh(cc);
             cOut.row(b)[u] = cc;
-            hOut.row(b)[u] = ov * std::tanh(cc);
+            hOut.row(b)[u] = ov * th;
+            if (gates) {
+                float* og = gates->row(b);
+                og[u] = iv;
+                og[h + u] = fv;
+                og[2 * h + u] = gv;
+                og[3 * h + u] = ov;
+            }
+            if (tanhC) tanhC->row(b)[u] = th;
         }
     }
+#endif
 }
 
 void kLstmCellBwd(const Mat& gh, const Mat& gp, const Mat& cNow,
-                  const float* cp, Mat& dh, Mat& dc, Mat& dg, int h) {
+                  const float* cp, Mat& dh, Mat& dc, Mat& dg, int h,
+                  const Mat* gates, const Mat* tanhC) {
 #ifdef PD_HAVE_MPS
     if (gpuActive()) { mpsLstmCellBwd(gh, gp, cNow, cp, dh, dc, dg, h); return; }
 #endif
+    if (gates && tanhC) {
+        for (int b = 0; b < gp.r; ++b) {
+            const float* og = gates->row(b);
+            const float* th = tanhC->row(b);
+            for (int u = 0; u < h; ++u) {
+                float iv = og[u], fv = og[h + u], gz = og[2 * h + u], ov = og[3 * h + u];
+                float t = th[u];
+                float dhn = gh.row(b)[u] + dh.row(b)[u];
+                float pc = cp ? cp[size_t(b) * h + u] : 0.0f;
+                float dct = dhn * ov * (1.0f - t * t) + dc.row(b)[u];
+                dg.row(b)[u] = dct * gz * iv * (1.0f - iv);
+                dg.row(b)[h + u] = dct * pc * fv * (1.0f - fv);
+                dg.row(b)[2 * h + u] = dct * iv * (1.0f - gz * gz);
+                dg.row(b)[3 * h + u] = dhn * t * ov * (1.0f - ov);
+                dc.row(b)[u] = dct * fv;
+            }
+        }
+        return;
+    }
+#ifdef PD_HAVE_ACCEL
+    const int B = gp.r;
+    if (B <= 0 || h <= 0) return;
+    const int n3 = B * 3 * h, nh = B * h;
+    thread_local std::vector<float> neg, ex, sig, gin, gout, cin, tc;
+    neg.resize(n3); ex.resize(n3); sig.resize(n3);
+    gin.resize(nh); gout.resize(nh); cin.resize(nh); tc.resize(nh);
+    for (int b = 0; b < B; ++b) {
+        const float* g = gp.row(b);
+        float* n = neg.data() + size_t(b) * 3 * h;
+        float* gi = gin.data() + size_t(b) * h;
+        float* ci = cin.data() + size_t(b) * h;
+        for (int u = 0; u < h; ++u) {
+            n[u] = -g[u];
+            n[h + u] = -g[h + u];
+            n[2 * h + u] = -g[3 * h + u];
+            gi[u] = g[2 * h + u];
+            ci[u] = cNow.row(b)[u];
+        }
+    }
+    int ns = n3, nt = nh;
+    vvexpf(ex.data(), neg.data(), &ns);
+    for (int i = 0; i < n3; ++i) ex[i] += 1.0f;
+    vvrecf(sig.data(), ex.data(), &ns);
+    vvtanhf(gout.data(), gin.data(), &nt);
+    vvtanhf(tc.data(), cin.data(), &nt);
+    for (int b = 0; b < B; ++b) {
+        const float* s = sig.data() + size_t(b) * 3 * h;
+        const float* gv = gout.data() + size_t(b) * h;
+        const float* tcv = tc.data() + size_t(b) * h;
+        for (int u = 0; u < h; ++u) {
+            float iv = s[u], fv = s[h + u], ov = s[2 * h + u];
+            float gz = gv[u], t = tcv[u];
+            float dhn = gh.row(b)[u] + dh.row(b)[u];
+            float pc = cp ? cp[size_t(b) * h + u] : 0.0f;
+            float dct = dhn * ov * (1.0f - t * t) + dc.row(b)[u];
+            dg.row(b)[u] = dct * gz * iv * (1.0f - iv);
+            dg.row(b)[h + u] = dct * pc * fv * (1.0f - fv);
+            dg.row(b)[2 * h + u] = dct * iv * (1.0f - gz * gz);
+            dg.row(b)[3 * h + u] = dhn * t * ov * (1.0f - ov);
+            dc.row(b)[u] = dct * fv;
+        }
+    }
+#else
     for (int b = 0; b < gp.r; ++b) {
         for (int u = 0; u < h; ++u) {
             float tc = std::tanh(cNow.row(b)[u]);
@@ -111,6 +251,7 @@ void kLstmCellBwd(const Mat& gh, const Mat& gp, const Mat& cNow,
             dc.row(b)[u] = dct * fv;
         }
     }
+#endif
 }
 
 void kConcat(Mat& z, const Mat& a, int n1, const Mat& b, int n2) {
@@ -161,8 +302,16 @@ void kAddTo(float* dst, void** gSlot, int dstCols, const Mat& src) {
 #else
     (void)gSlot;
 #endif
-    for (int i = 0; i < src.r; ++i)
-        for (int j = 0; j < src.c; ++j) dst[i * dstCols + j] += src.row(i)[j];
+    for (int i = 0; i < src.r; ++i) {
+        const float* s = src.row(i);
+        float* d = dst + size_t(i) * dstCols;
+        int j = 0;
+#if defined(__ARM_NEON)
+        for (; j + 4 <= src.c; j += 4)
+            vst1q_f32(d + j, vaddq_f32(vld1q_f32(d + j), vld1q_f32(s + j)));
+#endif
+        for (; j < src.c; ++j) d[j] += s[j];
+    }
 }
 
 void kBiasGradAdd(const Mat& g, float* db, void** dbSlot) {
@@ -171,8 +320,19 @@ void kBiasGradAdd(const Mat& g, float* db, void** dbSlot) {
 #else
     (void)dbSlot;
 #endif
-    for (int i = 0; i < g.r; ++i)
-        for (int j = 0; j < g.c; ++j) db[j] += g.row(i)[j];
+    int j = 0;
+#if defined(__ARM_NEON)
+    for (; j + 4 <= g.c; j += 4) {
+        float32x4_t s = vld1q_f32(db + j);
+        for (int i = 0; i < g.r; ++i) s = vaddq_f32(s, vld1q_f32(g.row(i) + j));
+        vst1q_f32(db + j, s);
+    }
+#endif
+    for (; j < g.c; ++j) {
+        float s = db[j];
+        for (int i = 0; i < g.r; ++i) s += g.row(i)[j];
+        db[j] = s;
+    }
 }
 
 void kCopy(float* dst, int dstStride, const float* src, int srcStride,

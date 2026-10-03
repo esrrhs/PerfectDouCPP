@@ -21,12 +21,6 @@ void Param::zeroGrad() {
 
 namespace {
 
-inline float sigmoidf(float x) {
-    if (x < -30.0f) return 0.0f;
-    if (x > 30.0f) return 1.0f;
-    return 1.0f / (1.0f + std::exp(-x));
-}
-
 void heInit(Param& p, Rng64& rng) {
     float bound = std::sqrt(6.0f / float(p.cols + p.rows));
     for (float& v : p.w) v = rng.uniform(-bound, bound);
@@ -184,6 +178,13 @@ const Mat& Lstm::forward(const Mat& x, int batch, int steps) {
     giOp.wSlot = const_cast<void**>(&wTi.devCache);
     gpuGemm(giOp, nullptr, 0, 0);
 
+    // CPU backward reuses these activations. The GPU cell kernel does not
+    // write them; invalidate so a later GPU step cannot read a stale cache.
+    actReady = !gpuActive();
+    if (actReady) {
+        actCache.resize(B * T, H);
+        tanhC.resize(B * T, h);
+    }
     ghGate.resize(B, H);
     for (int t = 0; t < T; ++t) {
         Mat hPrev = viewRows(statesH, t * B, B);
@@ -199,7 +200,16 @@ const Mat& Lstm::forward(const Mat& x, int batch, int steps) {
         Mat hNext = viewRows(statesH, (t + 1) * B, B);
         const float* cp = t == 0 ? nullptr
                                  : statesC.data() + size_t(t - 1) * B * statesC.s;
-        kLstmCellFwd(gp, cp, hNext, cNow, h);
+        Mat gateV, tanhV;
+        Mat* gateP = nullptr;
+        Mat* tanhP = nullptr;
+        if (actReady) {
+            gateV = viewRows(actCache, t * B, B);
+            tanhV = viewRows(tanhC, t * B, B);
+            gateP = &gateV;
+            tanhP = &tanhV;
+        }
+        kLstmCellFwd(gp, cp, hNext, cNow, h, gateP, tanhP);
     }
 
     hlLast = viewRows(statesH, T * B, B);
@@ -221,7 +231,6 @@ void Lstm::backward(const Mat& ghAll) {
 
     gwCache.resize(T);
     std::vector<GemmOp> gwOps(T);
-
     for (int t = T - 1; t >= 0; --t) {
         int idx = (T - 1 - t) & 1;
         Mat gh = viewRows(ghAll, t * B, B);
@@ -230,7 +239,16 @@ void Lstm::backward(const Mat& ghAll) {
         Mat dg = viewRows(dgAll, t * B, B);
         const float* cp = t == 0 ? nullptr
                                  : statesC.data() + size_t(t - 1) * B * statesC.s;
-        kLstmCellBwd(gh, gp, cNow, cp, dhBuf[idx], dcBuf, dg, h);
+        Mat gateV, tanhV;
+        const Mat* gateP = nullptr;
+        const Mat* tanhP = nullptr;
+        if (actReady) {
+            gateV = viewRows(actCache, t * B, B);
+            tanhV = viewRows(tanhC, t * B, B);
+            gateP = &gateV;
+            tanhP = &tanhV;
+        }
+        kLstmCellBwd(gh, gp, cNow, cp, dhBuf[idx], dcBuf, dg, h, gateP, tanhP);
 
         Mat hPrev = viewRows(statesH, t * B, B);
         gwh.resize(H, h);
@@ -246,12 +264,10 @@ void Lstm::backward(const Mat& ghAll) {
         kBiasGradAdd(dg, bh.dw.data(), &bh.devG);
 
         gwCache[t].resize(H, n);
-        gwOps[t] = GemmOp{'T', 'N', H, n, B,
-                          dg.data(), dg.s,
+        gwOps[t] = GemmOp{'T', 'N', H, n, B, dg.data(), dg.s,
                           xCache.data() + size_t(t) * B * xCache.s, xCache.s,
                           gwCache[t].data(), gwCache[t].s};
     }
-    // dWi += sum_t dg_t^T * x_t in one GEMM batch, same per-step shapes.
     gpuCommitGemms(T, gwOps.data());
     for (int t = T - 1; t >= 0; --t)
         kAddTo(Wi.dw.data(), &Wi.devG, n, gwCache[t]);
@@ -559,21 +575,7 @@ void lstmInferForward(const Lstm& l, const Mat& x, int B, int T,
             for (int q = 0; q < H; ++q)
                 gp[q] = gi[q] + gh[q] + l.bi.w[q] + l.bh.w[q];
         }
-        for (int ib = 0; ib < B; ++ib) {
-            const float* gp = w.gp.row(ib);
-            const float* cp = w.cp.row(ib);
-            float* hc = w.hc.row(ib);
-            float* cc = w.cc.row(ib);
-            for (int u = 0; u < h; ++u) {
-                float iv = sigmoidf(gp[u]);
-                float fv = sigmoidf(gp[h + u]);
-                float gv = std::tanh(gp[2 * h + u]);
-                float ov = sigmoidf(gp[3 * h + u]);
-                float c = fv * cp[u] + iv * gv;
-                cc[u] = c;
-                hc[u] = ov * std::tanh(c);
-            }
-        }
+        kLstmCellFwd(w.gp, w.cp.data(), w.hc, w.cc, h);
         if (t == T - 1)
             for (int ib = 0; ib < B; ++ib)
                 std::copy(w.hc.row(ib), w.hc.row(ib) + h, w.hl.row(ib));

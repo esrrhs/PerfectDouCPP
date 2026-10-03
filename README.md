@@ -35,8 +35,8 @@ ctest --test-dir build          # 规则测试 + 神经网络数值梯度检查
 ## 训练
 
 ```bash
-# macOS（Apple Silicon/AMD GPU）默认自动启用 Metal/MPS GPU；采样走 CPU、
-# PPO 学习走 GPU，--backend 可强制 gpu/cpu
+# macOS 默认走 Accelerate/AMX（比当前 Metal GEMM 更快）。采样和学习都在 CPU。
+# --backend gpu 可改回 Metal
 ./build/perfectdou_train --updates 1000 --games 256 --threads 10 --out ckpt
 
 # 快速/低配机器
@@ -61,18 +61,18 @@ ctest --test-dir build          # 规则测试 + 神经网络数值梯度检查
 --reward-scale L    oracle 塑形系数 l（默认 50，0 表示纯 ADP）
 --snapshot-every K  每 K 轮落盘，最后一轮必存
 --resume DIR        从 actor{0,1,2}.bin / critic{0,1,2}.bin 继续
---backend auto|gpu|cpu   GEMM 后端（Apple 平台默认 gpu：Metal/MPS）
+--backend auto|gpu|cpu   GEMM 后端（Apple 默认 cpu：Accelerate/AMX；gpu 为 Metal）
 ```
 
-GPU 后端说明（Apple Silicon / AMD Mac）：
+后端说明（Apple Silicon）：
 
-- 只有 PPO 学习阶段的大矩阵乘法走 GPU；多线程自对弈采样固定走 CPU
-  （同步小批量 GPU 编码在多线程下反而互相阻塞）。
+- 默认 PPO 与自对弈都走 CPU。大矩阵乘法用 Accelerate（AMX），LSTM 的
+  sigmoid/tanh 用 vForce。`--backend gpu` 仍可用 Metal GEMM。
+- 多线程自对弈采样固定走 CPU。
 - 数值为 FP32，`tests/test_gemm` 校验 CPU/GPU 结果逐位一致。
-- 参考实测（M1 Pro，hidden=256 / 256 局 / epochs=4）：单轮 5 分 32 秒（CPU）
-  → **38 秒（GPU）**，约 8.7 倍；轻量配置（hidden=128 / 64 局 / epochs=2）
-  约 5.8 秒/轮。
-- 无 GPU 的 Linux 机器自动回退纯 CPU。
+- 参考实测（M1 Pro，hidden=256 / 256 局 / epochs=4）：约 **5 秒/轮**
+  （采样 0.5 秒 + 学习 4.6 秒）。同配置 Metal 学习阶段大约慢一倍。
+- 无 Accelerate 的 Linux 机器使用 NEON/标量 CPU GEMM。
 
 输出文件：`ckpt/actor{0,1,2}.bin`、`ckpt/critic{0,1,2}.bin`
 （座位 0=landlord，1=landlord_down，2=landlord_up），供后续推理程序加载。

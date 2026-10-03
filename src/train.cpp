@@ -91,8 +91,13 @@ int main(int argc, char** argv) {
     if (args.backend == "cpu") nn::gemmSetGpu(false);
     if (args.backend == "gpu") nn::gemmSetGpu(true);
     std::cout << "PerfectDou CPP training\n";
-    std::cout << "  GEMM backend: "
-              << (nn::gemmGpuEnabled() ? "GPU (Metal)" : "CPU") << "\n";
+    const char* backend = nn::gemmGpuEnabled() ? "GPU (Metal)" :
+#ifdef __APPLE__
+                          "CPU (Accelerate)";
+#else
+                          "CPU";
+#endif
+    std::cout << "  GEMM backend: " << backend << "\n";
     std::cout << "  updates=" << args.updates << " games/update=" << args.games
               << " threads=" << args.threads << " hidden=" << args.hidden
               << " lstm=" << args.lstmHidden << " lr=" << args.lr
@@ -147,9 +152,10 @@ int main(int argc, char** argv) {
         algo::RolloutStats rs;
         algo::collectRollout(models, rc, streams, rs);
 
-        double secs = std::chrono::duration<double>(
-                          std::chrono::steady_clock::now() - t0)
-                          .count();
+        double rollSecs = std::chrono::duration<double>(
+                              std::chrono::steady_clock::now() - t0)
+                              .count();
+        auto t1 = std::chrono::steady_clock::now();
 
         std::array<algo::PPOStats, 3> ps;
         // The three seat models are independent: update them in parallel.
@@ -165,15 +171,18 @@ int main(int argc, char** argv) {
         }
         for (auto& th : learners) th.join();
 
+        double learnSecs = std::chrono::duration<double>(
+                               std::chrono::steady_clock::now() - t1)
+                               .count();
         double wp = double(rs.landlordWins) / std::max(1, rs.games);
         double adp = double(rs.landlordScore) / std::max(1, rs.games);
         double bpg = double(rs.bombs) / std::max(1, rs.games);
         double mpg = double(rs.moves) / std::max(1, rs.games);
         std::printf(
-            "upd %4d | rollout %.1fs games %d WP %.3f ADP %7.2f bomb/g %.2f "
+            "upd %4d | rollout %.1fs learn %.1fs games %d WP %.3f ADP %7.2f bomb/g %.2f "
             "moves/g %.1f | ent %5.3f/%5.3f/%5.3f vL %7.2f/%7.2f/%7.2f "
             "ret %7.1f/%7.1f/%7.1f | n %lld/%lld/%lld\n",
-            upd, secs, rs.games, wp, adp, bpg, mpg,
+            upd, rollSecs, learnSecs, rs.games, wp, adp, bpg, mpg,
             ps[0].entropy, ps[1].entropy, ps[2].entropy,
             ps[0].vLoss, ps[1].vLoss, ps[2].vLoss,
             ps[0].meanRet, ps[1].meanRet, ps[2].meanRet,

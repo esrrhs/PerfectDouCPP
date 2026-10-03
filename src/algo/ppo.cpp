@@ -96,7 +96,6 @@ void ppoUpdate(nn::Actor& actor, nn::Critic& critic,
             nn::gpuWaitEx(true);  // flush logits & values; keep fwd binds for backward
 
             // ---- loss gradients on host ----
-            auto tal0 = std::chrono::steady_clock::now();
             nn::Mat dLogits(B, nn::kNumActions);
             std::fill(dLogits.d.begin(), dLogits.d.end(), 0.0f);
             for (int i = 0; i < B; ++i) {

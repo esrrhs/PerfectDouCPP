@@ -500,6 +500,175 @@ kernel void gemm_blockn(device const float* A, device const float* B,
     }
 }
 
+// 32x32 register-blocked GEMM with double-buffered K tiles. Same 8x8
+// threads and 4x4 outputs/thread as gemm_block, so the per-output FMA order
+// matches it bit for bit. Threadgroup memory stays under 16 KB (two tiles)
+// so occupancy does not collapse. Loads are float4 along the contiguous
+// axis, including the transposed operand.
+constant constexpr int DB_BM = 32;
+constant constexpr int DB_BN = 32;
+constant constexpr int DB_BK = 16;
+constant constexpr int DB_TW = 8;
+constant constexpr int DB_MR = DB_BM / DB_TW;
+constant constexpr int DB_NR = DB_BN / DB_TW;
+
+inline void dbLoad(threadgroup float As[DB_BM][DB_BK + 1],
+                   threadgroup float Bs[DB_BK][DB_BN + 1],
+                   device const float* A, device const float* B,
+                   constant GemmP& p, uint i0, uint j0, uint k0, uint tid) {
+    // 32*16 floats = 128 float4, two per thread.
+    for (uint q = 0u; q < 2u; ++q) {
+        uint e = tid + 64u * q;
+        if (p.tA == 0) {
+            uint r = e >> 2;
+            uint c4 = e & 3u;
+            uint ar = i0 + r;
+            uint ak = k0 + c4 * 4u;
+            float4 v = float4(0.0f);
+            if (ar < uint(p.M) && (p.lda & 3) == 0 && ak + 3u < uint(p.K)) {
+                device const float* src = A + ar * uint(p.lda) + ak;
+                v = *(device const float4*)src;
+            } else if (ar < uint(p.M)) {
+                for (uint t = 0u; t < 4u; ++t)
+                    if (ak + t < uint(p.K))
+                        v[t] = A[ar * uint(p.lda) + ak + t];
+            }
+            As[r][c4 * 4u + 0u] = v[0];
+            As[r][c4 * 4u + 1u] = v[1];
+            As[r][c4 * 4u + 2u] = v[2];
+            As[r][c4 * 4u + 3u] = v[3];
+        } else {
+            uint c = e >> 3;          // k 0..15
+            uint r4 = e & 7u;         // float4 along M
+            uint ak = k0 + c;
+            uint ar = i0 + r4 * 4u;
+            float4 v = float4(0.0f);
+            if (ak < uint(p.K) && (p.lda & 3) == 0 && ar + 3u < uint(p.M)) {
+                device const float* src = A + ak * uint(p.lda) + ar;
+                v = *(device const float4*)src;
+            } else if (ak < uint(p.K)) {
+                for (uint t = 0u; t < 4u; ++t)
+                    if (ar + t < uint(p.M))
+                        v[t] = A[ak * uint(p.lda) + ar + t];
+            }
+            As[r4 * 4u + 0u][c] = v[0];
+            As[r4 * 4u + 1u][c] = v[1];
+            As[r4 * 4u + 2u][c] = v[2];
+            As[r4 * 4u + 3u][c] = v[3];
+        }
+        if (p.tB == 0) {
+            uint r = e >> 3;
+            uint c4 = e & 7u;
+            uint bk = k0 + r;
+            uint bj = j0 + c4 * 4u;
+            float4 v = float4(0.0f);
+            if (bk < uint(p.K) && (p.ldb & 3) == 0 && bj + 3u < uint(p.N)) {
+                device const float* src = B + bk * uint(p.ldb) + bj;
+                v = *(device const float4*)src;
+            } else if (bk < uint(p.K)) {
+                for (uint t = 0u; t < 4u; ++t)
+                    if (bj + t < uint(p.N))
+                        v[t] = B[bk * uint(p.ldb) + bj + t];
+            }
+            Bs[r][c4 * 4u + 0u] = v[0];
+            Bs[r][c4 * 4u + 1u] = v[1];
+            Bs[r][c4 * 4u + 2u] = v[2];
+            Bs[r][c4 * 4u + 3u] = v[3];
+        } else {
+            uint c = e >> 2;          // n 0..31
+            uint r4 = e & 3u;
+            uint bj = j0 + c;
+            uint bk = k0 + r4 * 4u;
+            float4 v = float4(0.0f);
+            if (bj < uint(p.N) && (p.ldb & 3) == 0 && bk + 3u < uint(p.K)) {
+                device const float* src = B + bj * uint(p.ldb) + bk;
+                v = *(device const float4*)src;
+            } else if (bj < uint(p.N)) {
+                for (uint t = 0u; t < 4u; ++t)
+                    if (bk + t < uint(p.K))
+                        v[t] = B[bj * uint(p.ldb) + bk + t];
+            }
+            Bs[r4 * 4u + 0u][c] = v[0];
+            Bs[r4 * 4u + 1u][c] = v[1];
+            Bs[r4 * 4u + 2u][c] = v[2];
+            Bs[r4 * 4u + 3u][c] = v[3];
+        }
+    }
+}
+
+kernel void gemm_db(device const float* A, device const float* B,
+                    device float* C, constant const float* bias,
+                    constant GemmP& p,
+                    uint2 tpos [[thread_position_in_threadgroup]],
+                    uint2 gpos [[threadgroup_position_in_grid]]) {
+    threadgroup float As[2][DB_BM][DB_BK + 1];
+    threadgroup float Bs[2][DB_BK][DB_BN + 1];
+    float acc[DB_MR][DB_NR];
+    #pragma unroll
+    for (int a = 0; a < DB_MR; ++a)
+        #pragma unroll
+        for (int b = 0; b < DB_NR; ++b) acc[a][b] = 0.0f;
+
+    const uint i0 = gpos.y * DB_BM;
+    const uint j0 = gpos.x * DB_BN;
+    const uint tr = tpos.y, tc = tpos.x;
+    const uint tid = tr * DB_TW + tc;
+
+    dbLoad(As[0], Bs[0], A, B, p, i0, j0, 0u, tid);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    int phase = 0;
+    for (int k0 = 0; k0 < p.K; k0 += DB_BK) {
+        int next = phase ^ 1;
+        if (k0 + DB_BK < p.K)
+            dbLoad(As[next], Bs[next], A, B, p, i0, j0, uint(k0 + DB_BK), tid);
+        #pragma unroll
+        for (int z = 0; z < DB_BK; ++z) {
+            if (k0 + z >= p.K) break;
+            float av[DB_MR];
+            float bv[DB_NR];
+            #pragma unroll
+            for (int a = 0; a < DB_MR; ++a)
+                av[a] = As[phase][tr * DB_MR + a][z];
+            #pragma unroll
+            for (int b = 0; b < DB_NR; ++b)
+                bv[b] = Bs[phase][z][tc * DB_NR + b];
+            #pragma unroll
+            for (int a = 0; a < DB_MR; ++a)
+                #pragma unroll
+                for (int b = 0; b < DB_NR; ++b)
+                    acc[a][b] += av[a] * bv[b];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        phase = next;
+    }
+
+    #pragma unroll
+    for (int a = 0; a < DB_MR; ++a) {
+        uint row = i0 + tr * DB_MR + a;
+        if (row >= uint(p.M)) continue;
+        uint col = j0 + tc * DB_NR;
+        device float* cp = C + row * p.ldc + col;
+        if (p.epi == 0) {
+            if (col + DB_NR <= uint(p.N)) {
+                cp[0] = acc[a][0]; cp[1] = acc[a][1];
+                cp[2] = acc[a][2]; cp[3] = acc[a][3];
+            } else {
+                #pragma unroll
+                for (int b = 0; b < DB_NR; ++b)
+                    if (col + uint(b) < uint(p.N)) cp[b] = acc[a][b];
+            }
+        } else {
+            constant const float* bp = bias + col;
+            #pragma unroll
+            for (int b = 0; b < DB_NR; ++b)
+                if (col + uint(b) < uint(p.N)) {
+                    float v = acc[a][b] + bp[b];
+                    cp[b] = v > 0.0f ? v : 0.0f;
+                }
+        }
+    }
+}
+
 struct AdamP {
     int n;
     float lr, b1, b2, eps, bc1, bc2;
@@ -689,14 +858,22 @@ struct KArgs {
     int a = 0, b = 0, c = 0, d = 0, e = 0, f = 0, g = 0;
 };
 
+// One compute encoder per command buffer. Ending and reopening an encoder
+// for every dispatch dominated CPU encode time without changing GPU order
+// (dispatches inside one encoder still run sequentially).
+id<MTLComputeCommandEncoder> encoder() {
+    ensureCB();
+    Ctx& c = ctx();
+    if (c.enc == nil) c.enc = [c.cb computeCommandEncoder];
+    return c.enc;
+}
+
 void launch1(NSString* name, NSArray<PDRef*>* bufs,
              const void* constants, NSUInteger cbytes, int threads) {
     auto _t0 = std::chrono::steady_clock::now();
     keepAlive(bufs);
-    ensureCB();
-    closeEncoder();
     Ctx& cx = ctx();
-    id<MTLComputeCommandEncoder> en = [cx.cb computeCommandEncoder];
+    id<MTLComputeCommandEncoder> en = encoder();
     id<MTLComputePipelineState> pso = pipeline(name);
     [en setComputePipelineState:pso];
     for (NSUInteger i = 0; i < bufs.count; ++i)
@@ -706,8 +883,6 @@ void launch1(NSString* name, NSArray<PDRef*>* bufs,
     NSUInteger groups = (threads + tw - 1) / tw;
     [en dispatchThreadgroups:MTLSizeMake(groups, 1, 1)
               threadsPerThreadgroup:MTLSizeMake(tw, 1, 1)];
-    [en endEncoding];
-    cx.enc = nil;
     ++cx.nCommit;
     auto _t1 = std::chrono::steady_clock::now();
     cx.encSec += std::chrono::duration<double>(_t1 - _t0).count();
@@ -717,10 +892,8 @@ void launch2(NSString* name, NSArray<PDRef*>* bufs,
              const void* constants, NSUInteger cbytes, int B, int H) {
     auto _t0 = std::chrono::steady_clock::now();
     keepAlive(bufs);
-    ensureCB();
-    closeEncoder();
     Ctx& cx = ctx();
-    id<MTLComputeCommandEncoder> en = [cx.cb computeCommandEncoder];
+    id<MTLComputeCommandEncoder> en = encoder();
     [en setComputePipelineState:pipeline(name)];
     for (NSUInteger i = 0; i < bufs.count; ++i)
         [en setBuffer:bufs[i]->buf offset:bufs[i]->off atIndex:i];
@@ -728,8 +901,6 @@ void launch2(NSString* name, NSArray<PDRef*>* bufs,
     NSUInteger gw = 8, gh = 8;
     [en dispatchThreadgroups:MTLSizeMake((B + gw - 1) / gw, (H + gh - 1) / gh, 1)
               threadsPerThreadgroup:MTLSizeMake(gw, gh, 1)];
-    [en endEncoding];
-    cx.enc = nil;
     ++cx.nCommit;
     auto _t1 = std::chrono::steady_clock::now();
     cx.encSec += std::chrono::duration<double>(_t1 - _t0).count();
@@ -899,17 +1070,16 @@ struct GParam {
     int M, N, K, lda, ldb, ldc, tA, tB, epi;
 };
 
-// Must match the gemm_block / gemm_blockn MSL constants.
+// Must match the gemm_block / gemm_blockn / gemm_db MSL constants.
 static constexpr int GB_M = 32, GB_N = 32, GB_W = 8;
 static constexpr int GB_NM = 16, GB_NN = 32;
+static constexpr int DB_BM = 32, DB_BN = 32, DB_TW = 8;
 
 // Custom tiled GEMM (one compute dispatch) with fused bias+relu epilogue.
 void mpsCustomGemm(const GemmOp& g, const void* biasV, size_t biasBytes,
                    int epi) {
     const float* bias = static_cast<const float*>(biasV);
     auto _t0 = std::chrono::steady_clock::now();
-    ensureCB();
-    closeEncoder();
     Ctx& cx = ctx();
     NSUInteger ar = (g.transA == 'N') ? g.M : g.K;
     NSUInteger br = (g.transB == 'N') ? g.K : g.N;
@@ -924,29 +1094,34 @@ void mpsCustomGemm(const GemmOp& g, const void* biasV, size_t biasBytes,
     keepAlive(bufs);
     GParam p{g.M, g.N, g.K, g.lda, g.ldb, g.ldc,
              g.transA == 'T' ? 1 : 0, g.transB == 'T' ? 1 : 0, epi};
-    id<MTLComputeCommandEncoder> en = [cx.cb computeCommandEncoder];
+    id<MTLComputeCommandEncoder> en = encoder();
     // Kernel selection (override with PD_GEMM_OLD / PD_GEMM_FORCE):
-    //  gemm_block  (32x32, 4x4 outputs/thread) wins on tall-M / big tiles;
-    //  gemm_blockn (16x32, 2x4) wins on short-M products where 32x32 would
-    //  launch too few threadgroups to hide the K-loop latency;
-    //  gemm_tiled  (16x16 scalar) retained for degenerate shapes.
-    int variant;  // 0=block, 1=blockn, 2=tiled
+    //  gemm_block  (32x32, 4x4 outputs/thread) for tall-M products;
+    //  gemm_blockn (16x32, 2x4) for short-M / wide-N products;
+    //  gemm_tiled  (16x16 scalar) for degenerate shapes;
+    //  gemm_db     (32x32, double-buffered) available as PD_GEMM_FORCE=3.
+    int variant;  // 0=block, 1=blockn, 2=tiled, 3=db
     if (getenv("PD_GEMM_OLD")) variant = 2;
     else if (getenv("PD_GEMM_FORCE"))
         variant = atoi(getenv("PD_GEMM_FORCE"));
     else if (g.M >= 192)
-        variant = 0;                 // tall M: 32x32 register block wins
+        variant = 0;
     else if (g.N >= 512)
-        variant = 1;                 // short M, wide N: 16x32 block wins
+        variant = 1;
     else
-        variant = 2;                 // small tiles / long K: scalar 16x16
-                                     // launches enough groups to hide latency
-    NSString* names[3] = {@"gemm_block", @"gemm_blockn", @"gemm_tiled"};
+        variant = 2;
+    NSString* names[4] = {@"gemm_block", @"gemm_blockn", @"gemm_tiled",
+                          @"gemm_db"};
     [en setComputePipelineState:pipeline(names[variant])];
     for (NSUInteger i = 0; i < 4; ++i)
         [en setBuffer:bufs[i]->buf offset:bufs[i]->off atIndex:i];
     [en setBytes:&p length:sizeof(p) atIndex:4];
-    if (variant == 0) {
+    if (variant == 3) {
+        NSUInteger gx = (g.N + DB_BN - 1) / DB_BN;
+        NSUInteger gy = (g.M + DB_BM - 1) / DB_BM;
+        [en dispatchThreadgroups:MTLSizeMake(gx, gy, 1)
+                  threadsPerThreadgroup:MTLSizeMake(DB_TW, DB_TW, 1)];
+    } else if (variant == 0) {
         NSUInteger gx = (g.N + GB_N - 1) / GB_N;
         NSUInteger gy = (g.M + GB_M - 1) / GB_M;
         [en dispatchThreadgroups:MTLSizeMake(gx, gy, 1)
@@ -961,8 +1136,6 @@ void mpsCustomGemm(const GemmOp& g, const void* biasV, size_t biasBytes,
         [en dispatchThreadgroups:MTLSizeMake(gx, gy, 1)
                   threadsPerThreadgroup:MTLSizeMake(16, 16, 1)];
     }
-    [en endEncoding];
-    cx.enc = nil;
     ++cx.nCommit;
     auto _t1 = std::chrono::steady_clock::now();
     cx.encSec += std::chrono::duration<double>(_t1 - _t0).count();
@@ -1106,10 +1279,8 @@ void mpsAdam(std::vector<float>& w, std::vector<float>& dw,
         float lr, b1, b2, eps, bc1, bc2;
     } p{n, lr, beta1, beta2, eps, bc1, bc2};
     size_t bytes = (size_t(n) + 3 & ~size_t(3)) * 4;
-    ensureCB();
-    closeEncoder();
     Ctx& cx = ctx();
-    id<MTLComputeCommandEncoder> en = [cx.cb computeCommandEncoder];
+    id<MTLComputeCommandEncoder> en = encoder();
     [en setComputePipelineState:pipeline(@"adam_step")];
     [en setBuffer:scalarRmw(w.data(), bytes)->buf offset:0 atIndex:0];
     [en setBuffer:scalarRmw(dw.data(), bytes)->buf offset:0 atIndex:1];
@@ -1119,8 +1290,6 @@ void mpsAdam(std::vector<float>& w, std::vector<float>& dw,
     NSUInteger tw = 128;
     [en dispatchThreadgroups:MTLSizeMake((n + tw - 1) / tw, 1, 1)
               threadsPerThreadgroup:MTLSizeMake(tw, 1, 1)];
-    [en endEncoding];
-    cx.enc = nil;
     ++cx.nCommit;
 }
 

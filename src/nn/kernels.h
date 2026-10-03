@@ -24,14 +24,18 @@ void kGateAdd(Mat& gp, const Mat& gi, const Mat& gh,
 
 // LSTM cell: given gate preactivations gp (B x 4h) and previous c,
 // write h/c. cp == nullptr denotes the t == 0 zero state.
+// When gates/tanhC are non-null, also store the activated i,f,g,o and tanh(c)
+// so the backward pass can skip a second exp/tanh.
 void kLstmCellFwd(const Mat& gp, const float* cp, Mat& hOut, Mat& cOut,
-                  int hidden);
+                  int hidden, Mat* gates = nullptr, Mat* tanhC = nullptr);
 
 // Backward through the cell. dh/dc are the running next-state gradients
 // (updated in place); dg is this step's gate gradient (B x 4h).
 // gh is the external gradient added to dh. cp may be null at t == 0.
+// gates/tanhC, when set, are the activations saved by kLstmCellFwd.
 void kLstmCellBwd(const Mat& gh, const Mat& gp, const Mat& cNow,
-                  const float* cp, Mat& dh, Mat& dc, Mat& dg, int hidden);
+                  const float* cp, Mat& dh, Mat& dc, Mat& dg, int hidden,
+                  const Mat* gates = nullptr, const Mat* tanhC = nullptr);
 
 // z[i,0:n1) = a[i,:]; z[i,n1:n1+n2) = b[i,:]
 void kConcat(Mat& z, const Mat& a, int n1, const Mat& b, int n2);
