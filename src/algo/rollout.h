@@ -64,8 +64,19 @@ void collectRollout(const ModelSet& models, const RolloutConfig& cfg,
 struct Batch {
     nn::Mat xImp, seq, mask, dynFeat, extra;
 };
+// Float features for one stream, built once and reused across PPO epochs.
+void cacheTransitionFeatures(const std::vector<Transition>& tr,
+                             std::vector<float>& xImp, std::vector<float>& seq,
+                             std::vector<float>& extra);
 void buildBatch(const std::vector<Transition*>& tr, nn::Mat& xImp,
                 nn::Mat& seq, nn::Mat& mask, nn::Mat& dynFeat,
                 nn::Mat& extra);
+// `base` is the stream the cached rows were built from. Each pointer in
+// `tr` must address an element of that stream.
+void buildBatchFromCache(const std::vector<Transition*>& tr,
+                         const Transition* base, const float* xAll, int xStride,
+                         const float* seqAll, const float* eAll, int eStride,
+                         nn::Mat& xImp, nn::Mat& seq, nn::Mat& mask,
+                         nn::Mat& dynFeat, nn::Mat& extra);
 
 }  // namespace algo

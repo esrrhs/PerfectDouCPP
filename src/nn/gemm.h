@@ -20,6 +20,7 @@
 // respected without per-op round trips.
 #pragma once
 #include <cstddef>
+#include <functional>
 namespace nn {
 
 void gemmInit();                       // initialize GPU backend (if present)
@@ -79,5 +80,17 @@ void gpuFlushGrad(void* slot, void* host, size_t bytes);
 void gpuPrintStats(const char* tag);
 // True when the calling thread dispatches work to the GPU.
 bool gpuActive();
+// False after the D3D12 device is removed. Host weights are unchanged until
+// the next successful fence. Other platforms are always ok.
+bool gpuDeviceOk();
+// Run fn on the single thread that owns the D3D12 compute queue. Nested
+// calls from that thread run inline. Other platforms call fn directly.
+void gpuInvoke(const std::function<void()>& fn);
+// Drop the compute queue and every device allocation it owns. The queue is
+// released on the thread that created it.
+void gpuReleaseThread();
+// Recreate the process-wide device after every learner has released its
+// queue. Returns false when the GPU cannot be brought back.
+bool gpuRecreate();
 
 }  // namespace nn

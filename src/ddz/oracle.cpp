@@ -158,9 +158,28 @@ int fDP(int a, int b, int c, int d) {
 // workers are short lived, so memory is released when they join.
 // ---------------------------------------------------------------------------
 
+// The map lives on the heap. A thread_local unordered_map is destroyed from
+// the TLS callback after MinGW's pthread runtime has already freed that
+// storage, which is the 0xC0000374 seen when a rollout worker exits.
+struct Memo {
+    std::unordered_map<uint64_t, int> m;
+};
+
+Memo*& memoPtr() {
+    static thread_local Memo* p = nullptr;
+    return p;
+}
+
 std::unordered_map<uint64_t, int>& cache() {
-    static thread_local std::unordered_map<uint64_t, int> m;
-    return m;
+    Memo*& p = memoPtr();
+    if (!p) p = new Memo;
+    return p->m;
+}
+
+void releaseMemo() {
+    Memo*& p = memoPtr();
+    delete p;
+    p = nullptr;
 }
 
 uint64_t packKey(const std::array<int8_t, kRanks>& cnt) {
@@ -304,7 +323,7 @@ int minSteps(const CardSet& hand) {
     return solve(cnt);
 }
 
-void clearOracleCache() { cache().clear(); }
+void clearOracleCache() { releaseMemo(); }
 
 size_t oracleCacheSize() { return cache().size(); }
 

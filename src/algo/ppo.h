@@ -35,7 +35,9 @@ struct PPOStats {
 void computeGAE(std::vector<Transition>& tr, float gamma, float lambda);
 
 // One PPO update of one seat's actor + critic over its rollout stream.
-void ppoUpdate(nn::Actor& actor, nn::Critic& critic,
+// False means the GPU device was removed before Adam wrote host weights, so
+// the update can be repeated after the device is recreated.
+bool ppoUpdate(nn::Actor& actor, nn::Critic& critic,
                std::vector<Transition>& tr, const PPOConfig& cfg,
                nn::Adam& actorOpt, nn::Adam& criticOpt, nn::Rng64& rng,
                PPOStats& stats);

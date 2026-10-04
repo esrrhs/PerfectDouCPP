@@ -54,6 +54,9 @@ endif()
 
 add_executable(perfectdou_train src/train.cpp)
 target_link_libraries(perfectdou_train PRIVATE perfectdou)
+if(WIN32)
+  target_link_libraries(perfectdou_train PRIVATE powrprof)
+endif()
 
 enable_testing()
 add_executable(test_rules tests/test_rules.cpp)

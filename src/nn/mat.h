@@ -55,7 +55,7 @@ struct Mat {
         c = cols;
         s = padStride(cols);
         ext = nullptr;
-        gpuDropCache(&devCache);  // host storage (re)allocated
+        gpuDropCache(&devCache);
         d.assign(size_t(r) * s, 0.0f);
     }
     // Non-owning view of another Mat's storage (r/c/s shared, data aliased).

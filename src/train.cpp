@@ -10,15 +10,27 @@
 // Example:
 //   perfectdou_train --updates 200 --games 256 --threads 8 --out ckpt
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
+#include <filesystem>
 #include <iostream>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <thread>
+
+#if defined(_WIN32)
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#include <powrprof.h>
+#endif
 
 #include "algo/ppo.h"
 #include "algo/rollout.h"
@@ -35,6 +47,7 @@ struct Args {
     int epochs = 4;
     int minibatch = 256;
     int snapshotEvery = 20;
+    int buffer = 2;
     float lr = 3e-4f;
     float clip = 0.2f;
     float ent = 0.1f;
@@ -69,6 +82,7 @@ void parseArgs(int argc, char** argv, Args& a) {
     a.epochs = std::atoi(argValue(argc, argv, "--epochs", "4"));
     a.minibatch = std::atoi(argValue(argc, argv, "--mb", "256"));
     a.snapshotEvery = std::atoi(argValue(argc, argv, "--snapshot-every", "20"));
+    a.buffer = std::atoi(argValue(argc, argv, "--buffer", "2"));
     a.lr = float(std::atof(argValue(argc, argv, "--lr", "3e-4")));
     a.clip = float(std::atof(argValue(argc, argv, "--clip", "0.2")));
     a.ent = float(std::atof(argValue(argc, argv, "--ent", "0.1")));
@@ -100,10 +114,21 @@ int main(int argc, char** argv) {
                           "CPU";
 #endif
     std::cout << "  GEMM backend: " << backend << "\n";
-    std::cout << "  updates=" << args.updates << " games/update=" << args.games
-              << " threads=" << args.threads << " hidden=" << args.hidden
-              << " lstm=" << args.lstmHidden << " lr=" << args.lr
-              << " rewardScale=" << args.rewardScale << "\n";
+    std::cout << "  updates=" << args.updates
+              << " games/update=" << args.games
+              << " buffer=" << args.buffer
+              << " threads=" << args.threads
+              << " mb=" << args.minibatch
+              << " epochs=" << args.epochs
+              << " hidden=" << args.hidden
+              << " lstm=" << args.lstmHidden
+              << " lr=" << args.lr
+              << " clip=" << args.clip
+              << " ent=" << args.ent
+              << " gamma=" << args.gamma
+              << " gae=" << args.gae
+              << " rewardScale=" << args.rewardScale
+              << " seed=" << args.seed << std::endl;
 
     nn::NetConfig cfg{args.hidden, args.lstmHidden};
     std::array<nn::Actor, 3> actor;
@@ -129,8 +154,7 @@ int main(int argc, char** argv) {
     ppo.minibatch = args.minibatch;
 
     auto saveAll = [&](const std::string& dir) {
-        std::string cmd = "mkdir -p " + dir;
-        std::system(cmd.c_str());
+        std::filesystem::create_directories(dir);
         for (int s = 0; s < 3; ++s) {
             actor[s].save((dir + "/actor" + std::to_string(s) + ".bin").c_str());
             critic[s].save((dir + "/critic" + std::to_string(s) + ".bin").c_str());
@@ -139,6 +163,23 @@ int main(int argc, char** argv) {
 
     // warm up the shared (read-only) oracle DP table before spawning workers
     ddz::minSteps(ddz::CardSet::parse("34567"));
+
+    // Idle modern standby powers the discrete GPU down; the driver then
+    // removes the device. Keep the system in the working state until exit.
+#if defined(_WIN32)
+    REASON_CONTEXT awakeReason = {};
+    awakeReason.Version = POWER_REQUEST_CONTEXT_VERSION;
+    awakeReason.Flags = POWER_REQUEST_CONTEXT_SIMPLE_STRING;
+    awakeReason.Reason.SimpleReasonString =
+        const_cast<wchar_t*>(L"PerfectDou training");
+    HANDLE awake = PowerCreateRequest(&awakeReason);
+    if (awake) {
+        PowerSetRequest(awake, PowerRequestSystemRequired);
+        PowerSetRequest(awake, PowerRequestExecutionRequired);
+    }
+    SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED |
+                            ES_AWAYMODE_REQUIRED);
+#endif
 
     // One GPU context per seat for the whole run. Destroying a D3D12 compute
     // queue takes several seconds on this driver, and a queue cannot be
@@ -150,6 +191,9 @@ int main(int argc, char** argv) {
         int generation = 0;
         int done = 0;
         int upd = 0;
+        int phase = 0;  // 0 = learn, 1 = release this thread's GPU context
+        unsigned seatMask = 0;
+        unsigned failed = 0;
         bool stop = false;
     } job;
     std::array<std::vector<algo::Transition>, 3> streams;
@@ -157,9 +201,14 @@ int main(int argc, char** argv) {
     std::vector<std::thread> learners;
     for (int s = 0; s < nLearn; ++s) {
         learners.emplace_back([&, s] {
+            // The compute queue lives on one owner thread. A learner that
+            // touches D3D itself would create a second queue.
+            nn::gemmSetThreadGpu(0);
             int seen = 0;
             while (true) {
                 int upd = 0;
+                int phase = 0;
+                unsigned mask = 0;
                 {
                     std::unique_lock<std::mutex> lock(job.mu);
                     job.cv.wait(lock, [&] {
@@ -167,13 +216,21 @@ int main(int argc, char** argv) {
                     });
                     if (job.stop && job.generation == seen) return;
                     upd = job.upd;
+                    phase = job.phase;
+                    mask = job.seatMask;
                     seen = job.generation;
                 }
-                nn::Rng64 ur(args.seed * 100000 + upd * 31 + s);
-                algo::ppoUpdate(actor[s], critic[s], streams[s], ppo, aOpt[s],
-                                cOpt[s], ur, ps[s]);
-                actor[s].prepareInference();
-                critic[s].prepareInference();
+                if (phase == 1) {
+                    nn::gpuReleaseThread();
+                } else if (mask & (1u << s)) {
+                    nn::Rng64 ur(args.seed * 100000 + upd * 31 + s);
+                    bool ok = algo::ppoUpdate(actor[s], critic[s], streams[s],
+                                              ppo, aOpt[s], cOpt[s], ur, ps[s]);
+                    if (!ok) {
+                        std::lock_guard<std::mutex> lock(job.mu);
+                        job.failed |= 1u << s;
+                    }
+                }
                 {
                     std::lock_guard<std::mutex> lock(job.mu);
                     ++job.done;
@@ -183,47 +240,207 @@ int main(int argc, char** argv) {
         });
     }
 
+    auto waitLearners = [&] {
+        std::unique_lock<std::mutex> lock(job.mu);
+        job.cv.wait(lock, [&] { return job.done == job.generation * nLearn; });
+    };
+    auto runLearn = [&](unsigned mask) {
+        {
+            std::lock_guard<std::mutex> lock(job.mu);
+            job.phase = 0;
+            job.seatMask = mask;
+            job.failed = 0;
+            ++job.generation;
+        }
+        job.cv.notify_all();
+        waitLearners();
+        std::lock_guard<std::mutex> lock(job.mu);
+        return job.failed;
+    };
+    auto releaseGpu = [&] {
+        {
+            std::lock_guard<std::mutex> lock(job.mu);
+            job.phase = 1;
+            ++job.generation;
+        }
+        job.cv.notify_all();
+        waitLearners();
+    };
+
+    // Inference copies are published by pointer. Rollout holds one snapshot
+    // for a whole chunk; the learner keeps writing the training models.
+    struct InferPack {
+        std::array<nn::Actor, 3> actor;
+        std::array<nn::Critic, 3> critic;
+    };
+    auto copySeat = [](nn::Actor& dstA, nn::Critic& dstC, nn::Actor& srcA,
+                       nn::Critic& srcC) {
+        auto da = dstA.params();
+        auto sa = srcA.params();
+        for (size_t i = 0; i < sa.size(); ++i) da[i]->w = sa[i]->w;
+        auto dc = dstC.params();
+        auto sc = srcC.params();
+        for (size_t i = 0; i < sc.size(); ++i) dc[i]->w = sc[i]->w;
+        dstA.prepareInference();
+        dstC.prepareInference();
+    };
+    auto makePack = [&] {
+        auto p = std::make_shared<InferPack>();
+        for (int s = 0; s < 3; ++s) {
+            p->actor[s].init(cfg, 1);
+            p->critic[s].init(cfg, 1);
+            copySeat(p->actor[s], p->critic[s], actor[s], critic[s]);
+        }
+        return p;
+    };
+    std::shared_ptr<InferPack> live = makePack();
+
+    struct Sample {
+        std::array<std::vector<algo::Transition>, 3> streams;
+        algo::RolloutStats stats{};
+        double rollSecs = 0;
+    };
+    struct Buffer {
+        std::mutex mu;
+        std::condition_variable cv;
+        std::deque<Sample> q;
+        int cap = 2;
+        bool stop = false;
+    } buf;
+    buf.cap = std::max(1, args.buffer);
+
+    std::thread producer([&] {
+        for (int chunk = 0; chunk < args.updates; ++chunk) {
+            {
+                std::lock_guard<std::mutex> lock(buf.mu);
+                if (buf.stop) return;
+            }
+            auto snap = std::atomic_load(&live);
+            algo::ModelSet models{{&snap->actor[0], &snap->actor[1], &snap->actor[2]},
+                                  {&snap->critic[0], &snap->critic[1], &snap->critic[2]}};
+            algo::RolloutConfig rc;
+            rc.gamesPerUpdate = args.games;
+            rc.threads = args.threads;
+            rc.rewardScale = args.rewardScale;
+            rc.seed = args.seed + uint64_t(chunk + 1) * 7919ULL;
+            Sample sample;
+            auto t0 = std::chrono::steady_clock::now();
+            algo::collectRollout(models, rc, sample.streams, sample.stats);
+            sample.rollSecs = std::chrono::duration<double>(
+                                  std::chrono::steady_clock::now() - t0)
+                                  .count();
+            {
+                std::unique_lock<std::mutex> lock(buf.mu);
+                buf.cv.wait(lock, [&] {
+                    return buf.stop || (int)buf.q.size() < buf.cap;
+                });
+                if (buf.stop) return;
+                double rollSecs = sample.rollSecs;
+                auto n0 = sample.stats.transitions[0];
+                auto n1 = sample.stats.transitions[1];
+                auto n2 = sample.stats.transitions[2];
+                buf.q.push_back(std::move(sample));
+                int queued = (int)buf.q.size();
+                std::printf(
+                    "buf chunk %d | rollout %.1fs | q %d/%d | games %d | n %lld/%lld/%lld\n",
+                    chunk + 1, rollSecs, queued, buf.cap, args.games,
+                    n0, n1, n2);
+                std::fflush(stdout);
+            }
+            buf.cv.notify_all();
+        }
+    });
+
     for (int upd = 1; upd <= args.updates; ++upd) {
-        auto t0 = std::chrono::steady_clock::now();
-        algo::ModelSet models{{&actor[0], &actor[1], &actor[2]},
-                              {&critic[0], &critic[1], &critic[2]}};
-        algo::RolloutConfig rc;
-        rc.gamesPerUpdate = args.games;
-        rc.threads = args.threads;
-        rc.rewardScale = args.rewardScale;
-        rc.seed = args.seed + uint64_t(upd) * 7919ULL;
-
-        algo::RolloutStats rs;
-        algo::collectRollout(models, rc, streams, rs);
-
-        double rollSecs = std::chrono::duration<double>(
-                              std::chrono::steady_clock::now() - t0)
-                              .count();
+        auto wall0 = std::chrono::steady_clock::now();
+        Sample sample;
+        int qReady = 0;
+        int qLeft = 0;
+        {
+            std::unique_lock<std::mutex> lock(buf.mu);
+            buf.cv.wait(lock, [&] { return buf.stop || !buf.q.empty(); });
+            if (buf.q.empty()) break;
+            qReady = (int)buf.q.size();
+            sample = std::move(buf.q.front());
+            buf.q.pop_front();
+            qLeft = (int)buf.q.size();
+        }
+        buf.cv.notify_all();
+        streams = std::move(sample.streams);
+        algo::RolloutStats rs = sample.stats;
+        double rollSecs = sample.rollSecs;
         auto t1 = std::chrono::steady_clock::now();
 
         {
             std::lock_guard<std::mutex> lock(job.mu);
             job.upd = upd;
-            ++job.generation;
         }
-        job.cv.notify_all();
-        {
-            std::unique_lock<std::mutex> lock(job.mu);
-            job.cv.wait(lock, [&] { return job.done == job.generation * nLearn; });
+        unsigned failed = runLearn((1u << nLearn) - 1u);
+        for (int attempt = 1; failed != 0 && attempt <= 2; ++attempt) {
+            std::fprintf(stderr,
+                         "GPU device lost during update %d (seats 0x%x), "
+                         "recreating and retrying\n",
+                         upd, failed);
+            releaseGpu();
+            if (!nn::gpuRecreate()) {
+                std::fprintf(stderr, "D3D12 device recreate failed\n");
+                failed = (1u << nLearn) - 1u;
+                break;
+            }
+            failed = runLearn(failed);
         }
+        if (failed) {
+            std::fprintf(stderr,
+                         "GPU device lost again during update %d, stopping\n",
+                         upd);
+            {
+                std::lock_guard<std::mutex> lock(job.mu);
+                job.stop = true;
+            }
+            job.cv.notify_all();
+            for (auto& th : learners)
+                if (th.joinable()) th.join();
+#if defined(_WIN32)
+            if (awake) {
+                PowerClearRequest(awake, PowerRequestExecutionRequired);
+                PowerClearRequest(awake, PowerRequestSystemRequired);
+                CloseHandle(awake);
+            }
+            SetThreadExecutionState(ES_CONTINUOUS);
+#endif
+            {
+                std::lock_guard<std::mutex> lock(buf.mu);
+                buf.stop = true;
+            }
+            buf.cv.notify_all();
+            if (producer.joinable()) producer.join();
+            return 1;
+        }
+
+        std::atomic_store(&live, makePack());
 
         double learnSecs = std::chrono::duration<double>(
                                std::chrono::steady_clock::now() - t1)
                                .count();
+        double wallSecs = std::chrono::duration<double>(
+                              std::chrono::steady_clock::now() - wall0)
+                              .count();
+        int qEnd = 0;
+        {
+            std::lock_guard<std::mutex> lock(buf.mu);
+            qEnd = (int)buf.q.size();
+        }
         double wp = double(rs.landlordWins) / std::max(1, rs.games);
         double adp = double(rs.landlordScore) / std::max(1, rs.games);
         double bpg = double(rs.bombs) / std::max(1, rs.games);
         double mpg = double(rs.moves) / std::max(1, rs.games);
         std::printf(
-            "upd %4d | rollout %.1fs learn %.1fs games %d WP %.3f ADP %7.2f bomb/g %.2f "
+            "upd %4d | q %d/%d left %d end %d | wall %.1fs rollout %.1fs learn %.1fs "
+            "games %d mb %d epochs %d threads %d | WP %.3f ADP %7.2f bomb/g %.2f "
             "moves/g %.1f | ent %5.3f/%5.3f/%5.3f vL %7.2f/%7.2f/%7.2f "
             "ret %7.1f/%7.1f/%7.1f | n %lld/%lld/%lld\n",
-            upd, rollSecs, learnSecs, rs.games, wp, adp, bpg, mpg,
+            upd, qReady, buf.cap, qLeft, qEnd, wallSecs, rollSecs, learnSecs,
+            rs.games, args.minibatch, args.epochs, args.threads, wp, adp, bpg, mpg,
             ps[0].entropy, ps[1].entropy, ps[2].entropy,
             ps[0].vLoss, ps[1].vLoss, ps[2].vLoss,
             ps[0].meanRet, ps[1].meanRet, ps[2].meanRet,
@@ -238,11 +455,28 @@ int main(int argc, char** argv) {
     }
 
     {
+        std::lock_guard<std::mutex> lock(buf.mu);
+        buf.stop = true;
+    }
+    buf.cv.notify_all();
+    if (producer.joinable()) producer.join();
+
+    {
         std::lock_guard<std::mutex> lock(job.mu);
         job.stop = true;
     }
     job.cv.notify_all();
-    for (auto& th : learners) th.join();
+    for (auto& th : learners)
+        if (th.joinable()) th.join();
+
+#if defined(_WIN32)
+    if (awake) {
+        PowerClearRequest(awake, PowerRequestExecutionRequired);
+        PowerClearRequest(awake, PowerRequestSystemRequired);
+        CloseHandle(awake);
+    }
+    SetThreadExecutionState(ES_CONTINUOUS);
+#endif
 
     saveAll(args.out);
     std::cout << "models saved to " << args.out << "/\n";

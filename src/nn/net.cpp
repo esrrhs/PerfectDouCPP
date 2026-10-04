@@ -663,6 +663,7 @@ void Adam::applyGradNorm(const std::vector<Param*>& ps, float maxNorm) {
     // Gradients are produced asynchronously into per-parameter device
     // accumulators; fence, then flush each slot before scanning on host.
     gpuWait();
+    if (!gpuDeviceOk()) return;
     for (Param* p : ps) {
         size_t bytes = size_t(padStride(p->rows * p->cols)) * 4;
         gpuFlushGrad(p->devG, p->dw.data(), bytes);
@@ -679,6 +680,8 @@ void Adam::applyGradNorm(const std::vector<Param*>& ps, float maxNorm) {
     apply(ps);
     // Weights must be resident before buildWT() / CPU inference read them.
     gpuWait();
+    // The step counter advanced, but a lost device does not copy w/m/v back.
+    if (!gpuDeviceOk()) --t;
 }
 
 }  // namespace nn

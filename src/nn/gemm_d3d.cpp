@@ -21,6 +21,7 @@
 #include <dxgi.h>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
@@ -40,6 +41,8 @@ struct Res {
     ID3D12Resource* p = nullptr;
     D3D12_RESOURCE_STATES state = D3D12_RESOURCE_STATE_COMMON;
     size_t cap = 0;
+    // Never transitioned. Used for the per-thread unused-UAV stand-in.
+    bool sticky = false;
 };
 
 struct View {
@@ -82,6 +85,7 @@ struct Slot {
     size_t bytes = 0;
     bool dirty = false;
     bool shadowValid = false;
+    void** owner = nullptr;
     std::vector<char> shadow;
 };
 
@@ -109,12 +113,22 @@ struct Pipe {
 ID3D12Device* g_device = nullptr;
 ID3D12RootSignature* g_root = nullptr;
 
-Res g_dummy;
 Pipe g_pipes[24];
 int g_npipes = 0;
 char g_label[320] = "GPU (D3D12)";
 bool g_initTried = false;
 bool g_initOk = false;
+std::atomic<bool> g_lost{false};
+Res g_dummy;
+
+bool deviceLost() { return g_lost.load(std::memory_order_acquire); }
+
+void noteLost(HRESULT hr) {
+    if (!g_lost.exchange(true, std::memory_order_acq_rel)) {
+        std::fprintf(stderr, "D3D12 device removed: 0x%08lx\n",
+                     (unsigned long)hr);
+    }
+}
 
 struct Ctx {
     ID3D12CommandQueue* queue = nullptr;
@@ -170,9 +184,7 @@ ID3D12Resource* createBuffer(size_t bytes, D3D12_HEAP_TYPE heap,
         &hp, D3D12_HEAP_FLAG_NONE, &d, state, nullptr, IID_PPV_ARGS(&res));
     if (FAILED(hr)) {
         HRESULT why = g_device ? g_device->GetDeviceRemovedReason() : hr;
-        std::fprintf(stderr,
-                     "D3D12 CreateCommittedResource failed: 0x%08lx removed: 0x%08lx\n",
-                     (unsigned long)hr, (unsigned long)why);
+        noteLost(FAILED(why) ? why : hr);
         return nullptr;
     }
     return res;
@@ -180,11 +192,80 @@ ID3D12Resource* createBuffer(size_t bytes, D3D12_HEAP_TYPE heap,
 
 void releaseSlot(Slot* s) {
     if (!s) return;
+    if (s->owner && *s->owner == s) *s->owner = nullptr;
     Ctx& c = ctx();
     auto& live = c.liveSlots;
     live.erase(std::remove(live.begin(), live.end(), s), live.end());
     if (s->gpu.p) s->gpu.p->Release();
     delete s;
+}
+
+void closeRecording(Ctx& c) {
+    if (c.recording && c.list) c.list->Close();
+    c.recording = false;
+}
+
+void teardown(Ctx& c) {
+    // Close before releasing anything the list still names. A device-lost
+    // path used to clear the recording flag and then free those resources
+    // underneath an open command list.
+    closeRecording(c);
+    if (c.event && c.fence && c.fenceValue > 0) {
+        while (c.fence->GetCompletedValue() < c.fenceValue) {
+            c.fence->SetEventOnCompletion(c.fenceValue, c.event);
+            if (WaitForSingleObject(c.event, 5000) != WAIT_OBJECT_0) break;
+        }
+    }
+    std::vector<Slot*> slots;
+    slots.swap(c.liveSlots);
+    c.graveyard.clear();
+    c.dirtyGrads.clear();
+    for (Slot* s : slots) {
+        if (!s) continue;
+        if (s->owner && *s->owner == s) *s->owner = nullptr;
+        if (s->gpu.p) s->gpu.p->Release();
+        delete s;
+    }
+    for (Upload& u : c.uploads) {
+        if (u.p) {
+            u.p->Unmap(0, nullptr);
+            u.p->Release();
+        }
+    }
+    c.uploads.clear();
+    c.pending.clear();
+    for (Chunk& ch : c.chunks)
+        if (ch.res.p) ch.res.p->Release();
+    c.chunks.clear();
+    if (c.readback) {
+        if (c.rbMap) c.readback->Unmap(0, nullptr);
+        c.readback->Release();
+        c.readback = nullptr;
+        c.rbMap = nullptr;
+        c.rbCap = 0;
+    }
+    c.window.clear();
+    if (c.list) {
+        c.list->Release();
+        c.list = nullptr;
+    }
+    for (ID3D12CommandAllocator* a : c.allocs)
+        if (a) a->Release();
+    c.allocs.clear();
+    if (c.queue) {
+        c.queue->Release();
+        c.queue = nullptr;
+    }
+    if (c.fence) {
+        c.fence->Release();
+        c.fence = nullptr;
+    }
+    if (c.event) {
+        CloseHandle(c.event);
+        c.event = nullptr;
+    }
+    c.fenceValue = 0;
+    c.sinceKick = 0;
 }
 
 // Buffers decay to COMMON when ExecuteCommandLists finishes, including
@@ -198,6 +279,10 @@ void noteBufferDecay() {
 }
 
 Ctx::~Ctx() {
+    // Live weight/grad slots outlive this thread: the owning Param releases
+    // them after join. Freeing them here, while another learner is still
+    // submitting, removes the device. d3dReleaseThread() is the path that
+    // drops them, and only after every learner has stopped.
     if (event && fence && fenceValue > 0) {
         while (fence->GetCompletedValue() < fenceValue) {
             fence->SetEventOnCompletion(fenceValue, event);
@@ -216,44 +301,70 @@ Ctx::~Ctx() {
             u.p->Release();
         }
     }
+    uploads.clear();
     for (Chunk& ch : chunks)
         if (ch.res.p) ch.res.p->Release();
+    chunks.clear();
     if (readback) {
         if (rbMap) readback->Unmap(0, nullptr);
         readback->Release();
+        readback = nullptr;
+        rbMap = nullptr;
     }
-    if (list) list->Release();
+    if (list) {
+        list->Release();
+        list = nullptr;
+    }
     for (ID3D12CommandAllocator* a : allocs)
         if (a) a->Release();
-    if (queue) queue->Release();
-    if (fence) fence->Release();
-    if (event) CloseHandle(event);
+    allocs.clear();
+    if (queue) {
+        queue->Release();
+        queue = nullptr;
+    }
+    if (fence) {
+        fence->Release();
+        fence = nullptr;
+    }
+    if (event) {
+        CloseHandle(event);
+        event = nullptr;
+    }
 }
 
 bool ensureThread() {
     Ctx& c = ctx();
     if (c.list) return true;
-    if (!g_device) return false;
+    if (!g_device || deviceLost()) return false;
     D3D12_COMMAND_QUEUE_DESC qd = {};
     qd.Type = D3D12_COMMAND_LIST_TYPE_COMPUTE;
-    if (FAILED(g_device->CreateCommandQueue(&qd, IID_PPV_ARGS(&c.queue))))
+    if (FAILED(g_device->CreateCommandQueue(&qd, IID_PPV_ARGS(&c.queue)))) {
+        noteLost(E_FAIL);
         return false;
+    }
     if (FAILED(g_device->CreateFence(0, D3D12_FENCE_FLAG_NONE,
-                                     IID_PPV_ARGS(&c.fence))))
+                                     IID_PPV_ARGS(&c.fence)))) {
+        noteLost(E_FAIL);
         return false;
+    }
     c.fenceValue = 0;
     ID3D12CommandAllocator* alloc = nullptr;
     if (FAILED(g_device->CreateCommandAllocator(
-            D3D12_COMMAND_LIST_TYPE_COMPUTE, IID_PPV_ARGS(&alloc))))
+            D3D12_COMMAND_LIST_TYPE_COMPUTE, IID_PPV_ARGS(&alloc)))) {
+        noteLost(E_FAIL);
         return false;
+    }
     c.allocs.push_back(alloc);
     c.allocIndex = 0;
     if (FAILED(g_device->CreateCommandList(
             0, D3D12_COMMAND_LIST_TYPE_COMPUTE, alloc, nullptr,
-            IID_PPV_ARGS(&c.list))))
+            IID_PPV_ARGS(&c.list)))) {
+        noteLost(E_FAIL);
         return false;
+    }
     c.list->Close();
     c.event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    if (!c.event) noteLost(E_FAIL);
     return c.event != nullptr;
 }
 
@@ -263,7 +374,7 @@ bool ensureRecording() {
     if (c.recording) return true;
     ID3D12CommandAllocator* alloc = c.allocs[c.allocIndex];
     if (FAILED(alloc->Reset()) || FAILED(c.list->Reset(alloc, nullptr))) {
-        std::fprintf(stderr, "D3D12 command allocator reset failed\n");
+        noteLost(E_FAIL);
         return false;
     }
     c.list->SetComputeRootSignature(g_root);
@@ -271,19 +382,29 @@ bool ensureRecording() {
     return true;
 }
 
+// One packet in flight process-wide. Each learner has its own queue, but
+// three queues executing together never let the GPU go idle and all bind
+// the shared dummy UAV. Either one removes the device on this driver.
+std::mutex& flightMu() {
+    static std::mutex m;
+    return m;
+}
+
 // Windows resets the device if one command list runs longer than the TDR
 // window (about 2s). Close and wait, then keep recording. Waiting before
 // the allocator is reused is required; resetting a list that is still
-// in flight corrupts later dispatches.
+// in flight corrupts later dispatches. Leaving the GPU continuously busy
+// also trips that timeout, so the next packet is not recorded in parallel.
 void kick(bool reopen) {
     Ctx& c = ctx();
     if (!c.recording) return;
     HRESULT hr = c.list->Close();
     c.recording = false;
-    if (FAILED(hr)) {
-        std::fprintf(stderr, "D3D12 Close failed: 0x%08lx\n", (unsigned long)hr);
-        std::abort();
+    if (FAILED(hr) || deviceLost() || !c.queue || !g_device) {
+        if (FAILED(hr)) noteLost(hr);
+        return;
     }
+    std::lock_guard<std::mutex> flight(flightMu());
     ID3D12CommandList* lists[] = {c.list};
     c.queue->ExecuteCommandLists(1, lists);
     UINT64 fv = ++c.fenceValue;
@@ -300,28 +421,27 @@ void kick(bool reopen) {
     }
     HRESULT removed = g_device->GetDeviceRemovedReason();
     if (FAILED(removed)) {
-        std::fprintf(stderr, "D3D12 device removed after kick: 0x%08lx\n",
-                     (unsigned long)removed);
-        std::abort();
+        noteLost(removed);
+        return;
     }
     ++c.nWait;
     c.sinceKick = 0;
     ID3D12CommandAllocator* alloc = c.allocs[c.allocIndex];
     if (FAILED(alloc->Reset())) {
-        std::fprintf(stderr, "D3D12 command allocator reset failed\n");
-        std::abort();
+        noteLost(E_FAIL);
+        return;
     }
     if (!reopen) return;
     if (FAILED(c.list->Reset(alloc, nullptr))) {
-        std::fprintf(stderr, "D3D12 command list reset failed\n");
-        std::abort();
+        noteLost(E_FAIL);
+        return;
     }
     c.list->SetComputeRootSignature(g_root);
     c.recording = true;
 }
 
 void transition(Res* r, D3D12_RESOURCE_STATES to) {
-    if (!r || !r->p || r->state == to || r == &g_dummy) return;
+    if (!r || !r->p || r->sticky || r->state == to) return;
     D3D12_RESOURCE_BARRIER b = {};
     b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
     b.Transition.pResource = r->p;
@@ -346,7 +466,10 @@ UpAlloc allocUpload(size_t bytes) {
     u.cap = std::max(need, size_t(32u << 20));
     u.p = createBuffer(u.cap, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_FLAG_NONE,
                        D3D12_RESOURCE_STATE_GENERIC_READ);
-    if (!u.p) std::abort();
+    if (!u.p) {
+        noteLost(E_FAIL);
+        return {};
+    }
     u.p->Map(0, nullptr, (void**)&u.map);
     u.used = need;
     c.uploads.push_back(u);
@@ -355,7 +478,7 @@ UpAlloc allocUpload(size_t bytes) {
 
 View dummyView() {
     View v;
-    v.res = &g_dummy;
+    v.res = g_dummy.p ? &g_dummy : nullptr;
     v.off = 0;
     v.len = 256;
     return v;
@@ -380,7 +503,10 @@ View allocScratch(size_t bytes, const void* seed) {
         ch->res.p = createBuffer(ch->res.cap, D3D12_HEAP_TYPE_DEFAULT,
                                  D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
                                  D3D12_RESOURCE_STATE_COMMON);
-        if (!ch->res.p) std::abort();
+        if (!ch->res.p) {
+            c.chunks.pop_back();
+            return {};
+        }
         ch->used = 0;
     }
     View v;
@@ -388,8 +514,9 @@ View allocScratch(size_t bytes, const void* seed) {
     v.off = ch->used;
     v.len = bytes;
     ch->used += need;
-    if (seed) {
+        if (seed) {
         UpAlloc u = allocUpload(bytes);
+        if (!u.ptr) return {};
         std::memcpy(u.ptr, seed, bytes);
         c.pending.push_back({v.res, v.off, u.res, u.off, bytes});
         c.stageBytes += (long long)bytes;
@@ -475,9 +602,20 @@ ID3D12PipelineState* findPso(const char* name) {
 
 void dispatch(const char* name, const View* bufs, int nbuf, const void* cst,
               size_t cbytes, UINT gx, UINT gy) {
+    if (deviceLost()) return;
+    for (int i = 0; i < nbuf; ++i) {
+        if (!bufs[i].res || !bufs[i].res->p) {
+            noteLost(E_FAIL);
+            return;
+        }
+    }
     auto t0 = std::chrono::steady_clock::now();
     flushPending();
-    if (!ensureRecording()) return;
+    if (deviceLost()) return;
+    if (!ensureRecording()) {
+        noteLost(E_FAIL);
+        return;
+    }
     Ctx& c = ctx();
     for (int i = 0; i < nbuf; ++i)
         transition(bufs[i].res, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
@@ -521,19 +659,30 @@ View rScalar(const std::vector<float>& v) {
     return kerIn(v.data(), bytes);
 }
 
-Slot* createSlot(const void* host, size_t bytes) {
+Slot* createSlot(void** owner, const void* host, size_t bytes) {
+    if (deviceLost()) return nullptr;
     auto* s = new Slot();
+    s->owner = owner;
     s->bytes = bytes;
     s->gpu.cap = align256(std::max(bytes, size_t(256)));
     s->gpu.state = D3D12_RESOURCE_STATE_COMMON;
     s->gpu.p = createBuffer(s->gpu.cap, D3D12_HEAP_TYPE_DEFAULT,
                             D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
                             D3D12_RESOURCE_STATE_COMMON);
-    if (!s->gpu.p) std::abort();
+    if (!s->gpu.p) {
+        delete s;
+        return nullptr;
+    }
     ctx().liveSlots.push_back(s);
     s->shadow.assign(bytes, 0);
     if (bytes && host) {
         UpAlloc u = allocUpload(bytes);
+        if (!u.ptr) {
+            ctx().liveSlots.pop_back();
+            s->gpu.p->Release();
+            delete s;
+            return nullptr;
+        }
         std::memcpy(u.ptr, host, bytes);
         ctx().pending.push_back({&s->gpu, 0, u.res, u.off, bytes});
         ctx().stageBytes += (long long)bytes;
@@ -1140,6 +1289,7 @@ bool d3dInit() {
     factory->Release();
     g_dummy.cap = 256;
     g_dummy.state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    g_dummy.sticky = true;
     g_dummy.p = createBuffer(256, D3D12_HEAP_TYPE_DEFAULT,
                              D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
                              D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
@@ -1153,6 +1303,35 @@ bool d3dInit() {
 
 bool d3dAvailable() { return d3dInit(); }
 const char* d3dLabel() { return g_label; }
+
+bool d3dDeviceOk() { return !g_initOk || !deviceLost(); }
+
+void d3dReleaseThread() { teardown(ctx()); }
+
+bool d3dRecreate() {
+    for (int i = 0; i < g_npipes; ++i) {
+        if (g_pipes[i].pso) g_pipes[i].pso->Release();
+        g_pipes[i].pso = nullptr;
+        g_pipes[i].name = nullptr;
+    }
+    g_npipes = 0;
+    if (g_root) {
+        g_root->Release();
+        g_root = nullptr;
+    }
+    if (g_dummy.p) {
+        g_dummy.p->Release();
+        g_dummy.p = nullptr;
+    }
+    if (g_device) {
+        g_device->Release();
+        g_device = nullptr;
+    }
+    g_initTried = false;
+    g_initOk = false;
+    g_lost.store(false, std::memory_order_release);
+    return d3dInit();
+}
 
 void d3dPrintStats(const char* tag) {
     Ctx& c = ctx();
@@ -1180,6 +1359,13 @@ void d3dStageInput(const void* p, size_t bytes) {
 
 void d3dWait(bool keepWindow) {
     Ctx& c = ctx();
+    if (deviceLost()) {
+        closeRecording(c);
+        c.pending.clear();
+        c.window.clear();
+        c.dirtyGrads.clear();
+        return;
+    }
     if (!c.recording && c.pending.empty() && c.dirtyGrads.empty()) return;
     auto t0 = std::chrono::steady_clock::now();
     flushPending();
@@ -1220,6 +1406,14 @@ void d3dWait(bool keepWindow) {
         for (Job& j : jobs) transition(j.src, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     }
     if (c.recording) kick(false);
+    if (deviceLost() || !g_device) {
+        c.pending.clear();
+        c.window.clear();
+        c.dirtyGrads.clear();
+        for (Chunk& ch : c.chunks) ch.used = 0;
+        for (Upload& u : c.uploads) u.used = 0;
+        return;
+    }
     if (c.fence && c.fenceValue != 0 &&
         c.fence->GetCompletedValue() < c.fenceValue) {
         c.fence->SetEventOnCompletion(c.fenceValue, c.event);
@@ -1227,8 +1421,13 @@ void d3dWait(bool keepWindow) {
     }
     HRESULT removed = g_device->GetDeviceRemovedReason();
     if (FAILED(removed)) {
-        std::fprintf(stderr, "D3D12 device removed during wait: 0x%08lx\n",
-                     (unsigned long)removed);
+        noteLost(removed);
+        c.pending.clear();
+        c.window.clear();
+        c.dirtyGrads.clear();
+        for (Chunk& ch : c.chunks) ch.used = 0;
+        for (Upload& u : c.uploads) u.used = 0;
+        return;
     }
     for (Job& j : jobs) {
         std::memcpy(j.host, c.rbMap + j.dstOff, j.bytes);
@@ -1264,25 +1463,34 @@ void d3dDropCache(void** slotp) {
 }
 
 void* d3dWeightCache(void** slot, const void* host, size_t bytes) {
-    if (!slot) return nullptr;
-    if (*slot == nullptr) *slot = createSlot(host, bytes);
-    else adoptSlot(static_cast<Slot*>(*slot));
+    if (!slot || deviceLost()) return nullptr;
+    if (*slot == nullptr) {
+        *slot = createSlot(slot, host, bytes);
+        if (!*slot) return nullptr;
+    } else {
+        adoptSlot(static_cast<Slot*>(*slot));
+    }
     return *slot;
 }
 
 void* d3dGradCache(void** slot, const void* host, size_t bytes) {
-    if (!slot) return nullptr;
-    if (*slot == nullptr) *slot = createSlot(host, bytes);
-    else adoptSlot(static_cast<Slot*>(*slot));
+    if (!slot || deviceLost()) return nullptr;
+    if (*slot == nullptr) {
+        *slot = createSlot(slot, host, bytes);
+        if (!*slot) return nullptr;
+    } else {
+        adoptSlot(static_cast<Slot*>(*slot));
+    }
     markDirty(static_cast<Slot*>(*slot));
     return *slot;
 }
 
 void d3dFlushGrad(void* slot, void* host, size_t bytes) {
-    if (!slot || !host || bytes == 0) return;
+    if (!slot || !host || bytes == 0 || deviceLost()) return;
     Slot* s = static_cast<Slot*>(slot);
     adoptSlot(s);
     if (s->dirty || !s->shadowValid) d3dWait(true);
+    if (deviceLost() || !s->shadowValid) return;
     size_t n = std::min(bytes, s->shadow.size());
     std::memcpy(host, s->shadow.data(), n);
     ctx().flushBytes += (long long)n;
@@ -1300,6 +1508,7 @@ void d3dCustomGemm(const GemmOp& g, const void* biasV, size_t biasBytes, int epi
     View rB;
     if (g.wSlot) {
         Slot* s = static_cast<Slot*>(d3dWeightCache(g.wSlot, g.B, br * g.ldb * 4));
+        if (!s) return;
         rB.res = &s->gpu;
         rB.off = 0;
         rB.len = s->bytes;
@@ -1396,6 +1605,7 @@ void d3dAddTo(float* dst, void** gSlot, int dstCols, const Mat& src) {
     struct P { int rows, cols, dc, sc; } p{src.r, src.c, dstCols, src.s};
     size_t rounded = (size_t(src.r) * dstCols * 4 + 15) & ~size_t(15);
     Slot* s = static_cast<Slot*>(d3dGradCache(gSlot, dst, rounded));
+    if (!s) return;
     View rd;
     rd.res = &s->gpu;
     rd.off = 0;
@@ -1406,6 +1616,7 @@ void d3dBiasGradAdd(const Mat& g, float* db, void** dbSlot) {
     struct P { int B, o, gs; } p{g.r, g.c, g.s};
     size_t rounded = (size_t(g.c) * 4 + 15) & ~size_t(15);
     Slot* s = static_cast<Slot*>(d3dGradCache(dbSlot, db, rounded));
+    if (!s) return;
     View rd;
     rd.res = &s->gpu;
     rd.off = 0;

@@ -2,7 +2,12 @@
 #include "nn/gemm.h"
 
 #include <algorithm>
+#include <condition_variable>
 #include <cstdio>
+#include <exception>
+#include <functional>
+#include <mutex>
+#include <thread>
 #include <vector>
 
 #if defined(__APPLE__)
@@ -300,9 +305,90 @@ void gpuMarkHost(float* p) {
 #endif
 }
 
+void gpuInvoke(const std::function<void()>& fn) {
+#if !defined(PD_HAVE_D3D)
+    fn();
+#else
+    // One queue, one thread. Three compute queues on this NVIDIA driver
+    // remove the device even when their packets are executed one at a time.
+    struct Owner {
+        std::mutex mu;
+        std::condition_variable cv;
+        std::function<void()> job;
+        std::exception_ptr error;
+        bool pending = false;
+        bool done = false;
+        bool busy = false;
+        bool stop = false;
+        std::thread th;
+        Owner() {
+            th = std::thread([this] {
+                for (;;) {
+                    std::function<void()> run;
+                    {
+                        std::unique_lock<std::mutex> lk(mu);
+                        cv.wait(lk, [&] { return pending || stop; });
+                        if (stop && !pending) return;
+                        run = std::move(job);
+                        pending = false;
+                    }
+                    std::exception_ptr ep;
+                    try {
+                        run();
+                    } catch (...) {
+                        ep = std::current_exception();
+                    }
+                    {
+                        std::lock_guard<std::mutex> lk(mu);
+                        error = ep;
+                        done = true;
+                    }
+                    cv.notify_all();
+                }
+            });
+        }
+        ~Owner() {
+            {
+                std::lock_guard<std::mutex> lk(mu);
+                stop = true;
+            }
+            cv.notify_all();
+            if (th.joinable()) th.join();
+        }
+    };
+    static Owner owner;
+    if (std::this_thread::get_id() == owner.th.get_id()) {
+        fn();
+        return;
+    }
+    std::unique_lock<std::mutex> lk(owner.mu);
+    owner.cv.wait(lk, [&] { return !owner.busy; });
+    owner.busy = true;
+    owner.done = false;
+    owner.error = nullptr;
+    owner.job = fn;
+    owner.pending = true;
+    lk.unlock();
+    owner.cv.notify_all();
+    lk.lock();
+    owner.cv.wait(lk, [&] { return owner.done; });
+    std::exception_ptr ep = owner.error;
+    owner.busy = false;
+    lk.unlock();
+    owner.cv.notify_all();
+    if (ep) std::rethrow_exception(ep);
+#endif
+}
+
 void gpuDropCache(void** slot) {
 #ifdef PD_HAVE_GPU
-    if (slot != nullptr && *slot != nullptr) PD_BE(DropCache)(slot);
+    if (slot != nullptr && *slot != nullptr) {
+#if defined(PD_HAVE_D3D)
+        gpuInvoke([slot] { PD_BE(DropCache)(slot); });
+#else
+        PD_BE(DropCache)(slot);
+#endif
+    }
 #else
     (void)slot;
 #endif
@@ -331,6 +417,31 @@ void gpuFlushGrad(void* slot, void* host, size_t bytes) {
     if (gemmGpuEnabled()) PD_BE(FlushGrad)(slot, host, bytes);
 #else
     (void)slot; (void)host; (void)bytes;
+#endif
+}
+
+bool gpuDeviceOk() {
+#if defined(PD_HAVE_D3D)
+    extern bool d3dDeviceOk();
+    return d3dDeviceOk();
+#else
+    return true;
+#endif
+}
+
+void gpuReleaseThread() {
+#if defined(PD_HAVE_D3D)
+    extern void d3dReleaseThread();
+    gpuInvoke([] { d3dReleaseThread(); });
+#endif
+}
+
+bool gpuRecreate() {
+#if defined(PD_HAVE_D3D)
+    extern bool d3dRecreate();
+    return d3dRecreate();
+#else
+    return true;
 #endif
 }
 

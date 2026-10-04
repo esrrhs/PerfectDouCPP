@@ -9,28 +9,27 @@
 
 namespace algo {
 
-void buildBatch(const std::vector<Transition*>& tr, nn::Mat& xImp, nn::Mat& seq,
-                nn::Mat& mask, nn::Mat& dynFeat, nn::Mat& extra) {
-    using namespace nn;
-    int B = static_cast<int>(tr.size());
-    xImp.resize(B, ddz::kImpSize);
-    seq.resize(B * ddz::kHistoryLen, ddz::kCardMat);
-    mask.resize(B, ddz::kAbstractActions);
-    dynFeat.resize(B * ddz::kAbstractActions, ddz::kActionDyn);
-    extra.resize(B, ddz::kExtraSize);
+namespace {
+
+void writeDense(const Transition& t, float* xImp, float* seqSample, float* extra) {
+    for (int j = 0; j < ddz::kImpBin; ++j) xImp[j] = float(t.imp[j]);
+    std::copy(t.scalar.begin(), t.scalar.end(), xImp + ddz::kImpBin);
+    for (int k = 0; k < ddz::kHistoryLen; ++k) {
+        const uint8_t* src = t.imp.data() + (6 + k) * ddz::kCardMat;
+        float* dst = seqSample + k * ddz::kCardMat;
+        for (int j = 0; j < ddz::kCardMat; ++j) dst[j] = float(src[j]);
+    }
+    for (int j = 0; j < ddz::kExtraBin; ++j) extra[j] = float(t.extra[j]);
+    std::copy(t.extraScalar.begin(), t.extraScalar.end(), extra + ddz::kExtraBin);
+}
+
+void scatterMaskDyn(const std::vector<Transition*>& tr, nn::Mat& mask,
+                    nn::Mat& dynFeat) {
     std::fill(dynFeat.d.begin(), dynFeat.d.end(), 0.0f);
     std::fill(mask.d.begin(), mask.d.end(), 0.0f);
+    int B = static_cast<int>(tr.size());
     for (int i = 0; i < B; ++i) {
         const Transition& t = *tr[i];
-        float* xi = xImp.row(i);
-        for (int j = 0; j < ddz::kImpBin; ++j) xi[j] = float(t.imp[j]);
-        std::copy(t.scalar.begin(), t.scalar.end(), xi + ddz::kImpBin);
-        // history blocks are slots 6..20 of the imperfect feature matrices
-        for (int k = 0; k < ddz::kHistoryLen; ++k) {
-            const uint8_t* src = t.imp.data() + (6 + k) * ddz::kCardMat;
-            float* dst = seq.row(k * B + i);
-            for (int j = 0; j < ddz::kCardMat; ++j) dst[j] = float(src[j]);
-        }
         for (int w = 0; w < 10; ++w) {
             uint64_t bits = t.mask[w];
             while (bits) {
@@ -43,10 +42,68 @@ void buildBatch(const std::vector<Transition*>& tr, nn::Mat& xImp, nn::Mat& seq,
             float* df = dynFeat.row(i * ddz::kAbstractActions + id);
             for (int j = 0; j < ddz::kActionDyn; ++j) df[j] = d[j];
         }
-        float* ei = extra.row(i);
-        for (int j = 0; j < ddz::kExtraBin; ++j) ei[j] = float(t.extra[j]);
-        std::copy(t.extraScalar.begin(), t.extraScalar.end(),
-                  ei + ddz::kExtraBin);
+    }
+}
+
+void sizeBatch(int B, nn::Mat& xImp, nn::Mat& seq, nn::Mat& mask, nn::Mat& dynFeat,
+               nn::Mat& extra) {
+    xImp.resize(B, ddz::kImpSize);
+    seq.resize(B * ddz::kHistoryLen, ddz::kCardMat);
+    mask.resize(B, ddz::kAbstractActions);
+    dynFeat.resize(B * ddz::kAbstractActions, ddz::kActionDyn);
+    extra.resize(B, ddz::kExtraSize);
+}
+
+}  // namespace
+
+void cacheTransitionFeatures(const std::vector<Transition>& tr,
+                             std::vector<float>& xImp, std::vector<float>& seq,
+                             std::vector<float>& extra) {
+    int N = static_cast<int>(tr.size());
+    int xs = nn::padStride(ddz::kImpSize);
+    int es = nn::padStride(ddz::kExtraSize);
+    xImp.assign(size_t(N) * xs, 0.0f);
+    seq.assign(size_t(N) * ddz::kHistoryLen * ddz::kCardMat, 0.0f);
+    extra.assign(size_t(N) * es, 0.0f);
+    for (int i = 0; i < N; ++i) {
+        writeDense(tr[i], xImp.data() + size_t(i) * xs,
+                   seq.data() + size_t(i) * ddz::kHistoryLen * ddz::kCardMat,
+                   extra.data() + size_t(i) * es);
+    }
+}
+
+void buildBatch(const std::vector<Transition*>& tr, nn::Mat& xImp, nn::Mat& seq,
+                nn::Mat& mask, nn::Mat& dynFeat, nn::Mat& extra) {
+    int B = static_cast<int>(tr.size());
+    sizeBatch(B, xImp, seq, mask, dynFeat, extra);
+    scatterMaskDyn(tr, mask, dynFeat);
+    for (int i = 0; i < B; ++i) {
+        float seqSample[ddz::kHistoryLen * ddz::kCardMat];
+        writeDense(*tr[i], xImp.row(i), seqSample, extra.row(i));
+        for (int k = 0; k < ddz::kHistoryLen; ++k)
+            std::copy(seqSample + k * ddz::kCardMat,
+                      seqSample + (k + 1) * ddz::kCardMat, seq.row(k * B + i));
+    }
+}
+
+void buildBatchFromCache(const std::vector<Transition*>& tr,
+                         const Transition* base, const float* xAll, int xStride,
+                         const float* seqAll, const float* eAll, int eStride,
+                         nn::Mat& xImp, nn::Mat& seq, nn::Mat& mask,
+                         nn::Mat& dynFeat, nn::Mat& extra) {
+    int B = static_cast<int>(tr.size());
+    sizeBatch(B, xImp, seq, mask, dynFeat, extra);
+    scatterMaskDyn(tr, mask, dynFeat);
+    for (int i = 0; i < B; ++i) {
+        int id = static_cast<int>(tr[i] - base);
+        std::copy(xAll + size_t(id) * xStride,
+                  xAll + size_t(id) * xStride + ddz::kImpSize, xImp.row(i));
+        const float* ss = seqAll + size_t(id) * ddz::kHistoryLen * ddz::kCardMat;
+        for (int k = 0; k < ddz::kHistoryLen; ++k)
+            std::copy(ss + k * ddz::kCardMat, ss + (k + 1) * ddz::kCardMat,
+                      seq.row(k * B + i));
+        std::copy(eAll + size_t(id) * eStride,
+                  eAll + size_t(id) * eStride + ddz::kExtraSize, extra.row(i));
     }
 }
 
@@ -65,6 +122,11 @@ void runWorker(const ModelSet& models, const RolloutConfig& cfg, int nGames,
     // Self-play inference stays on CPU: the GPU is reserved for PPO learning,
     // and many worker threads issuing synchronous GPU encodings serialize.
     gemmSetThreadGpu(0);
+    // Drop the oracle memo before this thread returns. The pthread TLS
+    // teardown on MinGW runs before C++ thread_local destructors.
+    struct OracleGuard {
+        ~OracleGuard() { clearOracleCache(); }
+    } oracleGuard;
 
     Rng dealRng(seed ^ 0xabcdef123456789ULL);
     Rng sampleRng(seed ^ 0x123456789abcdef0ULL);
