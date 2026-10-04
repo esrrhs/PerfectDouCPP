@@ -7,6 +7,7 @@
 // explicitly; residency windows suballocate those heaps so a training step
 // does not create one resource per tensor.
 #include "nn/gemm.h"
+#include "nn/gemm_cuda_bridge.h"
 #include "nn/kernels.h"
 
 #ifndef WIN32_LEAN_AND_MEAN
@@ -123,10 +124,125 @@ Res g_dummy;
 
 bool deviceLost() { return g_lost.load(std::memory_order_acquire); }
 
+struct Crumb {
+    const char* name = nullptr;
+    unsigned gx = 0, gy = 0;
+    int a = 0, b = 0, c = 0, d = 0;
+};
+constexpr int kCrumbN = 12;
+Crumb g_crumb[kCrumbN];
+int g_crumbCount = 0;
+
+struct BufInfo {
+    unsigned long long va = 0;
+    size_t off = 0, len = 0, cap = 0;
+};
+struct LastCmd {
+    const char* name = nullptr;
+    unsigned gx = 0, gy = 0;
+    int nconst = 0;
+    int cst[16] = {};
+    int nbuf = 0;
+    BufInfo buf[8];
+};
+LastCmd g_last;
+
+int reproLog() {
+    static int on = -1;
+    if (on < 0) on = std::getenv("PD_REPRO") ? 1 : 0;
+    return on;
+}
+
+int kickEvery() {
+    static int n = -1;
+    if (n < 0) {
+        const char* e = std::getenv("PD_KICK");
+        n = e ? std::atoi(e) : 32;
+        if (n < 1) n = 1;
+    }
+    return n;
+}
+
+void writeLastCmd() {
+    if (!reproLog() || !g_last.name) return;
+    CreateDirectoryA("build-win", nullptr);
+    CreateDirectoryA("build-win\\repro", nullptr);
+    FILE* f = std::fopen("build-win/repro/last_cmd.txt", "w");
+    if (!f) return;
+    std::fprintf(f, "%s grid %u %u\n", g_last.name, g_last.gx, g_last.gy);
+    std::fprintf(f, "const");
+    for (int i = 0; i < g_last.nconst; ++i) std::fprintf(f, " %d", g_last.cst[i]);
+    std::fprintf(f, "\n");
+    for (int i = 0; i < g_last.nbuf; ++i) {
+        const BufInfo& b = g_last.buf[i];
+        unsigned long long tail =
+            b.cap > b.off + b.len ? (unsigned long long)(b.cap - (b.off + b.len)) : 0;
+        std::fprintf(f, "buf %d va 0x%llx off %zu len %zu cap %zu tail %llu\n",
+                     i, b.va, b.off, b.len, b.cap, tail);
+    }
+    std::fclose(f);
+}
+
+void remember(const char* name, unsigned gx, unsigned gy, const void* cst,
+              size_t cbytes) {
+    Crumb& cr = g_crumb[g_crumbCount++ % kCrumbN];
+    cr.name = name;
+    cr.gx = gx;
+    cr.gy = gy;
+    cr.a = cr.b = cr.c = cr.d = 0;
+    if (cst && cbytes >= sizeof(int) * 4) {
+        const int* p = static_cast<const int*>(cst);
+        cr.a = p[0];
+        cr.b = p[1];
+        cr.c = p[2];
+        cr.d = p[3];
+    }
+}
+
+void preserveRepro() {
+    CreateDirectoryA("build-win", nullptr);
+    CreateDirectoryA("build-win\\repro", nullptr);
+    CreateDirectoryA("build-win\\repro\\lost", nullptr);
+    const char* names[] = {
+        "last_cmd.txt", "round.txt", "xImp.bin", "seq.bin", "mask.bin",
+        "dyn.bin", "extra.bin", "logits.bin", "values.bin",
+        "actor_w.bin", "critic_w.bin"};
+    for (const char* name : names) {
+        char src[160], dst[160];
+        std::snprintf(src, sizeof(src), "build-win/repro/%s", name);
+        std::snprintf(dst, sizeof(dst), "build-win/repro/lost/%s", name);
+        CopyFileA(src, dst, FALSE);
+    }
+}
+
 void noteLost(HRESULT hr) {
     if (!g_lost.exchange(true, std::memory_order_acq_rel)) {
         std::fprintf(stderr, "D3D12 device removed: 0x%08lx\n",
                      (unsigned long)hr);
+        int n = g_crumbCount < kCrumbN ? g_crumbCount : kCrumbN;
+        int begin = g_crumbCount - n;
+        std::fprintf(stderr, "last %d GPU commands:\n", n);
+        for (int i = 0; i < n; ++i) {
+            const Crumb& cr = g_crumb[(begin + i) % kCrumbN];
+            std::fprintf(stderr, "  %s grid %u %u args %d %d %d %d\n",
+                         cr.name ? cr.name : "-", cr.gx, cr.gy, cr.a, cr.b,
+                         cr.c, cr.d);
+        }
+        if (g_last.name) {
+            std::fprintf(stderr, "hung %s grid %u %u\n", g_last.name, g_last.gx,
+                         g_last.gy);
+            for (int i = 0; i < g_last.nbuf; ++i) {
+                const BufInfo& b = g_last.buf[i];
+                unsigned long long tail = b.cap > b.off + b.len
+                                               ? (unsigned long long)(b.cap - (b.off + b.len))
+                                               : 0;
+                std::fprintf(stderr,
+                             "  buf %d off %zu len %zu cap %zu tail %llu\n",
+                             i, b.off, b.len, b.cap, tail);
+            }
+        }
+        preserveRepro();
+        std::fflush(stderr);
     }
 }
 
@@ -180,8 +296,11 @@ ID3D12Resource* createBuffer(size_t bytes, D3D12_HEAP_TYPE heap,
     d.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
     d.Flags = flags;
     ID3D12Resource* res = nullptr;
+    D3D12_HEAP_FLAGS heapFlags = D3D12_HEAP_FLAG_NONE;
+    if (heap == D3D12_HEAP_TYPE_DEFAULT && std::getenv("PD_CUBLAS"))
+        heapFlags = D3D12_HEAP_FLAG_SHARED;
     HRESULT hr = g_device->CreateCommittedResource(
-        &hp, D3D12_HEAP_FLAG_NONE, &d, state, nullptr, IID_PPV_ARGS(&res));
+        &hp, heapFlags, &d, state, nullptr, IID_PPV_ARGS(&res));
     if (FAILED(hr)) {
         HRESULT why = g_device ? g_device->GetDeviceRemovedReason() : hr;
         noteLost(FAILED(why) ? why : hr);
@@ -342,7 +461,10 @@ bool ensureThread() {
         noteLost(E_FAIL);
         return false;
     }
-    if (FAILED(g_device->CreateFence(0, D3D12_FENCE_FLAG_NONE,
+    D3D12_FENCE_FLAGS fenceFlags = std::getenv("PD_CUBLAS")
+                                       ? D3D12_FENCE_FLAG_SHARED
+                                       : D3D12_FENCE_FLAG_NONE;
+    if (FAILED(g_device->CreateFence(0, fenceFlags,
                                      IID_PPV_ARGS(&c.fence)))) {
         noteLost(E_FAIL);
         return false;
@@ -407,6 +529,20 @@ void kick(bool reopen) {
     std::lock_guard<std::mutex> flight(flightMu());
     ID3D12CommandList* lists[] = {c.list};
     c.queue->ExecuteCommandLists(1, lists);
+    // Written before the fence wait, so a TDR that never returns still leaves
+    // the packet's kernel and buffer placement on disk.
+    writeLastCmd();
+    // Flushed before the fence wait, so a TDR that never returns still leaves
+    // the last packet's kernel on disk. Off unless PD_GPU_LOG is set.
+    static int logExec = -1;
+    if (logExec < 0) logExec = std::getenv("PD_GPU_LOG") ? 1 : 0;
+    if (logExec) {
+        const Crumb& cr = g_crumb[(g_crumbCount + kCrumbN - 1) % kCrumbN];
+        std::fprintf(stderr, "[d3d] execute #%d last=%s grid %u %u args %d %d %d %d\n",
+                     g_crumbCount, cr.name ? cr.name : "-", cr.gx, cr.gy, cr.a,
+                     cr.b, cr.c, cr.d);
+        std::fflush(stderr);
+    }
     UINT64 fv = ++c.fenceValue;
     c.queue->Signal(c.fence, fv);
     // Decay is sequenced before the next list on this queue, so record
@@ -631,8 +767,36 @@ void dispatch(const char* name, const View* bufs, int nbuf, const void* cst,
     if (cbytes)
         c.list->SetComputeRoot32BitConstants(7, (UINT)(cbytes / 4), cst, 0);
     c.list->Dispatch(std::max(gx, 1u), std::max(gy, 1u), 1);
+    remember(name, gx, gy, cst, cbytes);
+    g_last.name = name;
+    g_last.gx = gx;
+    g_last.gy = gy;
+    g_last.nconst = 0;
+    if (cst && cbytes >= sizeof(int)) {
+        int n = (int)std::min(cbytes / sizeof(int), sizeof(g_last.cst) / sizeof(int));
+        const int* p = static_cast<const int*>(cst);
+        for (int i = 0; i < n; ++i) g_last.cst[i] = p[i];
+        g_last.nconst = n;
+    }
+    g_last.nbuf = std::min(nbuf, 8);
+    for (int i = 0; i < g_last.nbuf; ++i) {
+        BufInfo& b = g_last.buf[i];
+        b.off = bufs[i].off;
+        b.len = bufs[i].len;
+        b.cap = bufs[i].res ? bufs[i].res->cap : 0;
+        b.va = bufs[i].res && bufs[i].res->p
+                   ? (unsigned long long)bufs[i].va()
+                   : 0;
+        if (bufs[i].len == 0 || !bufs[i].res) continue;
+        if (bufs[i].off + bufs[i].len > bufs[i].res->cap) {
+            std::fprintf(stderr,
+                         "D3D buffer past resource %s buf %d off %zu len %zu cap %zu\n",
+                         name, i, bufs[i].off, bufs[i].len, bufs[i].res->cap);
+            std::fflush(stderr);
+        }
+    }
     ++c.nCommit;
-    if (++c.sinceKick >= 32) kick(true);
+    if (++c.sinceKick >= kickEvery()) kick(true);
     c.encSec += std::chrono::duration<double>(
                     std::chrono::steady_clock::now() - t0)
                     .count();
@@ -1520,6 +1684,56 @@ void d3dCustomGemm(const GemmOp& g, const void* biasV, size_t biasBytes, int epi
     View bufs[4] = {rA, rB, rC, rBias};
     GParam p{g.M, g.N, g.K, g.lda, g.ldb, g.ldc,
              g.transA == 'T' ? 1 : 0, g.transB == 'T' ? 1 : 0, epi};
+    if (std::getenv("PD_CUBLAS")) {
+        // Materialize all uploads and finish preceding D3D kernels before
+        // cuBLAS touches the same shared resources. cuBLAS is synchronized on
+        // the CPU before recording the next D3D kernel.
+        flushPending();
+        if (ctx().recording) kick(false);
+        UINT64 waitValue = ctx().fenceValue;
+        UINT64 signalValue = waitValue + 1;
+        size_t outBytes = size_t(g.M) * g.ldc * sizeof(float);
+        std::vector<float> cudaOut(size_t(g.M) * g.ldc);
+        bool ok = !deviceLost() &&
+                  cudaBridgeGemm(g_device, ctx().queue, ctx().fence,
+                                 waitValue, signalValue,
+                                 rA.res->p, rA.off,
+                                 rB.res->p, rB.off,
+                                 rC.res->p, rC.off,
+                                 g.transA, g.transB,
+                                 g.M, g.N, g.K, g.lda, g.ldb, g.ldc,
+                                 cudaOut.data(), outBytes);
+        if (!ok) {
+            std::fprintf(stderr, "CUDA GEMM bridge failed: %s\n",
+                         cudaBridgeError());
+            noteLost(E_FAIL);
+            return;
+        }
+        ctx().fenceValue = signalValue;
+        // CUDA -> D3D12 writes are copied through an upload heap for now.
+        // D3D -> CUDA uses shared memory directly; this conservative return
+        // path avoids relying on driver cache visibility that failed parity
+        // on this laptop.
+        UpAlloc outUpload = allocUpload(outBytes);
+        if (!outUpload.ptr) {
+            noteLost(E_FAIL);
+            return;
+        }
+        std::memcpy(outUpload.ptr, cudaOut.data(), outBytes);
+        ctx().pending.push_back(
+            {rC.res, rC.off, outUpload.res, outUpload.off, outBytes});
+        ctx().stageBytes += (long long)outBytes;
+        if (epi == 1) {
+            struct BiasP { int a, b, c; } bp{g.N, g.M * g.N, g.ldc};
+            View add[2] = {rC, rBias};
+            dispatch("add_bias", add, 2, &bp, sizeof(bp),
+                     (UINT)((g.M * g.N + 63) / 64), 1);
+            struct ReluP { int a, b, c; } rp{g.N, g.M * g.N, g.ldc};
+            dispatch("relu_fwd", &rC, 1, &rp, sizeof(rp),
+                     (UINT)((g.M * g.N + 63) / 64), 1);
+        }
+        return;
+    }
     int variant = 2;
     if (std::getenv("PD_GEMM_OLD")) variant = 2;
     else if (const char* f = std::getenv("PD_GEMM_FORCE")) variant = std::atoi(f);
@@ -1529,6 +1743,11 @@ void d3dCustomGemm(const GemmOp& g, const void* biasV, size_t biasBytes, int epi
     // variant is not ported.
     if (variant == 3) variant = 0;
     if (variant < 0 || variant > 2) variant = 0;
+    // gemm_block's K-loop barrier hangs this driver when K is shorter than the
+    // 16-wide tile and the dispatch is the last command in the packet. The
+    // value head backward is exactly that shape (K=1). The barrier-free kernel
+    // covers it; one product has the same rounding either way.
+    if (variant != 2 && g.K < 16) variant = 2;
     const char* name = variant == 0 ? "gemm_block" : variant == 1 ? "gemm_blockn"
                                                                   : "gemm_tiled";
     UINT gx, gy;
@@ -1543,6 +1762,26 @@ void d3dCustomGemm(const GemmOp& g, const void* biasV, size_t biasBytes, int epi
         gy = (UINT)((g.M + 15) / 16);
     }
     dispatch(name, bufs, 4, &p, sizeof(p), gx, gy);
+    auto floats = [](int rows, int stride, int cols) -> size_t {
+        if (rows <= 0 || cols <= 0 || stride <= 0) return 0;
+        return (size_t)(rows - 1) * (size_t)stride + (size_t)cols;
+    };
+    size_t need[4] = {
+        (g.transA == 'T' ? floats(g.K, g.lda, g.M) : floats(g.M, g.lda, g.K)) * 4,
+        (g.transB == 'T' ? floats(g.N, g.ldb, g.K) : floats(g.K, g.ldb, g.N)) * 4,
+        floats(g.M, g.ldc, g.N) * 4,
+        epi ? (size_t)g.N * 4 : 0,
+    };
+    for (int i = 0; i < 4; ++i) {
+        if (i == 3 && epi == 0) continue;
+        if (bufs[i].len == 0) continue;
+        if (need[i] > bufs[i].len) {
+            std::fprintf(stderr,
+                         "D3D gemm OOB %s buf %d need %zu len %zu M %d N %d K %d\n",
+                         name, i, need[i], bufs[i].len, g.M, g.N, g.K);
+            std::fflush(stderr);
+        }
+    }
 }
 
 void d3dCommitGemms(int count, const GemmOp* ops, long long) {

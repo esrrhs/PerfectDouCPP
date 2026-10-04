@@ -4,6 +4,10 @@
 #include <array>
 #include <atomic>
 #include <cmath>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <filesystem>
 #include <mutex>
 #include <numeric>
 #include <thread>
@@ -43,6 +47,68 @@ void maskedSoftmax(const float* logits, int n, float* probs) {
     }
     float inv = 1.0f / sum;
     for (int a = 0; a < n; ++a) probs[a] *= inv;
+}
+
+}  // namespace
+
+namespace {
+
+bool reproDump() {
+    static int on = -1;
+    if (on < 0) on = std::getenv("PD_REPRO") ? 1 : 0;
+    return on != 0;
+}
+
+void writeMat(const char* path, const nn::Mat& m) {
+    FILE* f = std::fopen(path, "wb");
+    if (!f) return;
+    int hdr[3] = {m.r, m.c, m.s};
+    std::fwrite(hdr, sizeof(int), 3, f);
+    if (m.r > 0 && m.s > 0 && m.data())
+        std::fwrite(m.data(), sizeof(float), size_t(m.r) * m.s, f);
+    std::fclose(f);
+}
+
+void dumpWeights(const nn::Actor& actor, const nn::Critic& critic) {
+    std::filesystem::create_directories("build-win/repro");
+    auto dumpParams = [](const char* path, const std::vector<nn::Param*>& ps) {
+        FILE* f = std::fopen(path, "wb");
+        if (!f) return;
+        int n = (int)ps.size();
+        std::fwrite(&n, sizeof(int), 1, f);
+        for (const nn::Param* p : ps) {
+            int meta[3] = {p->rows, p->cols, (int)p->w.size()};
+            std::fwrite(meta, sizeof(int), 3, f);
+            if (!p->w.empty())
+                std::fwrite(p->w.data(), sizeof(float), p->w.size(), f);
+        }
+        std::fclose(f);
+    };
+    dumpParams("build-win/repro/actor_w.bin",
+               const_cast<nn::Actor&>(actor).params());
+    dumpParams("build-win/repro/critic_w.bin",
+               const_cast<nn::Critic&>(critic).params());
+}
+
+void dumpRound(int batchNo, const std::vector<Transition*>& mb, const Batch& batch) {
+    std::filesystem::create_directories("build-win/repro");
+    FILE* meta = std::fopen("build-win/repro/round.txt", "w");
+    if (meta) {
+        std::fprintf(meta, "batch %d B %d\n", batchNo, (int)mb.size());
+        for (size_t i = 0; i < mb.size(); ++i) {
+            const Transition* t = mb[i];
+            std::fprintf(meta, "%zu action %d logp %.8g adv %.8g ret %.8g reward %.8g value %.8g\n",
+                         i, t->action, t->logp, t->adv, t->ret, t->reward, t->value);
+        }
+        std::fclose(meta);
+    }
+    writeMat("build-win/repro/xImp.bin", batch.xImp);
+    writeMat("build-win/repro/seq.bin", batch.seq);
+    writeMat("build-win/repro/mask.bin", batch.mask);
+    writeMat("build-win/repro/dyn.bin", batch.dynFeat);
+    writeMat("build-win/repro/extra.bin", batch.extra);
+    std::remove("build-win/repro/logits.bin");
+    std::remove("build-win/repro/values.bin");
 }
 
 }  // namespace
@@ -90,10 +156,46 @@ bool ppoUpdate(nn::Actor& actor, nn::Critic& critic,
         (N + std::max(cfg.minibatch, 1) - 1) / std::max(cfg.minibatch, 1);
     const int totalBatches = cfg.epochs * batchesPerEpoch;
 
+    const bool singleThread = std::getenv("PD_SINGLE_THREAD") != nullptr;
+    int prodEp = 0;
+    int prodLo = 0;
+    bool needShuffle = true;
+    auto produceOne = [&]() -> bool {
+        while (prodEp < cfg.epochs && prodLo >= N) {
+            ++prodEp;
+            needShuffle = true;
+            prodLo = 0;
+        }
+        if (prodEp >= cfg.epochs) return false;
+        if (needShuffle) {
+            for (int i = N - 1; i > 0; --i) {
+                int j = int(rng.nextU64() % uint64_t(i + 1));
+                std::swap(order[i], order[j]);
+            }
+            needShuffle = false;
+            prodLo = 0;
+        }
+        int hi = std::min(prodLo + cfg.minibatch, N);
+        size_t tail = produced.load(std::memory_order_relaxed);
+        PreparedBatch& out = queue[tail % kQueueDepth];
+        out.mb.resize(hi - prodLo);
+        for (int i = prodLo; i < hi; ++i)
+            out.mb[i - prodLo] = &tr[order[i]];
+        buildBatchFromCache(
+            out.mb, tr.data(), xAll.data(), xStride, seqAll.data(),
+            eAll.data(), eStride, out.data.xImp, out.data.seq,
+            out.data.mask, out.data.dynFeat, out.data.extra);
+        produced.store(tail + 1, std::memory_order_release);
+        prodLo = hi;
+        return true;
+    };
+
     // This producer owns the shuffle RNG and writes one SPSC ring slot at a
     // time. The learner keeps ownership of its D3D context and only consumes
-    // fully materialized host batches.
-    std::thread prepareThread([&] {
+    // fully materialized host batches. Single-thread mode fills the next
+    // batch on this same thread instead.
+    std::thread prepareThread;
+    if (!singleThread) prepareThread = std::thread([&] {
         // Host only. A second command queue on this thread cannot be used
         // by the learner, and dropping a device cache here would free it
         // off the thread that created it.
@@ -139,18 +241,26 @@ bool ppoUpdate(nn::Actor& actor, nn::Critic& critic,
     double pgLossSum = 0, vLossSum = 0, entSum = 0;
     int mbCount = 0;
     bool deviceOk = true;
+    if (reproDump()) dumpWeights(actor, critic);
 
     for (int batchNo = 0; batchNo < totalBatches; ++batchNo) {
             size_t head = consumed.load(std::memory_order_relaxed);
-            while (produced.load(std::memory_order_acquire) == head) {
-                if (stopProducer.load(std::memory_order_acquire)) break;
-                std::this_thread::yield();
+            if (singleThread) {
+                if (produced.load(std::memory_order_acquire) == head &&
+                    !produceOne())
+                    break;
+            } else {
+                while (produced.load(std::memory_order_acquire) == head) {
+                    if (stopProducer.load(std::memory_order_acquire)) break;
+                    std::this_thread::yield();
+                }
+                if (produced.load(std::memory_order_acquire) == head) break;
             }
-            if (produced.load(std::memory_order_acquire) == head) break;
             PreparedBatch& in = queue[head % kQueueDepth];
             std::vector<Transition*>& mb = in.mb;
             Batch& batch = in.data;
             int B = static_cast<int>(mb.size());
+            if (reproDump()) dumpRound(batchNo, mb, batch);
 
             // Forward and backward run on the one thread that owns the
             // compute queue. The host loss below stays on this learner.
@@ -171,6 +281,10 @@ bool ppoUpdate(nn::Actor& actor, nn::Critic& critic,
 
             nn::Mat& logits = *logitRows;
             nn::Mat& values = *valueRows;
+            if (reproDump()) {
+                writeMat("build-win/repro/logits.bin", logits);
+                writeMat("build-win/repro/values.bin", values);
+            }
 
             // ---- loss gradients on host ----
             dLogits.resize(B, nn::kNumActions);
@@ -234,7 +348,7 @@ bool ppoUpdate(nn::Actor& actor, nn::Critic& critic,
             consumed.store(head + 1, std::memory_order_release);
     }
     stopProducer.store(true, std::memory_order_release);
-    prepareThread.join();
+    if (prepareThread.joinable()) prepareThread.join();
     if (!deviceOk) return false;
 
     nn::gpuInvoke([&] {

@@ -57,7 +57,7 @@ struct Args {
     uint64_t seed = 1;
     std::string out = "ckpt";
     std::string resume;
-    std::string backend = "auto";  // auto | gpu | cpu
+    std::string backend = "auto";  // auto | gpu | cuda | cpu
 };
 
 const char* argValue(int argc, char** argv, const char* key, const char* def) {
@@ -103,11 +103,16 @@ int main(int argc, char** argv) {
     parseArgs(argc, argv, args);
     if (args.threads <= 0) args.threads = 1;
 
+#if defined(_WIN32)
+    if (args.backend == "cuda") _putenv_s("PD_CUBLAS", "1");
+#endif
     nn::gemmInit();
     if (args.backend == "cpu") nn::gemmSetGpu(false);
-    if (args.backend == "gpu") nn::gemmSetGpu(true);
+    if (args.backend == "gpu" || args.backend == "cuda") nn::gemmSetGpu(true);
     std::cout << "PerfectDou CPP training\n";
-    const char* backend = nn::gemmGpuEnabled() ? nn::gemmGpuLabel() :
+    const char* backend = args.backend == "cuda"
+                              ? "GPU (cuBLAS GEMM + D3D12 kernels)"
+                              : nn::gemmGpuEnabled() ? nn::gemmGpuLabel() :
 #ifdef __APPLE__
                           "CPU (Accelerate)";
 #else
@@ -180,6 +185,85 @@ int main(int argc, char** argv) {
     SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED |
                             ES_AWAYMODE_REQUIRED);
 #endif
+
+    if (std::getenv("PD_SINGLE_THREAD")) {
+        std::fprintf(stderr, "single-thread: rollout and learn on this thread\n");
+        std::fflush(stderr);
+        args.threads = 1;
+        std::array<std::vector<algo::Transition>, 3> streams;
+        std::array<algo::PPOStats, 3> ps{};
+        for (int upd = 1; upd <= args.updates; ++upd) {
+            algo::ModelSet models{{&actor[0], &actor[1], &actor[2]},
+                                  {&critic[0], &critic[1], &critic[2]}};
+            algo::RolloutConfig rc;
+            rc.gamesPerUpdate = args.games;
+            rc.threads = 1;
+            rc.rewardScale = args.rewardScale;
+            rc.seed = args.seed + uint64_t(upd) * 7919ULL;
+            algo::RolloutStats rs;
+            auto wall0 = std::chrono::steady_clock::now();
+            // collectRollout appends. A fresh Sample in the pipelined path
+            // starts empty; this loop reuses the same vectors.
+            for (auto& seat : streams) seat.clear();
+            algo::collectRollout(models, rc, streams, rs);
+            nn::gemmSetThreadGpu(-1);
+            double rollSecs = std::chrono::duration<double>(
+                                  std::chrono::steady_clock::now() - wall0)
+                                  .count();
+            auto t1 = std::chrono::steady_clock::now();
+            auto learnSeats = [&](unsigned mask) {
+                unsigned failed = 0;
+                for (int s = 0; s < 3; ++s) {
+                    if ((mask & (1u << s)) == 0) continue;
+                    std::fprintf(stderr, "seat %d update %d\n", s, upd);
+                    std::fflush(stderr);
+                    nn::Rng64 ur(args.seed * 100000 + upd * 31 + s);
+                    if (!algo::ppoUpdate(actor[s], critic[s], streams[s], ppo,
+                                         aOpt[s], cOpt[s], ur, ps[s]))
+                        failed |= 1u << s;
+                }
+                return failed;
+            };
+            unsigned failed = learnSeats(7u);
+            for (int attempt = 1; failed != 0 && attempt <= 2; ++attempt) {
+                std::fprintf(stderr,
+                             "GPU device lost during update %d (seats 0x%x), "
+                             "recreating and retrying\n",
+                             upd, failed);
+                nn::gpuReleaseThread();
+                if (!nn::gpuRecreate()) {
+                    std::fprintf(stderr, "D3D12 device recreate failed\n");
+                    failed = 7u;
+                    break;
+                }
+                failed = learnSeats(failed);
+            }
+            if (failed) {
+                std::fprintf(stderr,
+                             "GPU device lost again during update %d, stopping\n",
+                             upd);
+                return 1;
+            }
+            double learnSecs = std::chrono::duration<double>(
+                                   std::chrono::steady_clock::now() - t1)
+                                   .count();
+            double wallSecs = std::chrono::duration<double>(
+                                  std::chrono::steady_clock::now() - wall0)
+                                  .count();
+            double wp = double(rs.landlordWins) / std::max(1, rs.games);
+            double adp = double(rs.landlordScore) / std::max(1, rs.games);
+            std::printf(
+                "upd %4d | wall %.1fs rollout %.1fs learn %.1fs threads 1 | "
+                "WP %.3f ADP %7.2f | ent %5.3f/%5.3f/%5.3f | n %lld/%lld/%lld\n",
+                upd, wallSecs, rollSecs, learnSecs, wp, adp, ps[0].entropy,
+                ps[1].entropy, ps[2].entropy, rs.transitions[0],
+                rs.transitions[1], rs.transitions[2]);
+            std::fflush(stdout);
+        }
+        saveAll(args.out);
+        std::cout << "models saved to " << args.out << "/\n";
+        return 0;
+    }
 
     // One GPU context per seat for the whole run. Destroying a D3D12 compute
     // queue takes several seconds on this driver, and a queue cannot be

@@ -309,6 +309,12 @@ void gpuInvoke(const std::function<void()>& fn) {
 #if !defined(PD_HAVE_D3D)
     fn();
 #else
+    static int single = -1;
+    if (single < 0) single = std::getenv("PD_SINGLE_THREAD") ? 1 : 0;
+    if (single) {
+        fn();
+        return;
+    }
     // One queue, one thread. Three compute queues on this NVIDIA driver
     // remove the device even when their packets are executed one at a time.
     struct Owner {

@@ -37,7 +37,7 @@ ctest --test-dir build          # 规则测试 + 神经网络数值梯度检查
 ```bash
 # macOS 默认走 Accelerate/AMX（比当前 Metal GEMM 更快）。
 # Windows 默认走本机显卡（Direct3D 12）。采样在 CPU，PPO 学习在 GPU。
-# --backend cpu / --backend gpu 可强制切换
+# --backend cpu / --backend gpu / --backend cuda 可强制切换
 ./build/perfectdou_train --updates 1000 --games 256 --threads 10 --out ckpt
 
 # 快速/低配机器
@@ -62,7 +62,7 @@ ctest --test-dir build          # 规则测试 + 神经网络数值梯度检查
 --reward-scale L    oracle 塑形系数 l（默认 50，0 表示纯 ADP）
 --snapshot-every K  每 K 轮落盘，最后一轮必存
 --resume DIR        从 actor{0,1,2}.bin / critic{0,1,2}.bin 继续
---backend auto|gpu|cpu   GEMM 后端（Apple 默认 cpu：Accelerate/AMX；Windows 默认 gpu：D3D12）
+--backend auto|gpu|cuda|cpu   GEMM 后端（Windows 的 cuda 用 cuBLAS GEMM + D3D12 其余核）
 ```
 
 后端说明：
@@ -75,6 +75,9 @@ ctest --test-dir build          # 规则测试 + 神经网络数值梯度检查
   多显卡时选择专用显存最大的一块（笔记本上的独显会优先于核显）。`--backend cpu`
   退回 CPU GEMM。x86-64 Windows 使用运行时检测的 AVX2/FMA 推理内核；自对弈采样
   固定走该 CPU 路径，只有 PPO 学习上 GPU。
+- 安装 CUDA Toolkit 后可用 `--backend cuda`，以 cuBLAS 替换 PPO 的 GEMM，其余核
+  仍使用 D3D12。当前 CUDA 输出经上传堆回到 D3D12，主要用于稳定性诊断，速度会比
+  纯 D3D12 慢。
 - 数值为 FP32。`tests/test_gemm` 校验 CPU/GPU GEMM，`tests/test_grad` 校验整网梯度。
 - 没有 GPU 时使用 CPU GEMM（Apple 为 Accelerate，ARM 为 NEON，其余为标量）。
 

@@ -294,6 +294,10 @@ void collectRollout(const ModelSet& models, const RolloutConfig& cfg,
     for (int t = 0; t < T; ++t) {
         if (split[t] == 0) continue;
         uint64_t seed = cfg.seed + 0x9e3779b97f4a7c15ULL * uint64_t(t + 1);
+        if (T == 1) {
+            runWorker(models, cfg, split[t], seed, results[t]);
+            continue;
+        }
         threads.emplace_back(runWorker, std::cref(models), std::cref(cfg),
                              split[t], seed, std::ref(results[t]));
     }
