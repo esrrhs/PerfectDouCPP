@@ -237,30 +237,28 @@ void Lstm::backward(const Mat& ghAll) {
     gpuStageInput(dhBuf[0].data(), B * dhBuf[0].s);
     gpuStageInput(dcBuf.data(), B * dcBuf.s);
 
-    gwCache.resize(T);
-    std::vector<GemmOp> gwOps(T);
     bool seq = kLstmSeqBwd(ghAll, gpre, statesC, Wh.w.data(), &Wh.devW, dgAll, B, T, h);
     if (seq) {
-        for (int t = T - 1; t >= 0; --t) {
-            Mat dg = viewRows(dgAll, t * B, B);
-            Mat hPrev = viewRows(statesH, t * B, B);
-            gwh.resize(H, h);
-            GemmOp gWh{'T', 'N', H, h, B, dg.data(), dg.s,
-                       hPrev.data(), hPrev.s, gwh.data(), gwh.s};
-            gpuGemm(gWh, nullptr, 0, 0);
-            kAddTo(Wh.dw.data(), &Wh.devG, h, gwh);
-            gwCache[t].resize(H, n);
-            gwOps[t] = GemmOp{'T', 'N', H, n, B, dg.data(), dg.s,
-                              xCache.data() + size_t(t) * B * xCache.s, xCache.s,
-                              gwCache[t].data(), gwCache[t].s};
-        }
+        // sum_t dg_t^T * h_t  and  sum_t dg_t^T * x_t  are two GEMMs with
+        // K = B*T. h_0..h_{T-1} are the leading rows of statesH, and xCache
+        // is already timestep-major in that same order.
+        gwh.resize(H, h);
+        GemmOp gWh{'T', 'N', H, h, B * T, dgAll.data(), dgAll.s,
+                   statesH.data(), statesH.s, gwh.data(), gwh.s};
+        gpuGemm(gWh, nullptr, 0, 0);
+        if (gwCache.empty()) gwCache.resize(1);
+        gwCache[0].resize(H, n);
+        GemmOp gWi{'T', 'N', H, n, B * T, dgAll.data(), dgAll.s,
+                   xCache.data(), xCache.s, gwCache[0].data(), gwCache[0].s};
+        gpuGemm(gWi, nullptr, 0, 0);
+        kAddTo(Wh.dw.data(), &Wh.devG, h, gwh);
+        kAddTo(Wi.dw.data(), &Wi.devG, n, gwCache[0]);
         kBiasGradAdd(dgAll, bi.dw.data(), &bi.devG);
         kBiasGradAdd(dgAll, bh.dw.data(), &bh.devG);
-        gpuCommitGemms(T, gwOps.data());
-        for (int t = T - 1; t >= 0; --t)
-            kAddTo(Wi.dw.data(), &Wi.devG, n, gwCache[t]);
         return;
     }
+    gwCache.resize(T);
+    std::vector<GemmOp> gwOps(T);
     for (int t = T - 1; t >= 0; --t) {
         int idx = (T - 1 - t) & 1;
         Mat gh = viewRows(ghAll, t * B, B);
