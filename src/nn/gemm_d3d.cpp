@@ -2223,6 +2223,56 @@ void d3dGateAdd(Mat& gp, const Mat& gi, const Mat& gh,
             {rOut(gp), rIn(gi), rIn(gh), rScalar(bi), rScalar(bh)}, &p,
             sizeof(p), gp.r * gp.c);
 }
+bool d3dLstmSeqFwd(Mat& statesH, Mat& wTh, const Mat& gateI,
+                   const std::vector<float>& bi, const std::vector<float>& bh,
+                   Mat& gpre, Mat& statesC, int B, int T, int hidden) {
+    if (!useCuda() || B <= 0 || T <= 0 || hidden <= 0 || hidden > 1024) return false;
+    if ((int)bi.size() < 4 * hidden || (int)bh.size() < 4 * hidden) return false;
+    View h = bindFresh(statesH.data(), size_t(statesH.r) * statesH.s * 4, nullptr, false);
+    Slot* ws = static_cast<Slot*>(d3dWeightCache(&wTh.devCache, wTh.data(),
+                                                 size_t(wTh.r) * wTh.s * 4));
+    if (!ws || !h.res) return false;
+    View w;
+    w.res = &ws->gpu;
+    w.off = 0;
+    w.len = ws->bytes;
+    View gi = kerIn(gateI.data(), size_t(gateI.r) * gateI.s * 4);
+    View ib = kerIn(bi.data(), size_t(4 * hidden) * 4);
+    View hb = kerIn(bh.data(), size_t(4 * hidden) * 4);
+    View gp = bindFresh(gpre.data(), size_t(gpre.r) * gpre.s * 4, nullptr, false);
+    View c = bindFresh(statesC.data(), size_t(statesC.r) * statesC.s * 4, nullptr, false);
+    if (!gi.res || !ib.res || !hb.res || !gp.res || !c.res) return false;
+    struct P {
+        int h, B, T, hs, ws, gis, gps, cs;
+    } p{hidden, B, T, statesH.s, wTh.s, gateI.s, gpre.s, statesC.s};
+    View bufs[] = {h, w, gi, ib, hb, gp, c};
+    return queueKernel("lstm_seq_fwd", bufs, 7, &p, sizeof(p), (unsigned)B, 1);
+}
+
+bool d3dLstmSeqBwd(const Mat& ghAll, const Mat& gpre, const Mat& statesC,
+                   const float* Wh, void** whSlot, Mat& dgAll,
+                   int B, int T, int hidden) {
+    if (!useCuda() || B <= 0 || T <= 0 || hidden <= 0 || hidden > 1024) return false;
+    if (!Wh || !whSlot) return false;
+    size_t whBytes = size_t(4 * hidden) * hidden * 4;
+    Slot* ws = static_cast<Slot*>(d3dWeightCache(whSlot, Wh, whBytes));
+    if (!ws) return false;
+    View w;
+    w.res = &ws->gpu;
+    w.off = 0;
+    w.len = ws->bytes;
+    View gh = kerIn(ghAll.data(), size_t(ghAll.r) * ghAll.s * 4);
+    View gp = kerIn(gpre.data(), size_t(gpre.r) * gpre.s * 4);
+    View cn = kerIn(statesC.data(), size_t(statesC.r) * statesC.s * 4);
+    View dg = bindFresh(dgAll.data(), size_t(dgAll.r) * dgAll.s * 4, nullptr, false);
+    if (!gh.res || !gp.res || !cn.res || !dg.res) return false;
+    struct P {
+        int h, B, T, ghs, gps, cs, dgs, whs;
+    } p{hidden, B, T, ghAll.s, gpre.s, statesC.s, dgAll.s, hidden};
+    View bufs[] = {gh, gp, cn, w, dg};
+    return queueKernel("lstm_seq_bwd", bufs, 5, &p, sizeof(p), (unsigned)B, 1);
+}
+
 void d3dLstmCellFwd(const Mat& gp, const float* cp, Mat& hOut, Mat& cOut,
                     int hidden) {
     struct P { int h, B, hasCp; } p{hidden, gp.r, cp ? 1 : 0};

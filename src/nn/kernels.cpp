@@ -40,6 +40,14 @@ void PD_BE(LstmCellFwd)(const Mat& gp, const float* cp, Mat& hOut, Mat& cOut,
                     int hidden);
 void PD_BE(LstmCellBwd)(const Mat& gh, const Mat& gp, const Mat& cNow,
                     const float* cp, Mat& dh, Mat& dc, Mat& dg, int hidden);
+#if defined(PD_HAVE_D3D)
+bool d3dLstmSeqFwd(Mat& statesH, Mat& wTh, const Mat& gateI,
+                   const std::vector<float>& bi, const std::vector<float>& bh,
+                   Mat& gpre, Mat& statesC, int B, int T, int hidden);
+bool d3dLstmSeqBwd(const Mat& ghAll, const Mat& gpre, const Mat& statesC,
+                   const float* Wh, void** whSlot, Mat& dgAll,
+                   int B, int T, int hidden);
+#endif
 void PD_BE(Concat)(Mat& z, const Mat& a, int n1, const Mat& b, int n2);
 void PD_BE(Split)(const Mat& z, int n1, Mat& a, Mat& b, int n2);
 void PD_BE(ZeroAndLast)(Mat& all, const Mat& gh, int B, int T, int h);
@@ -89,6 +97,32 @@ void kGateAdd(Mat& gp, const Mat& gi, const Mat& gh,
 
 namespace {
 inline float sigm(float x) { return 1.0f / (1.0f + std::exp(-x)); }
+}
+
+bool kLstmSeqFwd(Mat& statesH, Mat& wTh, const Mat& gateI,
+                 const std::vector<float>& bi, const std::vector<float>& bh,
+                 Mat& gpre, Mat& statesC, int B, int T, int hidden) {
+#if defined(PD_HAVE_D3D)
+    if (gpuActive())
+        return d3dLstmSeqFwd(statesH, wTh, gateI, bi, bh, gpre, statesC, B, T, hidden);
+#else
+    (void)statesH; (void)wTh; (void)gateI; (void)bi; (void)bh;
+    (void)gpre; (void)statesC; (void)B; (void)T; (void)hidden;
+#endif
+    return false;
+}
+
+bool kLstmSeqBwd(const Mat& ghAll, const Mat& gpre, const Mat& statesC,
+                 const float* Wh, void** whSlot, Mat& dgAll,
+                 int B, int T, int hidden) {
+#if defined(PD_HAVE_D3D)
+    if (gpuActive())
+        return d3dLstmSeqBwd(ghAll, gpre, statesC, Wh, whSlot, dgAll, B, T, hidden);
+#else
+    (void)ghAll; (void)gpre; (void)statesC; (void)Wh; (void)whSlot;
+    (void)dgAll; (void)B; (void)T; (void)hidden;
+#endif
+    return false;
 }
 
 void kLstmCellFwd(const Mat& gp, const float* cp, Mat& hOut, Mat& cOut,

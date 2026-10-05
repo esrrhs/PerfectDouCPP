@@ -427,6 +427,112 @@ extern "C" __global__ void lstm_cell_bwd(float* GH, float* GP, float* CN, float*
   DG[base + 3 * uh + u] = dhn * tc * ov * (1.f - ov);
   DC[b * uh + u] = dct * fv;
 }
+// One block owns one batch row and walks every time step. The next step only
+// needs this row's hidden state, so the block keeps it in shared memory and
+// the whole unroll is a single launch.
+extern "C" __global__ void lstm_seq_fwd(
+    float* H, const float* W, const float* GI, const float* BI, const float* BH,
+    float* GP, float* C,
+    int h, int B, int T, int hs, int ws, int gis, int gps, int cs) {
+  extern __shared__ float sm[];
+  int b = (int)blockIdx.x;
+  if (b >= B) return;
+  for (int u = (int)threadIdx.x; u < h; u += (int)blockDim.x) {
+    sm[u] = 0.f;
+    H[(size_t)b * hs + u] = 0.f;
+  }
+  __syncthreads();
+  for (int t = 0; t < T; ++t) {
+    float neu[8];
+    int nu = 0;
+    for (int u = (int)threadIdx.x; u < h; u += (int)blockDim.x) {
+      const float* gi = GI + (size_t)(t * B + b) * gis;
+      float a0 = gi[u] + BI[u] + BH[u];
+      float a1 = gi[h + u] + BI[h + u] + BH[h + u];
+      float a2 = gi[2 * h + u] + BI[2 * h + u] + BH[2 * h + u];
+      float a3 = gi[3 * h + u] + BI[3 * h + u] + BH[3 * h + u];
+      for (int k = 0; k < h; ++k) {
+        float hv = sm[k];
+        const float* wk = W + (size_t)k * ws;
+        a0 += hv * wk[u];
+        a1 += hv * wk[h + u];
+        a2 += hv * wk[2 * h + u];
+        a3 += hv * wk[3 * h + u];
+      }
+      float* gp = GP + (size_t)(t * B + b) * gps;
+      gp[u] = a0;
+      gp[h + u] = a1;
+      gp[2 * h + u] = a2;
+      gp[3 * h + u] = a3;
+      float iv = 1.f / (1.f + expf(-a0));
+      float fv = 1.f / (1.f + expf(-a1));
+      float gz = tanhf(a2);
+      float ov = 1.f / (1.f + expf(-a3));
+      float pc = t ? C[(size_t)((t - 1) * B + b) * cs + u] : 0.f;
+      float cc = fv * pc + iv * gz;
+      C[(size_t)(t * B + b) * cs + u] = cc;
+      float hn = ov * tanhf(cc);
+      H[(size_t)((t + 1) * B + b) * hs + u] = hn;
+      neu[nu++] = hn;
+    }
+    __syncthreads();
+    nu = 0;
+    for (int u = (int)threadIdx.x; u < h; u += (int)blockDim.x) sm[u] = neu[nu++];
+    __syncthreads();
+  }
+}
+// Cell backward and the recurrent input gradient (dg @ Wh) for every step.
+// Weight and bias reductions stay outside so their sum order does not change.
+extern "C" __global__ void lstm_seq_bwd(
+    const float* GH, const float* GP, const float* CN, const float* WH, float* DG,
+    int h, int B, int T, int ghs, int gps, int cs, int dgs, int whs) {
+  extern __shared__ float sm[];
+  float* dg = sm;
+  float* dh = sm + 4 * h;
+  float* dc = dh + h;
+  int b = (int)blockIdx.x;
+  if (b >= B) return;
+  for (int u = (int)threadIdx.x; u < h; u += (int)blockDim.x) {
+    dh[u] = 0.f;
+    dc[u] = 0.f;
+  }
+  __syncthreads();
+  for (int t = T - 1; t >= 0; --t) {
+    for (int u = (int)threadIdx.x; u < h; u += (int)blockDim.x) {
+      size_t row = (size_t)(t * B + b);
+      const float* gp = GP + row * gps;
+      float tc = tanhf(CN[row * cs + u]);
+      float iv = 1.f / (1.f + expf(-gp[u]));
+      float fv = 1.f / (1.f + expf(-gp[h + u]));
+      float gz = tanhf(gp[2 * h + u]);
+      float ov = 1.f / (1.f + expf(-gp[3 * h + u]));
+      float dhn = GH[row * ghs + u] + dh[u];
+      float pc = t ? CN[(size_t)((t - 1) * B + b) * cs + u] : 0.f;
+      float dct = dhn * ov * (1.f - tc * tc) + dc[u];
+      float d0 = dct * gz * iv * (1.f - iv);
+      float d1 = dct * pc * fv * (1.f - fv);
+      float d2 = dct * iv * (1.f - gz * gz);
+      float d3 = dhn * tc * ov * (1.f - ov);
+      dg[u] = d0;
+      dg[h + u] = d1;
+      dg[2 * h + u] = d2;
+      dg[3 * h + u] = d3;
+      float* grow = DG + row * dgs;
+      grow[u] = d0;
+      grow[h + u] = d1;
+      grow[2 * h + u] = d2;
+      grow[3 * h + u] = d3;
+      dc[u] = dct * fv;
+    }
+    __syncthreads();
+    for (int u = (int)threadIdx.x; u < h; u += (int)blockDim.x) {
+      float s = 0.f;
+      for (int q = 0; q < 4 * h; ++q) s += dg[q] * WH[(size_t)q * whs + u];
+      dh[u] = s;
+    }
+    __syncthreads();
+  }
+}
 extern "C" __global__ void concat2(float* Z, float* A, float* B,
                                   int n1, int n2, int rows, int zs, int as, int bs) {
   int gid = blockIdx.x * blockDim.x + threadIdx.x;
@@ -645,9 +751,18 @@ bool cudaBridgeKernel(ID3D12Device* device, const char* name,
     if (cst && nint > 0) std::memcpy(ints, cst, (size_t)nint * sizeof(int));
 
     unsigned bx = 64, by = 1;
+    unsigned shmem = 0;
     if (std::strcmp(name, "lstm_cell_fwd") == 0 || std::strcmp(name, "lstm_cell_bwd") == 0) {
         bx = 8;
         by = 8;
+    } else if (std::strcmp(name, "lstm_seq_fwd") == 0) {
+        bx = 128;
+        by = 1;
+        if (nint >= 1 && ints[0] > 0) shmem = (unsigned)ints[0] * sizeof(float);
+    } else if (std::strcmp(name, "lstm_seq_bwd") == 0) {
+        bx = 128;
+        by = 1;
+        if (nint >= 1 && ints[0] > 0) shmem = (unsigned)ints[0] * 6u * sizeof(float);
     } else if (std::strcmp(name, "adam_step") == 0) {
         bx = 128;
     }
@@ -677,7 +792,7 @@ bool cudaBridgeKernel(ID3D12Device* device, const char* name,
     }
     crumb("kern launch");
     Lane& ln = g_lanes[laneIndex()];
-    CUresult st = g_api.cuLaunchKernel(fn, gridX, gridY, 1, bx, by, 1, 0, ln.stream, args, nullptr);
+    CUresult st = g_api.cuLaunchKernel(fn, gridX, gridY, 1, bx, by, 1, shmem, ln.stream, args, nullptr);
     if (st != CUDA_SUCCESS) {
         setCu(st, name);
         return false;

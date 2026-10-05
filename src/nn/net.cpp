@@ -185,31 +185,36 @@ const Mat& Lstm::forward(const Mat& x, int batch, int steps) {
         actCache.resize(B * T, H);
         tanhC.resize(B * T, h);
     }
-    ghGate.resize(B, H);
-    for (int t = 0; t < T; ++t) {
-        Mat hPrev = viewRows(statesH, t * B, B);
-        Mat gp = viewRows(gpre, t * B, B);
-        GemmOp g{'N', 'N', B, H, h, hPrev.data(), hPrev.s,
-                 wTh.data(), wTh.s, ghGate.data(), ghGate.s};
-        g.wSlot = const_cast<void**>(&wTh.devCache);
-        gpuGemm(g, nullptr, 0, 0);
-        Mat gi = viewRows(gateIAll, t * B, B);
-        kGateAdd(gp, gi, ghGate, bi.w, bh.w);
+    // The recurrent GEMM, bias add and cell share one row of hidden state, so
+    // the CUDA path walks all T steps inside one block per batch row.
+    bool seq = kLstmSeqFwd(statesH, wTh, gateIAll, bi.w, bh.w, gpre, statesC, B, T, h);
+    if (!seq) {
+        ghGate.resize(B, H);
+        for (int t = 0; t < T; ++t) {
+            Mat hPrev = viewRows(statesH, t * B, B);
+            Mat gp = viewRows(gpre, t * B, B);
+            GemmOp g{'N', 'N', B, H, h, hPrev.data(), hPrev.s,
+                     wTh.data(), wTh.s, ghGate.data(), ghGate.s};
+            g.wSlot = const_cast<void**>(&wTh.devCache);
+            gpuGemm(g, nullptr, 0, 0);
+            Mat gi = viewRows(gateIAll, t * B, B);
+            kGateAdd(gp, gi, ghGate, bi.w, bh.w);
 
-        Mat cNow = viewRows(statesC, t * B, B);
-        Mat hNext = viewRows(statesH, (t + 1) * B, B);
-        const float* cp = t == 0 ? nullptr
-                                 : statesC.data() + size_t(t - 1) * B * statesC.s;
-        Mat gateV, tanhV;
-        Mat* gateP = nullptr;
-        Mat* tanhP = nullptr;
-        if (actReady) {
-            gateV = viewRows(actCache, t * B, B);
-            tanhV = viewRows(tanhC, t * B, B);
-            gateP = &gateV;
-            tanhP = &tanhV;
+            Mat cNow = viewRows(statesC, t * B, B);
+            Mat hNext = viewRows(statesH, (t + 1) * B, B);
+            const float* cp = t == 0 ? nullptr
+                                     : statesC.data() + size_t(t - 1) * B * statesC.s;
+            Mat gateV, tanhV;
+            Mat* gateP = nullptr;
+            Mat* tanhP = nullptr;
+            if (actReady) {
+                gateV = viewRows(actCache, t * B, B);
+                tanhV = viewRows(tanhC, t * B, B);
+                gateP = &gateV;
+                tanhP = &tanhV;
+            }
+            kLstmCellFwd(gp, cp, hNext, cNow, h, gateP, tanhP);
         }
-        kLstmCellFwd(gp, cp, hNext, cNow, h, gateP, tanhP);
     }
 
     hlLast = viewRows(statesH, T * B, B);
@@ -231,6 +236,28 @@ void Lstm::backward(const Mat& ghAll) {
 
     gwCache.resize(T);
     std::vector<GemmOp> gwOps(T);
+    bool seq = kLstmSeqBwd(ghAll, gpre, statesC, Wh.w.data(), &Wh.devW, dgAll, B, T, h);
+    if (seq) {
+        for (int t = T - 1; t >= 0; --t) {
+            Mat dg = viewRows(dgAll, t * B, B);
+            Mat hPrev = viewRows(statesH, t * B, B);
+            gwh.resize(H, h);
+            GemmOp gWh{'T', 'N', H, h, B, dg.data(), dg.s,
+                       hPrev.data(), hPrev.s, gwh.data(), gwh.s};
+            gpuGemm(gWh, nullptr, 0, 0);
+            kAddTo(Wh.dw.data(), &Wh.devG, h, gwh);
+            gwCache[t].resize(H, n);
+            gwOps[t] = GemmOp{'T', 'N', H, n, B, dg.data(), dg.s,
+                              xCache.data() + size_t(t) * B * xCache.s, xCache.s,
+                              gwCache[t].data(), gwCache[t].s};
+        }
+        kBiasGradAdd(dgAll, bi.dw.data(), &bi.devG);
+        kBiasGradAdd(dgAll, bh.dw.data(), &bh.devG);
+        gpuCommitGemms(T, gwOps.data());
+        for (int t = T - 1; t >= 0; --t)
+            kAddTo(Wi.dw.data(), &Wi.devG, n, gwCache[t]);
+        return;
+    }
     for (int t = T - 1; t >= 0; --t) {
         int idx = (T - 1 - t) & 1;
         Mat gh = viewRows(ghAll, t * B, B);

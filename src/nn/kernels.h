@@ -37,6 +37,15 @@ void kLstmCellBwd(const Mat& gh, const Mat& gp, const Mat& cNow,
                   const float* cp, Mat& dh, Mat& dc, Mat& dg, int hidden,
                   const Mat* gates = nullptr, const Mat* tanhC = nullptr);
 
+// CUDA-only unroll of every time step in one launch. Returns false on the
+// CPU and on the pure D3D path, which keep the per-step loop.
+bool kLstmSeqFwd(Mat& statesH, Mat& wTh, const Mat& gateI,
+                 const std::vector<float>& bi, const std::vector<float>& bh,
+                 Mat& gpre, Mat& statesC, int B, int T, int hidden);
+bool kLstmSeqBwd(const Mat& ghAll, const Mat& gpre, const Mat& statesC,
+                 const float* Wh, void** whSlot, Mat& dgAll,
+                 int B, int T, int hidden);
+
 // z[i,0:n1) = a[i,:]; z[i,n1:n1+n2) = b[i,:]
 void kConcat(Mat& z, const Mat& a, int n1, const Mat& b, int n2);
 // inverse: split z rows into a (first n1) and b (next n2)
