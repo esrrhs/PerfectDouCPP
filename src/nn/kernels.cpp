@@ -5,6 +5,10 @@
 #include <cmath>
 #include <vector>
 
+#if defined(__x86_64__) || defined(_M_X64)
+#include <immintrin.h>
+#endif
+
 #include "nn/gemm.h"
 #include "nn/kernels.h"
 
@@ -96,8 +100,93 @@ void kGateAdd(Mat& gp, const Mat& gi, const Mat& gh,
 }
 
 namespace {
-inline float sigm(float x) { return 1.0f / (1.0f + std::exp(-x)); }
+inline float sigm(float x) { return 1.0f / (1.0f + expf(-x)); }
+
+#if defined(__x86_64__) || defined(_M_X64)
+#if defined(__GNUC__) || defined(__clang__)
+#define PD_AVX2 __attribute__((target("avx2,fma")))
+#else
+#define PD_AVX2
+#endif
+
+// Cephes expf, about 1 ulp. The libm double exp was the rollout hotspot.
+PD_AVX2 __m256 lstmExp8(__m256 x) {
+    x = _mm256_min_ps(x, _mm256_set1_ps(88.3762626647949f));
+    x = _mm256_max_ps(x, _mm256_set1_ps(-88.3762626647949f));
+    const __m256 half = _mm256_set1_ps(0.5f);
+    __m256 fx = _mm256_fmadd_ps(x, _mm256_set1_ps(1.44269504088896341f), half);
+    fx = _mm256_floor_ps(fx);
+    x = _mm256_fnmadd_ps(fx, _mm256_set1_ps(0.693359375f), x);
+    x = _mm256_fnmadd_ps(fx, _mm256_set1_ps(-2.12194440e-4f), x);
+    __m256 z = _mm256_mul_ps(x, x);
+    __m256 y = _mm256_set1_ps(1.9875691500E-4f);
+    y = _mm256_fmadd_ps(y, x, _mm256_set1_ps(1.3981999507E-3f));
+    y = _mm256_fmadd_ps(y, x, _mm256_set1_ps(8.3334519073E-3f));
+    y = _mm256_fmadd_ps(y, x, _mm256_set1_ps(4.1665795894E-2f));
+    y = _mm256_fmadd_ps(y, x, _mm256_set1_ps(1.6666665459E-1f));
+    y = _mm256_fmadd_ps(y, x, _mm256_set1_ps(5.0000001201E-1f));
+    y = _mm256_fmadd_ps(y, z, x);
+    y = _mm256_add_ps(y, _mm256_set1_ps(1.0f));
+    __m256i ei = _mm256_add_epi32(_mm256_cvtps_epi32(fx), _mm256_set1_epi32(127));
+    ei = _mm256_slli_epi32(ei, 23);
+    return _mm256_mul_ps(y, _mm256_castsi256_ps(ei));
 }
+
+PD_AVX2 __m256 lstmSigm8(__m256 x) {
+    __m256 e = lstmExp8(_mm256_sub_ps(_mm256_setzero_ps(), x));
+    return _mm256_div_ps(_mm256_set1_ps(1.0f), _mm256_add_ps(_mm256_set1_ps(1.0f), e));
+}
+
+PD_AVX2 __m256 lstmTanh8(__m256 x) {
+    __m256 e = lstmExp8(_mm256_mul_ps(x, _mm256_set1_ps(-2.0f)));
+    return _mm256_div_ps(_mm256_sub_ps(_mm256_set1_ps(1.0f), e),
+                         _mm256_add_ps(_mm256_set1_ps(1.0f), e));
+}
+
+PD_AVX2 void lstmCellRowAvx2(const float* g, const float* cp, float* hOut, float* cOut,
+                             float* og, float* th, int h) {
+    int u = 0;
+    for (; u + 8 <= h; u += 8) {
+        __m256 iv = lstmSigm8(_mm256_loadu_ps(g + u));
+        __m256 fv = lstmSigm8(_mm256_loadu_ps(g + h + u));
+        __m256 gv = lstmTanh8(_mm256_loadu_ps(g + 2 * h + u));
+        __m256 ov = lstmSigm8(_mm256_loadu_ps(g + 3 * h + u));
+        __m256 pc = cp ? _mm256_loadu_ps(cp + u) : _mm256_setzero_ps();
+        __m256 cc = _mm256_fmadd_ps(iv, gv, _mm256_mul_ps(fv, pc));
+        __m256 tn = lstmTanh8(cc);
+        _mm256_storeu_ps(cOut + u, cc);
+        _mm256_storeu_ps(hOut + u, _mm256_mul_ps(ov, tn));
+        if (og) {
+            _mm256_storeu_ps(og + u, iv);
+            _mm256_storeu_ps(og + h + u, fv);
+            _mm256_storeu_ps(og + 2 * h + u, gv);
+            _mm256_storeu_ps(og + 3 * h + u, ov);
+        }
+        if (th) _mm256_storeu_ps(th + u, tn);
+    }
+    for (; u < h; ++u) {
+        float iv = sigm(g[u]);
+        float fv = sigm(g[h + u]);
+        float gv = tanhf(g[2 * h + u]);
+        float ov = sigm(g[3 * h + u]);
+        float pc = cp ? cp[u] : 0.0f;
+        float cc = fv * pc + iv * gv;
+        float tn = tanhf(cc);
+        cOut[u] = cc;
+        hOut[u] = ov * tn;
+        if (og) {
+            og[u] = iv;
+            og[h + u] = fv;
+            og[2 * h + u] = gv;
+            og[3 * h + u] = ov;
+        }
+        if (th) th[u] = tn;
+    }
+}
+#endif
+}
+
+bool pdAvx2Available();
 
 bool kLstmSeqFwd(Mat& statesH, Mat& wTh, const Mat& gateI,
                  const std::vector<float>& bi, const std::vector<float>& bh,
@@ -183,25 +272,41 @@ void kLstmCellFwd(const Mat& gp, const float* cp, Mat& hOut, Mat& cOut,
         }
     }
 #else
+#if defined(__x86_64__) || defined(_M_X64)
+    static const bool avx = pdAvx2Available();
+#else
+    const bool avx = false;
+#endif
     for (int b = 0; b < gp.r; ++b) {
+        const float* g = gp.row(b);
+        const float* cprev = cp ? cp + size_t(b) * h : nullptr;
+        float* og = gates ? gates->row(b) : nullptr;
+        float* th = tanhC ? tanhC->row(b) : nullptr;
+#if defined(__x86_64__) || defined(_M_X64)
+        if (avx) {
+            lstmCellRowAvx2(g, cprev, hOut.row(b), cOut.row(b), og, th, h);
+            continue;
+        }
+#else
+        (void)avx;
+#endif
         for (int u = 0; u < h; ++u) {
-            float iv = sigm(gp.row(b)[u]);
-            float fv = sigm(gp.row(b)[h + u]);
-            float gv = std::tanh(gp.row(b)[2 * h + u]);
-            float ov = sigm(gp.row(b)[3 * h + u]);
-            float pc = cp ? cp[b * h + u] : 0.0f;
+            float iv = sigm(g[u]);
+            float fv = sigm(g[h + u]);
+            float gv = tanhf(g[2 * h + u]);
+            float ov = sigm(g[3 * h + u]);
+            float pc = cprev ? cprev[u] : 0.0f;
             float cc = fv * pc + iv * gv;
-            float th = std::tanh(cc);
+            float tn = tanhf(cc);
             cOut.row(b)[u] = cc;
-            hOut.row(b)[u] = ov * th;
-            if (gates) {
-                float* og = gates->row(b);
+            hOut.row(b)[u] = ov * tn;
+            if (og) {
                 og[u] = iv;
                 og[h + u] = fv;
                 og[2 * h + u] = gv;
                 og[3 * h + u] = ov;
             }
-            if (tanhC) tanhC->row(b)[u] = th;
+            if (th) th[u] = tn;
         }
     }
 #endif

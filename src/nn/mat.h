@@ -51,12 +51,21 @@ struct Mat {
     ~Mat() { gpuDropCache(&devCache); }
 
     void resize(int rows, int cols) {
+        int ns = padStride(cols);
+        size_t n = size_t(rows) * ns;
+        // Same shape already owns a zero-padded buffer. Callers overwrite the
+        // live columns or fill explicitly; skipping the assign avoids a full
+        // clear on every inference step and every minibatch.
+        if (ext == nullptr && r == rows && c == cols && s == ns && d.size() == n) {
+            gpuDropCache(&devCache);
+            return;
+        }
         r = rows;
         c = cols;
-        s = padStride(cols);
+        s = ns;
         ext = nullptr;
         gpuDropCache(&devCache);
-        d.assign(size_t(r) * s, 0.0f);
+        d.assign(n, 0.0f);
     }
     // Non-owning view of another Mat's storage (r/c/s shared, data aliased).
     // Lets layer caches keep the exact pointer a kernel bound, so GPU-resident

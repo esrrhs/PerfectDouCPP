@@ -9,6 +9,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <functional>
+#include <condition_variable>
 #include <mutex>
 #include <numeric>
 #include <thread>
@@ -153,6 +154,10 @@ bool ppoUpdate(nn::Actor& actor, nn::Critic& critic,
     std::atomic<size_t> produced{0};
     std::atomic<size_t> consumed{0};
     std::atomic<bool> stopProducer{false};
+    // yield() is Sleep(0) on this runtime and showed up as about a fifth of
+    // process CPU. Wait on the slot instead.
+    std::mutex slotMu;
+    std::condition_variable slotCv;
     const int batchesPerEpoch =
         (N + std::max(cfg.minibatch, 1) - 1) / std::max(cfg.minibatch, 1);
     const int totalBatches = cfg.epochs * batchesPerEpoch;
@@ -207,12 +212,17 @@ bool ppoUpdate(nn::Actor& actor, nn::Critic& critic,
                 std::swap(order[i], order[j]);
             }
             for (int lo = 0; lo < N && !stopProducer.load(); lo += cfg.minibatch) {
-                size_t tail = produced.load(std::memory_order_relaxed);
-                while (tail - consumed.load(std::memory_order_acquire) >=
-                       kQueueDepth) {
-                    if (stopProducer.load(std::memory_order_acquire)) return;
-                    std::this_thread::yield();
+                size_t tail = 0;
+                {
+                    std::unique_lock<std::mutex> lk(slotMu);
+                    slotCv.wait(lk, [&] {
+                        if (stopProducer.load(std::memory_order_acquire)) return true;
+                        tail = produced.load(std::memory_order_relaxed);
+                        return tail - consumed.load(std::memory_order_acquire) <
+                               kQueueDepth;
+                    });
                 }
+                if (stopProducer.load(std::memory_order_acquire)) return;
                 int hi = std::min(lo + cfg.minibatch, N);
                 PreparedBatch& out = queue[tail % kQueueDepth];
                 out.mb.resize(hi - lo);
@@ -223,6 +233,7 @@ bool ppoUpdate(nn::Actor& actor, nn::Critic& critic,
                     eAll.data(), eStride, out.data.xImp, out.data.seq,
                     out.data.mask, out.data.dynFeat, out.data.extra);
                 produced.store(tail + 1, std::memory_order_release);
+                slotCv.notify_one();
             }
         }
     });
@@ -258,10 +269,11 @@ bool ppoUpdate(nn::Actor& actor, nn::Critic& critic,
                     !produceOne())
                     break;
             } else {
-                while (produced.load(std::memory_order_acquire) == head) {
-                    if (stopProducer.load(std::memory_order_acquire)) break;
-                    std::this_thread::yield();
-                }
+                std::unique_lock<std::mutex> lk(slotMu);
+                slotCv.wait(lk, [&] {
+                    return stopProducer.load(std::memory_order_acquire) ||
+                           produced.load(std::memory_order_acquire) != head;
+                });
                 if (produced.load(std::memory_order_acquire) == head) break;
             }
             PreparedBatch& in = queue[head % kQueueDepth];
@@ -354,6 +366,7 @@ bool ppoUpdate(nn::Actor& actor, nn::Critic& critic,
             // may refill the host batch while the stream finishes. The D3D
             // path waited inside onGpu.
             consumed.store(head + 1, std::memory_order_release);
+            slotCv.notify_one();
             if (ownGpu) {
                 nn::gpuSync();
                 nn::gpuWait();
@@ -365,6 +378,7 @@ bool ppoUpdate(nn::Actor& actor, nn::Critic& critic,
             ++mbCount;
     }
     stopProducer.store(true, std::memory_order_release);
+    slotCv.notify_all();
     if (prepareThread.joinable()) prepareThread.join();
     if (!deviceOk) return false;
 

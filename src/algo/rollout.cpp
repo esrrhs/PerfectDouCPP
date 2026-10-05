@@ -207,7 +207,7 @@ void runWorker(const ModelSet& models, const RolloutConfig& cfg, int nGames,
                 float probs[kAbstractActions];
                 float sum = 0.0f;
                 for (int a = 0; a < kAbstractActions; ++a) {
-                    probs[a] = std::exp(logits.row(i)[a] - mx);
+                    probs[a] = expf(logits.row(i)[a] - mx);
                     sum += probs[a];
                 }
                 float draw = float((sampleRng.nextU64() >> 11) /
