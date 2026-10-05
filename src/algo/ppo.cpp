@@ -338,7 +338,10 @@ bool ppoUpdate(nn::Actor& actor, nn::Critic& critic,
                     g = 0.0f;
                 float scale = 1.0f / float(N);
                 float pa = probs[act];
-                float sumW = g * scale +
+                // sumW is E[W]. The taken-action weight is -g/p, so its
+                // expectation is -g, not +g. The positive baseline kept a
+                // full-sized step after the chosen action was already certain.
+                float sumW = -g * scale +
                              cfg.entCoef * scale * (1.0f - entropy);
                 for (int a = 0; a < nn::kNumActions; ++a) {
                     if (probs[a] <= 0.0f) continue;
