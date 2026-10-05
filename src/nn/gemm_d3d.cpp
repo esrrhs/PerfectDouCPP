@@ -118,6 +118,8 @@ struct Pipe {
 };
 
 ID3D12Device* g_device = nullptr;
+ID3D12CommandQueue* g_queue = nullptr;
+std::mutex g_queueMu;
 ID3D12RootSignature* g_root = nullptr;
 
 Pipe g_pipes[24];
@@ -269,6 +271,25 @@ struct CudaOp {
     size_t cbytes = 0;
 };
 
+// Scratch that must not be shared across seats. The D3D queue above this
+// stays process-wide; three compute queues remove the device on this driver.
+constexpr int kSeatSlots = 4;
+struct SeatScratch {
+    std::deque<Chunk> chunks;
+    std::vector<Upload> uploads;
+    std::vector<CopyOp> pending;
+    std::unordered_map<uintptr_t, Bind> window;
+    std::vector<Slot*> dirtyGrads;
+    std::vector<Slot*> graveyard;
+    std::vector<CudaOp> cudaOps;
+    ID3D12Resource* readback = nullptr;
+    char* rbMap = nullptr;
+    size_t rbCap = 0;
+    long long nWait = 0, nCommit = 0;
+    long long stageBytes = 0, flushBytes = 0;
+    double waitSec = 0, encSec = 0;
+};
+
 struct Ctx {
     ID3D12CommandQueue* queue = nullptr;
     ID3D12Fence* fence = nullptr;
@@ -294,6 +315,9 @@ struct Ctx {
     long long nWait = 0, nCommit = 0;
     long long stageBytes = 0, flushBytes = 0;
     double waitSec = 0, encSec = 0;
+    int seat = 0;
+    bool ownsQueue = false;
+    SeatScratch parked[kSeatSlots];
     ~Ctx();
 };
 
@@ -314,7 +338,7 @@ ID3D12Resource* createBuffer(size_t bytes, D3D12_HEAP_TYPE heap,
                              D3D12_RESOURCE_STATES state) {
     // A new committed resource while CUDA still owns the device has crashed
     // this driver. The stream is idle before the allocation.
-    if (cudaBridgeHasWork() && !cudaBridgeSync()) {
+    if (!cudaBridgeSyncAll()) {
         std::fprintf(stderr, "CUDA sync before D3D alloc failed: %s\n", cudaBridgeError());
         noteLost(E_FAIL);
         return nullptr;
@@ -377,6 +401,25 @@ void releaseSlot(Slot* s) {
     delete s;
 }
 
+void exchangeScratch(Ctx& c, SeatScratch& s) {
+    std::swap(c.chunks, s.chunks);
+    std::swap(c.uploads, s.uploads);
+    std::swap(c.pending, s.pending);
+    std::swap(c.window, s.window);
+    std::swap(c.dirtyGrads, s.dirtyGrads);
+    std::swap(c.graveyard, s.graveyard);
+    std::swap(c.cudaOps, s.cudaOps);
+    std::swap(c.readback, s.readback);
+    std::swap(c.rbMap, s.rbMap);
+    std::swap(c.rbCap, s.rbCap);
+    std::swap(c.nWait, s.nWait);
+    std::swap(c.nCommit, s.nCommit);
+    std::swap(c.stageBytes, s.stageBytes);
+    std::swap(c.flushBytes, s.flushBytes);
+    std::swap(c.waitSec, s.waitSec);
+    std::swap(c.encSec, s.encSec);
+}
+
 void closeRecording(Ctx& c) {
     if (c.recording && c.list) c.list->Close();
     c.recording = false;
@@ -428,6 +471,38 @@ void teardown(Ctx& c) {
         c.rbCap = 0;
     }
     c.window.clear();
+    c.cudaOps.clear();
+    c.dirtyGrads.clear();
+    c.graveyard.clear();
+    // Parked seats hold their own chunks. The live set was released above.
+    for (int i = 0; i < kSeatSlots; ++i) {
+        exchangeScratch(c, c.parked[i]);
+        for (Upload& u : c.uploads) {
+            if (u.p) {
+                u.p->Unmap(0, nullptr);
+                u.p->Release();
+            }
+        }
+        c.uploads.clear();
+        c.pending.clear();
+        for (Chunk& ch : c.chunks)
+            if (ch.res.p) {
+                cudaBridgeDrop(ch.res.p);
+                ch.res.p->Release();
+            }
+        c.chunks.clear();
+        if (c.readback) {
+            if (c.rbMap) c.readback->Unmap(0, nullptr);
+            c.readback->Release();
+            c.readback = nullptr;
+            c.rbMap = nullptr;
+            c.rbCap = 0;
+        }
+        c.window.clear();
+        c.cudaOps.clear();
+        c.dirtyGrads.clear();
+        c.graveyard.clear();
+    }
     if (c.list) {
         c.list->Release();
         c.list = nullptr;
@@ -435,10 +510,9 @@ void teardown(Ctx& c) {
     for (ID3D12CommandAllocator* a : c.allocs)
         if (a) a->Release();
     c.allocs.clear();
-    if (c.queue) {
-        c.queue->Release();
-        c.queue = nullptr;
-    }
+    if (c.queue && c.ownsQueue) c.queue->Release();
+    c.queue = nullptr;
+    c.ownsQueue = false;
     if (c.fence) {
         c.fence->Release();
         c.fence = nullptr;
@@ -514,10 +588,9 @@ Ctx::~Ctx() {
     for (ID3D12CommandAllocator* a : allocs)
         if (a) a->Release();
     allocs.clear();
-    if (queue) {
-        queue->Release();
-        queue = nullptr;
-    }
+    if (queue && ownsQueue) queue->Release();
+    queue = nullptr;
+    ownsQueue = false;
     if (fence) {
         fence->Release();
         fence = nullptr;
@@ -528,15 +601,38 @@ Ctx::~Ctx() {
     }
 }
 
+ID3D12CommandQueue* sharedQueue() {
+    std::lock_guard<std::mutex> lk(g_queueMu);
+    if (g_queue) return g_queue;
+    if (!g_device) return nullptr;
+    D3D12_COMMAND_QUEUE_DESC qd = {};
+    qd.Type = D3D12_COMMAND_LIST_TYPE_COMPUTE;
+    if (FAILED(g_device->CreateCommandQueue(&qd, IID_PPV_ARGS(&g_queue)))) {
+        noteLost(E_FAIL);
+        g_queue = nullptr;
+    }
+    return g_queue;
+}
+
 bool ensureThread() {
     Ctx& c = ctx();
     if (c.list) return true;
     if (!g_device || deviceLost()) return false;
-    D3D12_COMMAND_QUEUE_DESC qd = {};
-    qd.Type = D3D12_COMMAND_LIST_TYPE_COMPUTE;
-    if (FAILED(g_device->CreateCommandQueue(&qd, IID_PPV_ARGS(&c.queue)))) {
-        noteLost(E_FAIL);
-        return false;
+    // One compute queue for the process. A queue per learner removes the
+    // device on this driver; each thread still has its own allocator, list,
+    // fence, and scratch, so the three seats record at the same time.
+    if (std::getenv("PD_CUBLAS")) {
+        c.queue = sharedQueue();
+        c.ownsQueue = false;
+        if (!c.queue) return false;
+    } else {
+        D3D12_COMMAND_QUEUE_DESC qd = {};
+        qd.Type = D3D12_COMMAND_LIST_TYPE_COMPUTE;
+        if (FAILED(g_device->CreateCommandQueue(&qd, IID_PPV_ARGS(&c.queue)))) {
+            noteLost(E_FAIL);
+            return false;
+        }
+        c.ownsQueue = true;
     }
     D3D12_FENCE_FLAGS fenceFlags = std::getenv("PD_CUBLAS")
                                        ? D3D12_FENCE_FLAG_SHARED
@@ -942,6 +1038,24 @@ bool replayCuda() {
                     .count();
     c.cudaOps.clear();
     return !deviceLost();
+}
+
+// Park this thread's scratch and switch the CUDA stream. The D3D queue does
+// not change. An open wave is submitted first so its copies stay on the
+// seat that recorded them.
+void useSeat(int id) {
+    if (id < 0) id = 0;
+    id %= kSeatSlots;
+    Ctx& c = ctx();
+    if (c.seat == id) {
+        cudaBridgeSetStream(id);
+        return;
+    }
+    if (c.recording || !c.pending.empty() || !c.cudaOps.empty()) replayCuda();
+    exchangeScratch(c, c.parked[c.seat]);
+    c.seat = id;
+    exchangeScratch(c, c.parked[c.seat]);
+    cudaBridgeSetStream(id);
 }
 
 void dispatch(const char* name, const View* bufs, int nbuf, const void* cst,
@@ -1727,6 +1841,13 @@ bool d3dRecreate() {
         g_dummy.p->Release();
         g_dummy.p = nullptr;
     }
+    {
+        std::lock_guard<std::mutex> lk(g_queueMu);
+        if (g_queue) {
+            g_queue->Release();
+            g_queue = nullptr;
+        }
+    }
     if (g_device) {
         g_device->Release();
         g_device = nullptr;
@@ -1740,9 +1861,9 @@ bool d3dRecreate() {
 void d3dPrintStats(const char* tag) {
     Ctx& c = ctx();
     std::fprintf(stderr,
-                 "[d3d %s] CB=%lld enc=%lld waitMs=%.1f encMs=%.1f "
+                 "[d3d %s] seat=%d CB=%lld enc=%lld waitMs=%.1f encMs=%.1f "
                  "stageMB=%.1f flushMB=%.1f\n",
-                 tag, c.nWait, c.nCommit, c.waitSec * 1e3, c.encSec * 1e3,
+                 tag, c.seat, c.nWait, c.nCommit, c.waitSec * 1e3, c.encSec * 1e3,
                  c.stageBytes / 1e6, c.flushBytes / 1e6);
     c.nWait = c.nCommit = 0;
     c.stageBytes = c.flushBytes = 0;
@@ -1812,6 +1933,17 @@ void cudaReadback(bool keepWindow) {
     c.graveyard.clear();
     ++c.nWait;
     c.waitSec += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+}
+
+void d3dUseSeat(int seat) { useSeat(seat); }
+
+void d3dSubmit() { replayCuda(); }
+
+void d3dSyncSeat() {
+    if (!cudaBridgeSync()) {
+        std::fprintf(stderr, "CUDA seat sync failed: %s\n", cudaBridgeError());
+        noteLost(E_FAIL);
+    }
 }
 
 void d3dWait(bool keepWindow) {

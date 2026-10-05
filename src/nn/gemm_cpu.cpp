@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <condition_variable>
 #include <cstdio>
+#include <cstdlib>
 #include <exception>
 #include <functional>
 #include <mutex>
@@ -35,6 +36,7 @@ namespace {
 // default backend is CPU. --backend gpu still opts into Metal.
 bool g_enabled = false;
 thread_local int t_override = -1;  // -1: follow g_enabled, 0/1: explicit
+thread_local int g_boundSeat = 0;
 
 // Above this MAC count the GPU is used; below it, launch/sync overhead would
 // dominate small products (256x256 and smaller).
@@ -281,6 +283,37 @@ void gpuWaitEx(bool keepWindow) {
 #endif
 }
 
+void gpuBindSeat(int seat) {
+    if (seat < 0) seat = 0;
+    g_boundSeat = seat;
+#if defined(PD_HAVE_CUBLAS)
+    extern void cudaBridgeSetStream(int);
+    cudaBridgeSetStream(seat);
+#endif
+#if defined(PD_HAVE_D3D)
+    if (std::getenv("PD_CUBLAS")) {
+        extern void d3dUseSeat(int);
+        d3dUseSeat(seat);
+    }
+#endif
+}
+
+void gpuSubmit() {
+#if defined(PD_HAVE_D3D)
+    extern void d3dSubmit();
+    if (gemmGpuEnabled()) d3dSubmit();
+#endif
+}
+
+void gpuSync() {
+#if defined(PD_HAVE_D3D)
+    extern void cudaBridgeSetStream(int);
+    extern void d3dSyncSeat();
+    cudaBridgeSetStream(g_boundSeat);
+    if (gemmGpuEnabled()) d3dSyncSeat();
+#endif
+}
+
 void gpuStageInput(float* p, int floats) {
 #ifdef PD_HAVE_GPU
     if (gemmGpuEnabled()) PD_BE(StageInput)(p, size_t(floats) * 4);
@@ -309,10 +342,21 @@ void gpuInvoke(const std::function<void()>& fn) {
 #if !defined(PD_HAVE_D3D)
     fn();
 #else
+    int seat = g_boundSeat;
+    auto run = [fn, seat] {
+        struct Guard {
+            int prev;
+            explicit Guard(int s) : prev(g_boundSeat) { g_boundSeat = s; }
+            ~Guard() { g_boundSeat = prev; }
+        } guard(seat);
+        extern void d3dUseSeat(int);
+        d3dUseSeat(seat);
+        fn();
+    };
     static int single = -1;
     if (single < 0) single = std::getenv("PD_SINGLE_THREAD") ? 1 : 0;
     if (single) {
-        fn();
+        run();
         return;
     }
     // One queue, one thread. Three compute queues on this NVIDIA driver
@@ -364,7 +408,7 @@ void gpuInvoke(const std::function<void()>& fn) {
     };
     static Owner owner;
     if (std::this_thread::get_id() == owner.th.get_id()) {
-        fn();
+        run();
         return;
     }
     std::unique_lock<std::mutex> lk(owner.mu);
@@ -372,7 +416,7 @@ void gpuInvoke(const std::function<void()>& fn) {
     owner.busy = true;
     owner.done = false;
     owner.error = nullptr;
-    owner.job = fn;
+    owner.job = std::function<void()>(run);
     owner.pending = true;
     lk.unlock();
     owner.cv.notify_all();
@@ -390,7 +434,8 @@ void gpuDropCache(void** slot) {
 #ifdef PD_HAVE_GPU
     if (slot != nullptr && *slot != nullptr) {
 #if defined(PD_HAVE_D3D)
-        gpuInvoke([slot] { PD_BE(DropCache)(slot); });
+        if (std::getenv("PD_CUBLAS")) PD_BE(DropCache)(slot);
+        else gpuInvoke([slot] { PD_BE(DropCache)(slot); });
 #else
         PD_BE(DropCache)(slot);
 #endif
@@ -438,7 +483,8 @@ bool gpuDeviceOk() {
 void gpuReleaseThread() {
 #if defined(PD_HAVE_D3D)
     extern void d3dReleaseThread();
-    gpuInvoke([] { d3dReleaseThread(); });
+    if (std::getenv("PD_CUBLAS")) d3dReleaseThread();
+    else gpuInvoke([] { d3dReleaseThread(); });
 #endif
 }
 

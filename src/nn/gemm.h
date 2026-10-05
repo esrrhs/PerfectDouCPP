@@ -60,6 +60,13 @@ void gpuGemm(const GemmOp& op, const float* bias, int biasFloats, int epi);
 // stay alive (needed so the backward pass reads forward activations).
 void gpuWaitEx(bool keepWindow);
 inline void gpuWait() { gpuWaitEx(false); }
+// Bind later GPU work and stream syncs on this thread to a seat. Seats do
+// not share scratch or a CUDA stream. The D3D queue stays the one owner queue.
+void gpuBindSeat(int seat);
+// Launch the queued wave and return. The stream keeps running.
+void gpuSubmit();
+// Wait for the stream selected by gpuBindSeat. Other seats are not waited on.
+void gpuSync();
 // Copy a host buffer into the current residency window (read-write scratch
 // initialized on the host, e.g. zeroed recurrent-gradient states).
 void gpuStageInput(float* p, int floats);

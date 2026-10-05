@@ -12,6 +12,7 @@
 #include <cublas_v2.h>
 #include <nvrtc.h>
 
+#include <atomic>
 #include <cstdio>
 #include <cstring>
 #include <mutex>
@@ -35,6 +36,7 @@ using PFN_cuDestroyExternalMemory = CUresult(CUDAAPI*)(CUexternalMemory);
 using PFN_cuMemcpyDtoH_v2 = CUresult(CUDAAPI*)(void*, CUdeviceptr, size_t);
 using PFN_cuStreamCreate = CUresult(CUDAAPI*)(CUstream*, unsigned int);
 using PFN_cuStreamSynchronize = CUresult(CUDAAPI*)(CUstream);
+using PFN_cuLaunchHostFunc = CUresult(CUDAAPI*)(CUstream, CUhostFn, void*);
 using PFN_cuStreamDestroy_v2 = CUresult(CUDAAPI*)(CUstream);
 using PFN_cuModuleLoadData = CUresult(CUDAAPI*)(CUmodule*, const void*);
 using PFN_cuModuleGetFunction = CUresult(CUDAAPI*)(CUfunction*, CUmodule, const char*);
@@ -76,6 +78,7 @@ struct Api {
     PFN_cuMemcpyDtoH_v2 cuMemcpyDtoH = nullptr;
     PFN_cuStreamCreate cuStreamCreate = nullptr;
     PFN_cuStreamSynchronize cuStreamSynchronize = nullptr;
+    PFN_cuLaunchHostFunc cuLaunchHostFunc = nullptr;
     PFN_cuStreamDestroy_v2 cuStreamDestroy = nullptr;
     PFN_cuModuleLoadData cuModuleLoadData = nullptr;
     PFN_cuModuleGetFunction cuModuleGetFunction = nullptr;
@@ -101,12 +104,31 @@ Api g_api;
 std::mutex g_mu;
 CUcontext g_ctx = nullptr;
 CUdevice g_dev = 0;
-cublasHandle_t g_blas = nullptr;
-CUstream g_stream = nullptr;
 CUmodule g_mod = nullptr;
 bool g_ready = false;
 bool g_failed = false;
-bool g_busy = false;
+// One stream per seat. Non-blocking so a DtoH on the NULL stream does not
+// wait for the other seats. Each handle stays bound to its stream.
+constexpr int kLanes = 8;
+struct Lane {
+    CUstream stream = nullptr;
+    cublasHandle_t blas = nullptr;
+    HANDLE done = nullptr;
+    bool busy = false;
+};
+void CUDA_CB onLaneDone(void* user) {
+    // No CUDA calls here. The waiting thread blocks on this event, not inside
+    // cuStreamSynchronize, so the driver lock stays free for the other seats.
+    SetEvent(static_cast<HANDLE>(user));
+}
+Lane g_lanes[kLanes];
+std::atomic<int> g_laneNext{0};
+thread_local int t_lane = -1;
+
+int laneIndex() {
+    if (t_lane < 0) t_lane = g_laneNext.fetch_add(1, std::memory_order_relaxed) % kLanes;
+    return t_lane;
+}
 char g_err[256] = "cuda bridge not initialised";
 
 struct Map {
@@ -167,6 +189,7 @@ bool loadApi() {
            loadOne(g_api.nvcuda, "cuMemcpyDtoH_v2", g_api.cuMemcpyDtoH) &&
            loadOne(g_api.nvcuda, "cuStreamCreate", g_api.cuStreamCreate) &&
            loadOne(g_api.nvcuda, "cuStreamSynchronize", g_api.cuStreamSynchronize) &&
+           loadOne(g_api.nvcuda, "cuLaunchHostFunc", g_api.cuLaunchHostFunc) &&
            loadOne(g_api.nvcuda, "cuStreamDestroy_v2", g_api.cuStreamDestroy) &&
            loadOne(g_api.nvcuda, "cuModuleLoadData", g_api.cuModuleLoadData) &&
            loadOne(g_api.nvcuda, "cuModuleGetFunction", g_api.cuModuleGetFunction) &&
@@ -200,9 +223,9 @@ bool enter() {
 
 void dropAll() {
     if (g_ctx) g_api.cuCtxSetCurrent(g_ctx);
-    if (g_busy && g_stream) {
-        g_api.cuStreamSynchronize(g_stream);
-        g_busy = false;
+    for (Lane& ln : g_lanes) {
+        if (ln.busy && ln.stream) g_api.cuStreamSynchronize(ln.stream);
+        ln.busy = false;
     }
     for (auto& kv : g_maps) {
         if (kv.second.mem) g_api.cuDestroyExternalMemory(kv.second.mem);
@@ -213,15 +236,16 @@ void dropAll() {
         g_api.cuModuleUnload(g_mod);
         g_mod = nullptr;
     }
-    if (g_blas) {
-        g_api.cublasDestroy(g_blas);
-        g_blas = nullptr;
+    for (Lane& ln : g_lanes) {
+        if (ln.blas) {
+            g_api.cublasDestroy(ln.blas);
+            ln.blas = nullptr;
+        }
+        if (ln.stream) {
+            g_api.cuStreamDestroy(ln.stream);
+            ln.stream = nullptr;
+        }
     }
-    if (g_stream) {
-        g_api.cuStreamDestroy(g_stream);
-        g_stream = nullptr;
-    }
-    g_busy = false;
     g_ready = false;
 }
 
@@ -258,27 +282,37 @@ bool ensureInit() {
         g_failed = true;
         return false;
     }
-    // Flags 0: this stream orders with the legacy NULL stream. cublas is a
-    // runtime library; if SetStream does not attach, it keeps using NULL.
-    // A non-blocking stream would then race that gemm and fault the driver.
-    st = g_api.cuStreamCreate(&g_stream, 0);
-    if (st != CUDA_SUCCESS) {
-        setCu(st, "cuStreamCreate");
-        g_failed = true;
-        return false;
-    }
-    cublasStatus_t bs = g_api.cublasCreate(&g_blas);
-    if (bs != CUBLAS_STATUS_SUCCESS) {
-        std::snprintf(g_err, sizeof(g_err), "cublasCreate failed (%d)", (int)bs);
-        g_failed = true;
-        return false;
-    }
-    g_api.cublasSetMathMode(g_blas, CUBLAS_PEDANTIC_MATH);
-    bs = g_api.cublasSetStream(g_blas, reinterpret_cast<cudaStream_t>(g_stream));
-    if (bs != CUBLAS_STATUS_SUCCESS) {
-        std::snprintf(g_err, sizeof(g_err), "cublasSetStream failed (%d)", (int)bs);
-        g_failed = true;
-        return false;
+    // Non-blocking: a blocking stream joins the NULL stream, and cuMemcpyDtoH
+    // uses that stream, which would stall every seat at every readback.
+    // cublasSetStream is checked; the gemm does not stay on NULL.
+    for (Lane& ln : g_lanes) {
+        if (!ln.done) {
+            ln.done = CreateEventA(nullptr, FALSE, FALSE, nullptr);
+            if (!ln.done) {
+                std::snprintf(g_err, sizeof(g_err), "CreateEvent failed");
+                g_failed = true;
+                return false;
+            }
+        }
+        st = g_api.cuStreamCreate(&ln.stream, CU_STREAM_NON_BLOCKING);
+        if (st != CUDA_SUCCESS) {
+            setCu(st, "cuStreamCreate");
+            g_failed = true;
+            return false;
+        }
+        cublasStatus_t bs = g_api.cublasCreate(&ln.blas);
+        if (bs != CUBLAS_STATUS_SUCCESS) {
+            std::snprintf(g_err, sizeof(g_err), "cublasCreate failed (%d)", (int)bs);
+            g_failed = true;
+            return false;
+        }
+        g_api.cublasSetMathMode(ln.blas, CUBLAS_PEDANTIC_MATH);
+        bs = g_api.cublasSetStream(ln.blas, reinterpret_cast<cudaStream_t>(ln.stream));
+        if (bs != CUBLAS_STATUS_SUCCESS) {
+            std::snprintf(g_err, sizeof(g_err), "cublasSetStream failed (%d)", (int)bs);
+            g_failed = true;
+            return false;
+        }
     }
     g_ready = true;
     std::snprintf(g_err, sizeof(g_err), "ok");
@@ -563,14 +597,15 @@ bool cudaBridgeGemm(ID3D12Device* device,
     const float* A = reinterpret_cast<const float*>(pa + aOff);
     const float* B = reinterpret_cast<const float*>(pb + bOff);
     float* C = reinterpret_cast<float*>(pc + cOff);
-    cublasStatus_t bs = g_api.cublasSgemm(g_blas, opB, opA, N, M, K, &alpha, B, ldb, A, lda, &beta, C, ldc);
+    Lane& ln = g_lanes[laneIndex()];
+    cublasStatus_t bs = g_api.cublasSgemm(ln.blas, opB, opA, N, M, K, &alpha, B, ldb, A, lda, &beta, C, ldc);
     std::snprintf(line, sizeof(line), "gemm done %d", (int)bs);
     crumb(line);
     if (bs != CUBLAS_STATUS_SUCCESS) {
         std::snprintf(g_err, sizeof(g_err), "cublasSgemm failed (%d)", (int)bs);
         return false;
     }
-    g_busy = true;
+    ln.busy = true;
     return true;
 }
 
@@ -641,30 +676,64 @@ bool cudaBridgeKernel(ID3D12Device* device, const char* name,
         for (int i = 0; i < nint; ++i) args[na++] = &ints[i];
     }
     crumb("kern launch");
-    CUresult st = g_api.cuLaunchKernel(fn, gridX, gridY, 1, bx, by, 1, 0, g_stream, args, nullptr);
+    Lane& ln = g_lanes[laneIndex()];
+    CUresult st = g_api.cuLaunchKernel(fn, gridX, gridY, 1, bx, by, 1, 0, ln.stream, args, nullptr);
     if (st != CUDA_SUCCESS) {
         setCu(st, name);
         return false;
     }
-    g_busy = true;
+    ln.busy = true;
+    return true;
+}
+
+void cudaBridgeSetStream(int seat) {
+    if (seat < 0) seat = 0;
+    t_lane = seat % kLanes;
+}
+
+bool syncLane(int idx) {
+    CUstream s = nullptr;
+    HANDLE ev = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(g_mu);
+        if (!ensureInit()) return false;
+        if (idx < 0 || idx >= kLanes) return false;
+        if (!g_lanes[idx].busy) return true;
+        s = g_lanes[idx].stream;
+        ev = g_lanes[idx].done;
+        ResetEvent(ev);
+        CUresult st = g_api.cuLaunchHostFunc(s, onLaneDone, ev);
+        if (st != CUDA_SUCCESS) {
+            setCu(st, "cuLaunchHostFunc");
+            return false;
+        }
+    }
+    // OS wait, not a CUDA synchronize: another seat can launch while this one runs.
+    WaitForSingleObject(ev, INFINITE);
+    CUresult st = g_api.cuStreamSynchronize(s);
+    std::lock_guard<std::mutex> lock(g_mu);
+    if (st != CUDA_SUCCESS) {
+        setCu(st, "cuStreamSynchronize");
+        return false;
+    }
+    g_lanes[idx].busy = false;
     return true;
 }
 
 bool cudaBridgeHasWork() {
     std::lock_guard<std::mutex> lock(g_mu);
-    return g_busy;
+    int idx = t_lane < 0 ? 0 : t_lane;
+    return g_lanes[idx].busy;
 }
 
 bool cudaBridgeSync() {
-    std::lock_guard<std::mutex> lock(g_mu);
-    if (!g_busy) return true;
-    if (!enter()) return false;
-    CUresult st = g_api.cuStreamSynchronize(g_stream);
-    g_busy = false;
-    if (st != CUDA_SUCCESS) {
-        setCu(st, "cuStreamSynchronize");
-        return false;
-    }
+    int idx = t_lane < 0 ? 0 : t_lane;
+    return syncLane(idx);
+}
+
+bool cudaBridgeSyncAll() {
+    for (int i = 0; i < kLanes; ++i)
+        if (!syncLane(i)) return false;
     return true;
 }
 
@@ -673,16 +742,9 @@ bool cudaBridgeDtoH(ID3D12Device* device, ID3D12Resource* resource, size_t offse
     char line[160];
     std::snprintf(line, sizeof(line), "dtoh %zu", bytes);
     crumb(line);
+    if (!cudaBridgeSync()) return false;
     std::lock_guard<std::mutex> lock(g_mu);
     if (!ensureInit()) return false;
-    if (g_busy) {
-        CUresult st = g_api.cuStreamSynchronize(g_stream);
-        g_busy = false;
-        if (st != CUDA_SUCCESS) {
-            setCu(st, "cuStreamSynchronize");
-            return false;
-        }
-    }
     CUdeviceptr ptr = 0;
     if (!mapOf(device, resource, &ptr)) return false;
     CUresult st = g_api.cuMemcpyDtoH(host, ptr + offset, bytes);
@@ -695,13 +757,9 @@ bool cudaBridgeDtoH(ID3D12Device* device, ID3D12Resource* resource, size_t offse
 
 void cudaBridgeDrop(ID3D12Resource* resource) {
     if (!resource) return;
+    if (!cudaBridgeSyncAll()) return;
     std::lock_guard<std::mutex> lock(g_mu);
     if (!g_ready) return;
-    if (g_busy) {
-        g_api.cuCtxSetCurrent(g_ctx);
-        g_api.cuStreamSynchronize(g_stream);
-        g_busy = false;
-    }
     auto it = g_maps.find(resource);
     if (it == g_maps.end()) return;
     if (it->second.mem) g_api.cuDestroyExternalMemory(it->second.mem);
@@ -726,8 +784,10 @@ bool cudaBridgeGemm(ID3D12Device*, ID3D12Resource*, size_t, ID3D12Resource*, siz
                     ID3D12Resource*, size_t, char, char, int, int, int, int, int, int) { return false; }
 bool cudaBridgeKernel(ID3D12Device*, const char*, ID3D12Resource**, const size_t*, int,
                       const void*, size_t, unsigned, unsigned) { return false; }
+void cudaBridgeSetStream(int) {}
 bool cudaBridgeHasWork() { return false; }
 bool cudaBridgeSync() { return true; }
+bool cudaBridgeSyncAll() { return true; }
 bool cudaBridgeDtoH(ID3D12Device*, ID3D12Resource*, size_t, void*, size_t) { return false; }
 void cudaBridgeDrop(ID3D12Resource*) {}
 void cudaBridgeReset() {}

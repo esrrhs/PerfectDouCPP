@@ -8,6 +8,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
+#include <functional>
 #include <mutex>
 #include <numeric>
 #include <thread>
@@ -228,12 +229,19 @@ bool ppoUpdate(nn::Actor& actor, nn::Critic& critic,
 
     nn::Mat dLogits, dValue;
 
-    // The D3D residency window is one per device context. Two seats in
-    // that window at once reuse each other's scratch and remove the device.
-    // One seat runs its minibatches through Adam before the next seat starts.
-    static std::mutex oneSeat;
-    std::lock_guard<std::mutex> seatLock(oneSeat);
-    nn::gpuInvoke([&] {
+    // CUDA: this learner records and launches on its own thread. The three
+    // seats share one D3D queue (a queue each removes the device) and each
+    // has its own CUDA stream. The pure D3D path stays on the owner thread.
+    const bool ownGpu = std::getenv("PD_CUBLAS") != nullptr;
+    auto onGpu = [&](const std::function<void()>& fn) {
+        if (ownGpu) fn();
+        else nn::gpuInvoke(fn);
+    };
+    static std::atomic<int> seatNext{0};
+    static thread_local int seat = -1;
+    if (seat < 0) seat = seatNext.fetch_add(1, std::memory_order_relaxed);
+    nn::gpuBindSeat(seat);
+    onGpu([&] {
         actor.zeroGrad();
         critic.zeroGrad();
     });
@@ -266,14 +274,19 @@ bool ppoUpdate(nn::Actor& actor, nn::Critic& critic,
             // compute queue. The host loss below stays on this learner.
             nn::Mat* logitRows = nullptr;
             nn::Mat* valueRows = nullptr;
-            nn::gpuInvoke([&] {
+            onGpu([&] {
                 logitRows = &actor.forward(batch.xImp, batch.seq, batch.mask,
                                            batch.dynFeat);
                 valueRows = &critic.forward(batch.xImp, batch.seq, batch.extra);
                 nn::gpuMarkHost(logitRows->data());
                 nn::gpuMarkHost(valueRows->data());
-                nn::gpuWaitEx(true);  // flush logits & values; keep fwd binds
+                if (ownGpu) nn::gpuSubmit();
+                else nn::gpuWaitEx(true);
             });
+            if (ownGpu) {
+                nn::gpuSync();
+                nn::gpuWaitEx(true);
+            }
             if (!nn::gpuDeviceOk()) {
                 deviceOk = false;
                 break;
@@ -331,27 +344,31 @@ bool ppoUpdate(nn::Actor& actor, nn::Critic& critic,
                 dValue.row(i)[0] = cfg.vfCoef * err / float(N);
             }
 
-            nn::gpuInvoke([&] {
+            onGpu([&] {
                 actor.backward(dLogits);
                 critic.backward(dValue);
-                // Fence before this iteration's host buffers (dLogits, inputs)
-                // go out of scope and the next minibatch overwrites them.
-                nn::gpuWait();
+                if (ownGpu) nn::gpuSubmit();
+                else nn::gpuWait();
             });
+            // CUDA copies are already in this seat's scratch, so the producer
+            // may refill the host batch while the stream finishes. The D3D
+            // path waited inside onGpu.
+            consumed.store(head + 1, std::memory_order_release);
+            if (ownGpu) {
+                nn::gpuSync();
+                nn::gpuWait();
+            }
             if (!nn::gpuDeviceOk()) {
                 deviceOk = false;
                 break;
             }
             ++mbCount;
-            // Release only after the final fence: the producer may now reuse
-            // this slot's host buffers for a later minibatch.
-            consumed.store(head + 1, std::memory_order_release);
     }
     stopProducer.store(true, std::memory_order_release);
     if (prepareThread.joinable()) prepareThread.join();
     if (!deviceOk) return false;
 
-    nn::gpuInvoke([&] {
+    onGpu([&] {
         actorOpt.applyGradNorm(actor.params(), cfg.maxGradNorm);
         criticOpt.applyGradNorm(critic.params(), cfg.maxGradNorm);
         if (!nn::gpuDeviceOk()) return;
@@ -362,9 +379,6 @@ bool ppoUpdate(nn::Actor& actor, nn::Critic& critic,
         nn::gpuPrintStats("ppo-update");
     });
     if (!nn::gpuDeviceOk()) return false;
-    // Still holding the seat lock: rebuilding the transposed weights drops
-    // device caches. Doing that after the lock lets the next seat record
-    // against a buffer this thread is freeing.
     actor.prepareInference();
     critic.prepareInference();
 

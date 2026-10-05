@@ -285,9 +285,10 @@ int main(int argc, char** argv) {
     std::vector<std::thread> learners;
     for (int s = 0; s < nLearn; ++s) {
         learners.emplace_back([&, s] {
-            // The compute queue lives on one owner thread. A learner that
-            // touches D3D itself would create a second queue.
-            nn::gemmSetThreadGpu(0);
+            // Pure D3D stays on the owner thread: a second compute queue
+            // removes the device. CUDA learners record on this thread and
+            // share the one queue created inside ensureThread.
+            if (!std::getenv("PD_CUBLAS")) nn::gemmSetThreadGpu(0);
             int seen = 0;
             while (true) {
                 int upd = 0;

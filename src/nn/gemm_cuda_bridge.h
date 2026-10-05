@@ -21,8 +21,12 @@ bool cudaBridgeKernel(ID3D12Device* device, const char* name,
                       const void* cst, size_t cbytes,
                       unsigned gridX, unsigned gridY);
 
+// Seat index selects which CUDA stream later launches and syncs use.
+// Streams do not wait for each other.
+void cudaBridgeSetStream(int seat);
 bool cudaBridgeHasWork();
 bool cudaBridgeSync();
+bool cudaBridgeSyncAll();
 bool cudaBridgeDtoH(ID3D12Device* device, ID3D12Resource* resource, size_t offset,
                     void* host, size_t bytes);
 void cudaBridgeDrop(ID3D12Resource* resource);
