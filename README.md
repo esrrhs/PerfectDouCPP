@@ -57,7 +57,7 @@ ctest --test-dir build          # 规则测试 + 神经网络数值梯度检查
 --hidden H          MLP 宽度（论文 256；128 可显著提速）
 --lstm-hidden H     LSTM 隐层（论文 128）
 --epochs N          每批数据 PPO epoch 数（论文默认 4）
---mb N              minibatch（1024 总批 / GPU128；单机默认 256）
+--mb N              minibatch（论文 batch size 1024，8 卡时每卡 128；单机默认 1024）
 --lr/--clip/--ent/--gae/--gamma   PPO 超参，默认论文值
 --reward-scale L    oracle 塑形系数 l（默认 50，0 表示纯 ADP）
 --snapshot-every K  每 K 轮落盘，最后一轮必存

@@ -45,7 +45,7 @@ struct Args {
     int hidden = 256;
     int lstmHidden = 128;
     int epochs = 4;
-    int minibatch = 256;
+    int minibatch = 1024;
     int snapshotEvery = 20;
     int buffer = 2;
     float lr = 3e-4f;
@@ -80,7 +80,7 @@ void parseArgs(int argc, char** argv, Args& a) {
     a.hidden = std::atoi(argValue(argc, argv, "--hidden", "256"));
     a.lstmHidden = std::atoi(argValue(argc, argv, "--lstm-hidden", "128"));
     a.epochs = std::atoi(argValue(argc, argv, "--epochs", "4"));
-    a.minibatch = std::atoi(argValue(argc, argv, "--mb", "256"));
+    a.minibatch = std::atoi(argValue(argc, argv, "--mb", "1024"));
     a.snapshotEvery = std::atoi(argValue(argc, argv, "--snapshot-every", "20"));
     a.buffer = std::atoi(argValue(argc, argv, "--buffer", "2"));
     a.lr = float(std::atof(argValue(argc, argv, "--lr", "3e-4")));
