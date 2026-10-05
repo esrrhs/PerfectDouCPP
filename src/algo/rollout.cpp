@@ -25,7 +25,9 @@ void writeDense(const Transition& t, float* xImp, float* seqSample, float* extra
 
 void scatterMaskDyn(const std::vector<Transition*>& tr, nn::Mat& mask,
                     nn::Mat& dynFeat) {
-    std::fill(dynFeat.d.begin(), dynFeat.d.end(), 0.0f);
+    // Illegal dyn rows are ignored by the mask. Only the mask has to be
+    // cleared; legal rows are overwritten below. New rows come in zero from
+    // Mat::resize, so a stale illegal row stays finite and is never sampled.
     std::fill(mask.d.begin(), mask.d.end(), 0.0f);
     int B = static_cast<int>(tr.size());
     for (int i = 0; i < B; ++i) {

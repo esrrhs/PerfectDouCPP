@@ -53,11 +53,18 @@ struct Mat {
     void resize(int rows, int cols) {
         int ns = padStride(cols);
         size_t n = size_t(rows) * ns;
-        // Same shape already owns a zero-padded buffer. Callers overwrite the
-        // live columns or fill explicitly; skipping the assign avoids a full
-        // clear on every inference step and every minibatch.
-        if (ext == nullptr && r == rows && c == cols && s == ns && d.size() == n) {
-            gpuDropCache(&devCache);
+        // Callers overwrite the live columns or fill explicitly. When only the
+        // row count changes, keep the allocation and zero just the new tail
+        // so a fluctuating batch size does not clear the whole matrix.
+        if (ext == nullptr && c == cols && s == ns && d.capacity() >= n) {
+            bool same = n == d.size() && r == rows;
+            if (n > d.size()) d.resize(n, 0.0f);
+            else if (n < d.size()) d.resize(n);
+            r = rows;
+            // Same storage: keep the device buffer and re-upload on next use.
+            // A new import every step never returns its memory on this driver.
+            if (same) gpuStaleCache(&devCache);
+            else gpuDropCache(&devCache);
             return;
         }
         r = rows;

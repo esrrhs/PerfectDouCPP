@@ -87,6 +87,8 @@ struct Slot {
     size_t bytes = 0;
     bool dirty = false;
     bool shadowValid = false;
+    // Host contents changed. The next weight/grad use copies them in place.
+    bool reload = false;
     void** owner = nullptr;
     // Thread that inserted this slot. liveSlots is thread-local, so a drop
     // marshalled onto the GPU owner must unlink it here or kick() writes
@@ -1218,6 +1220,21 @@ void adoptSlot(Slot* s) {
     }
 }
 
+bool reloadSlot(Slot* s, const void* host, size_t bytes) {
+    if (!s || !s->reload) return true;
+    if (!s->gpu.p || bytes > s->gpu.cap) return false;
+    s->reload = false;
+    s->dirty = false;
+    s->shadowValid = false;
+    if (!host || bytes == 0) return true;
+    UpAlloc u = allocUpload(bytes);
+    if (!u.ptr) return false;
+    std::memcpy(u.ptr, host, bytes);
+    ctx().pending.push_back({&s->gpu, 0, u.res, u.off, bytes});
+    ctx().stageBytes += (long long)bytes;
+    return true;
+}
+
 void markDirty(Slot* s) {
     if (!s || s->dirty) return;
     adoptSlot(s);
@@ -2043,6 +2060,11 @@ void d3dWait(bool keepWindow) {
                      .count();
 }
 
+void d3dStaleCache(void** slotp) {
+    if (!slotp || !*slotp) return;
+    static_cast<Slot*>(*slotp)->reload = true;
+}
+
 void d3dDropCache(void** slotp) {
     if (!slotp || !*slotp) return;
     Slot* s = static_cast<Slot*>(*slotp);
@@ -2055,25 +2077,30 @@ void d3dDropCache(void** slotp) {
     else releaseSlot(s);
 }
 
-void* d3dWeightCache(void** slot, const void* host, size_t bytes) {
-    if (!slot || deviceLost()) return nullptr;
+void* reuseOrCreate(void** slot, const void* host, size_t bytes) {
     if (*slot == nullptr) {
         *slot = createSlot(slot, host, bytes);
-        if (!*slot) return nullptr;
-    } else {
-        adoptSlot(static_cast<Slot*>(*slot));
+        return *slot;
+    }
+    Slot* s = static_cast<Slot*>(*slot);
+    adoptSlot(s);
+    if (!s->reload) return s;
+    if (bytes > s->gpu.cap || !reloadSlot(s, host, bytes)) {
+        d3dDropCache(slot);
+        if (deviceLost()) return nullptr;
+        *slot = createSlot(slot, host, bytes);
     }
     return *slot;
 }
 
+void* d3dWeightCache(void** slot, const void* host, size_t bytes) {
+    if (!slot || deviceLost()) return nullptr;
+    return reuseOrCreate(slot, host, bytes);
+}
+
 void* d3dGradCache(void** slot, const void* host, size_t bytes) {
     if (!slot || deviceLost()) return nullptr;
-    if (*slot == nullptr) {
-        *slot = createSlot(slot, host, bytes);
-        if (!*slot) return nullptr;
-    } else {
-        adoptSlot(static_cast<Slot*>(*slot));
-    }
+    if (!reuseOrCreate(slot, host, bytes)) return nullptr;
     markDirty(static_cast<Slot*>(*slot));
     return *slot;
 }

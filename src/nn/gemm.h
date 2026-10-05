@@ -74,6 +74,10 @@ void gpuStageInput(float* p, int floats);
 void gpuMarkHost(float* p);
 // Release an opaque per-object device cache slot (no-op when empty/CPU).
 void gpuDropCache(void** slot);
+// Host bytes changed but the allocation is still the right size. The next
+// weight or gradient use copies the host into the existing device buffer.
+// Destroying and re-importing that buffer leaks device memory on this driver.
+void gpuStaleCache(void** slot);
 // Persistent device copy of a model weight, cached in the host object's
 // *slot; lazily (re)seeded from host after an invalidation/optimizer step.
 // Returns an opaque buffer reference for immediate encoding.

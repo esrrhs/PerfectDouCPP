@@ -15,8 +15,8 @@ Param::~Param() {
 
 void Param::zeroGrad() {
     std::fill(dw.begin(), dw.end(), 0.0f);
-    // The device accumulator must re-seed from the now-zero host gradient.
-    gpuDropCache(&devG);
+    // Re-seed the existing device accumulator from the zeroed host gradient.
+    gpuStaleCache(&devG);
 }
 
 namespace {
@@ -166,8 +166,9 @@ const Mat& Lstm::forward(const Mat& x, int batch, int steps) {
     statesH.resize((T + 1) * B, h);
     statesC.resize(T * B, h);
     outCache.resize(B * T, h);
-    std::fill(statesH.d.begin(), statesH.d.end(), 0.0f);
-    std::fill(statesC.d.begin(), statesC.d.end(), 0.0f);
+    // The fused GPU cell writes the zero initial state itself and never reads
+    // these host buffers. Filling them is a few MB of memset on every
+    // minibatch. The CPU fallback below still needs the zeros.
 
     // Input-gate products for all steps in a single batched GEMM: (B*T x n) @ (n x 4h) -> (B*T x 4h).
     gateIAll.resize(B * T, H);
@@ -189,6 +190,8 @@ const Mat& Lstm::forward(const Mat& x, int batch, int steps) {
     // the CUDA path walks all T steps inside one block per batch row.
     bool seq = kLstmSeqFwd(statesH, wTh, gateIAll, bi.w, bh.w, gpre, statesC, B, T, h);
     if (!seq) {
+        std::fill(statesH.d.begin(), statesH.d.end(), 0.0f);
+        std::fill(statesC.d.begin(), statesC.d.end(), 0.0f);
         ghGate.resize(B, H);
         for (int t = 0; t < T; ++t) {
             Mat hPrev = viewRows(statesH, t * B, B);

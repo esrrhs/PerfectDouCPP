@@ -958,6 +958,8 @@ void mpsDropCache(void** slot) {
     (void)transferred;
 }
 
+void mpsStaleCache(void** slot) { mpsDropCache(slot); }
+
 // ---------------------------------------------------------------------------
 // Init
 // ---------------------------------------------------------------------------

@@ -386,10 +386,11 @@ bool ppoUpdate(nn::Actor& actor, nn::Critic& critic,
         actorOpt.applyGradNorm(actor.params(), cfg.maxGradNorm);
         criticOpt.applyGradNorm(critic.params(), cfg.maxGradNorm);
         if (!nn::gpuDeviceOk()) return;
-        // Weights changed on the device; drop their cached device copies (the
-        // transposed wt Mats drop theirs in prepareInference via resize).
-        for (nn::Param* p : actor.params()) nn::gpuDropCache(&p->devW);
-        for (nn::Param* p : critic.params()) nn::gpuDropCache(&p->devW);
+        // Host weights were updated in place. Re-upload into the existing
+        // device buffers; destroying them leaks CUDA memory on this driver.
+        // Transposed wt Mats are marked the same way by prepareInference.
+        for (nn::Param* p : actor.params()) nn::gpuStaleCache(&p->devW);
+        for (nn::Param* p : critic.params()) nn::gpuStaleCache(&p->devW);
         nn::gpuPrintStats("ppo-update");
     });
     if (!nn::gpuDeviceOk()) return false;

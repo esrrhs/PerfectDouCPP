@@ -160,6 +160,7 @@ void PD_BE(StageInput)(const void* p, size_t bytes);
 void PD_BE(PrintStats)(const char* tag);
 void PD_BE(MarkHost)(const void* p);
 void PD_BE(DropCache)(void** slot);
+void PD_BE(StaleCache)(void** slot);
 void* PD_BE(WeightCache)(void** slot, const void* host, size_t bytes);
 void* PD_BE(GradCache)(void** slot, const void* host, size_t bytes);
 void PD_BE(FlushGrad)(void* slot, void* host, size_t bytes);
@@ -438,6 +439,21 @@ void gpuDropCache(void** slot) {
         else gpuInvoke([slot] { PD_BE(DropCache)(slot); });
 #else
         PD_BE(DropCache)(slot);
+#endif
+    }
+#else
+    (void)slot;
+#endif
+}
+
+void gpuStaleCache(void** slot) {
+#ifdef PD_HAVE_GPU
+    if (slot != nullptr && *slot != nullptr) {
+#if defined(PD_HAVE_D3D)
+        if (std::getenv("PD_CUBLAS")) PD_BE(StaleCache)(slot);
+        else gpuInvoke([slot] { PD_BE(StaleCache)(slot); });
+#else
+        PD_BE(StaleCache)(slot);
 #endif
     }
 #else
