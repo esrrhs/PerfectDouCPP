@@ -1,320 +1,737 @@
 #include "nn/gemm_cuda_bridge.h"
 
+#if defined(_WIN32) && defined(PD_HAVE_CUBLAS)
+
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
 #include <windows.h>
 #include <d3d12.h>
 
-#if defined(PD_HAVE_CUBLAS)
 #include <cuda.h>
-#include <cudaTypedefs.h>
 #include <cublas_v2.h>
-#endif
+#include <nvrtc.h>
 
-#include <algorithm>
-#include <cwchar>
 #include <cstdio>
 #include <cstring>
 #include <mutex>
+#include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace nn {
-
-#if defined(PD_HAVE_CUBLAS)
 namespace {
 
+using PFN_cuInit = CUresult(CUDAAPI*)(unsigned int);
+using PFN_cuGetErrorString = CUresult(CUDAAPI*)(CUresult, const char**);
+using PFN_cuDeviceGet = CUresult(CUDAAPI*)(CUdevice*, int);
+using PFN_cuDeviceGetAttribute = CUresult(CUDAAPI*)(int*, CUdevice_attribute, CUdevice);
+using PFN_cuDevicePrimaryCtxRetain = CUresult(CUDAAPI*)(CUcontext*, CUdevice);
+using PFN_cuCtxSetCurrent = CUresult(CUDAAPI*)(CUcontext);
+using PFN_cuCtxGetCurrent = CUresult(CUDAAPI*)(CUcontext*);
+using PFN_cuImportExternalMemory = CUresult(CUDAAPI*)(CUexternalMemory*, const CUDA_EXTERNAL_MEMORY_HANDLE_DESC*);
+using PFN_cuExternalMemoryGetMappedBuffer = CUresult(CUDAAPI*)(CUdeviceptr*, CUexternalMemory, const CUDA_EXTERNAL_MEMORY_BUFFER_DESC*);
+using PFN_cuDestroyExternalMemory = CUresult(CUDAAPI*)(CUexternalMemory);
+using PFN_cuMemcpyDtoH_v2 = CUresult(CUDAAPI*)(void*, CUdeviceptr, size_t);
+using PFN_cuStreamCreate = CUresult(CUDAAPI*)(CUstream*, unsigned int);
+using PFN_cuStreamSynchronize = CUresult(CUDAAPI*)(CUstream);
+using PFN_cuStreamDestroy_v2 = CUresult(CUDAAPI*)(CUstream);
+using PFN_cuModuleLoadData = CUresult(CUDAAPI*)(CUmodule*, const void*);
+using PFN_cuModuleGetFunction = CUresult(CUDAAPI*)(CUfunction*, CUmodule, const char*);
+using PFN_cuModuleUnload = CUresult(CUDAAPI*)(CUmodule);
+using PFN_cuLaunchKernel = CUresult(CUDAAPI*)(CUfunction, unsigned int, unsigned int, unsigned int,
+                                            unsigned int, unsigned int, unsigned int,
+                                            unsigned int, CUstream, void**, void**);
+using PFN_cublasCreate = cublasStatus_t(CUBLASAPI*)(cublasHandle_t*);
+using PFN_cublasDestroy = cublasStatus_t(CUBLASAPI*)(cublasHandle_t);
+using PFN_cublasSetMathMode = cublasStatus_t(CUBLASAPI*)(cublasHandle_t, cublasMath_t);
+using PFN_cublasSetStream = cublasStatus_t(CUBLASAPI*)(cublasHandle_t, cudaStream_t);
+using PFN_cublasSgemm = cublasStatus_t(CUBLASAPI*)(cublasHandle_t, cublasOperation_t, cublasOperation_t,
+                                                 int, int, int, const float*, const float*, int,
+                                                 const float*, int, const float*, float*, int);
+using PFN_nvrtcCreateProgram = nvrtcResult(*)(nvrtcProgram*, const char*, const char*, int, const char* const*, const char* const*);
+using PFN_nvrtcDestroyProgram = nvrtcResult(*)(nvrtcProgram*);
+using PFN_nvrtcCompileProgram = nvrtcResult(*)(nvrtcProgram, int, const char* const*);
+using PFN_nvrtcGetPTXSize = nvrtcResult(*)(nvrtcProgram, size_t*);
+using PFN_nvrtcGetPTX = nvrtcResult(*)(nvrtcProgram, char*);
+using PFN_nvrtcGetCUBINSize = nvrtcResult(*)(nvrtcProgram, size_t*);
+using PFN_nvrtcGetCUBIN = nvrtcResult(*)(nvrtcProgram, char*);
+using PFN_nvrtcGetProgramLogSize = nvrtcResult(*)(nvrtcProgram, size_t*);
+using PFN_nvrtcGetProgramLog = nvrtcResult(*)(nvrtcProgram, char*);
+
 struct Api {
-    HMODULE cuda = nullptr;
+    HMODULE nvcuda = nullptr;
     HMODULE cublas = nullptr;
-    decltype(&cuInit) init = nullptr;
-    decltype(&cuDeviceGet) deviceGet = nullptr;
-    decltype(&cuDevicePrimaryCtxRetain) primaryCtxRetain = nullptr;
-    decltype(&cuCtxSetCurrent) ctxSetCurrent = nullptr;
-    decltype(&cuCtxSynchronize) ctxSync = nullptr;
-    decltype(&cuImportExternalMemory) importMemory = nullptr;
-    decltype(&cuExternalMemoryGetMappedBuffer) mapBuffer = nullptr;
-    decltype(&cuMemFree_v2) memFree = nullptr;
-    decltype(&cuMemcpyDtoH_v2) copyDtoH = nullptr;
-    decltype(&cuDestroyExternalMemory) destroyMemory = nullptr;
-    decltype(&cuImportExternalSemaphore) importSemaphore = nullptr;
-    decltype(&cuWaitExternalSemaphoresAsync) waitSemaphore = nullptr;
-    decltype(&cuSignalExternalSemaphoresAsync) signalSemaphore = nullptr;
-    decltype(&cuDestroyExternalSemaphore) destroySemaphore = nullptr;
-    decltype(&cublasCreate_v2) blasCreate = nullptr;
-    decltype(&cublasSetMathMode) setMathMode = nullptr;
-    decltype(&cublasSgemm_v2) sgemm = nullptr;
-    CUcontext context = nullptr;
-    cublasHandle_t handle = nullptr;
-    bool tried = false;
-    bool ok = false;
-    char error[256] = "CUDA bridge not initialized";
+    HMODULE nvrtc = nullptr;
+    PFN_cuInit cuInit = nullptr;
+    PFN_cuGetErrorString cuGetErrorString = nullptr;
+    PFN_cuDeviceGet cuDeviceGet = nullptr;
+    PFN_cuDeviceGetAttribute cuDeviceGetAttribute = nullptr;
+    PFN_cuDevicePrimaryCtxRetain cuDevicePrimaryCtxRetain = nullptr;
+    PFN_cuCtxSetCurrent cuCtxSetCurrent = nullptr;
+    PFN_cuCtxGetCurrent cuCtxGetCurrent = nullptr;
+    PFN_cuImportExternalMemory cuImportExternalMemory = nullptr;
+    PFN_cuExternalMemoryGetMappedBuffer cuExternalMemoryGetMappedBuffer = nullptr;
+    PFN_cuDestroyExternalMemory cuDestroyExternalMemory = nullptr;
+    PFN_cuMemcpyDtoH_v2 cuMemcpyDtoH = nullptr;
+    PFN_cuStreamCreate cuStreamCreate = nullptr;
+    PFN_cuStreamSynchronize cuStreamSynchronize = nullptr;
+    PFN_cuStreamDestroy_v2 cuStreamDestroy = nullptr;
+    PFN_cuModuleLoadData cuModuleLoadData = nullptr;
+    PFN_cuModuleGetFunction cuModuleGetFunction = nullptr;
+    PFN_cuModuleUnload cuModuleUnload = nullptr;
+    PFN_cuLaunchKernel cuLaunchKernel = nullptr;
+    PFN_cublasCreate cublasCreate = nullptr;
+    PFN_cublasDestroy cublasDestroy = nullptr;
+    PFN_cublasSetMathMode cublasSetMathMode = nullptr;
+    PFN_cublasSetStream cublasSetStream = nullptr;
+    PFN_cublasSgemm cublasSgemm = nullptr;
+    PFN_nvrtcCreateProgram nvrtcCreateProgram = nullptr;
+    PFN_nvrtcDestroyProgram nvrtcDestroyProgram = nullptr;
+    PFN_nvrtcCompileProgram nvrtcCompileProgram = nullptr;
+    PFN_nvrtcGetPTXSize nvrtcGetPTXSize = nullptr;
+    PFN_nvrtcGetPTX nvrtcGetPTX = nullptr;
+    PFN_nvrtcGetCUBINSize nvrtcGetCUBINSize = nullptr;
+    PFN_nvrtcGetCUBIN nvrtcGetCUBIN = nullptr;
+    PFN_nvrtcGetProgramLogSize nvrtcGetProgramLogSize = nullptr;
+    PFN_nvrtcGetProgramLog nvrtcGetProgramLog = nullptr;
 };
 
-Api& api() {
-    static Api a;
-    return a;
-}
+Api g_api;
+std::mutex g_mu;
+CUcontext g_ctx = nullptr;
+CUdevice g_dev = 0;
+cublasHandle_t g_blas = nullptr;
+CUstream g_stream = nullptr;
+CUmodule g_mod = nullptr;
+bool g_ready = false;
+bool g_failed = false;
+bool g_busy = false;
+char g_err[256] = "cuda bridge not initialised";
 
-template <class T>
-bool load(HMODULE module, const char* name, T& out) {
-    out = reinterpret_cast<T>(GetProcAddress(module, name));
-    return out != nullptr;
-}
+struct Map {
+    CUexternalMemory mem = nullptr;
+    CUdeviceptr ptr = 0;
+};
+std::unordered_map<ID3D12Resource*, Map> g_maps;
+std::unordered_map<std::string, CUfunction> g_fn;
 
-void fail(const char* text, int code = 0) {
-    Api& a = api();
-    if (code)
-        std::snprintf(a.error, sizeof(a.error), "%s (%d)", text, code);
-    else
-        std::snprintf(a.error, sizeof(a.error), "%s", text);
-}
-
-bool init() {
-    Api& a = api();
-    if (a.tried) return a.ok;
-    a.tried = true;
-
-    a.cuda = LoadLibraryW(L"nvcuda.dll");
-    wchar_t root[512] = {};
-    DWORD n = GetEnvironmentVariableW(L"CUDA_PATH", root, 512);
-    wchar_t blasPath[640] = {};
-    if (n > 0 && n < 512)
-        ::swprintf(blasPath, 640, L"%ls\\bin\\x64\\cublas64_13.dll", root);
-    a.cublas = blasPath[0] ? LoadLibraryW(blasPath) : nullptr;
-    if (!a.cublas) a.cublas = LoadLibraryW(L"cublas64_13.dll");
-    if (!a.cuda || !a.cublas) {
-        fail("cannot load nvcuda.dll/cublas64_13.dll");
+template <typename T>
+bool loadOne(HMODULE mod, const char* name, T& out) {
+    out = reinterpret_cast<T>(GetProcAddress(mod, name));
+    if (!out) {
+        std::snprintf(g_err, sizeof(g_err), "missing %s", name);
         return false;
     }
-
-    bool symbols =
-        load(a.cuda, "cuInit", a.init) &&
-        load(a.cuda, "cuDeviceGet", a.deviceGet) &&
-        load(a.cuda, "cuDevicePrimaryCtxRetain", a.primaryCtxRetain) &&
-        load(a.cuda, "cuCtxSetCurrent", a.ctxSetCurrent) &&
-        load(a.cuda, "cuCtxSynchronize", a.ctxSync) &&
-        load(a.cuda, "cuImportExternalMemory", a.importMemory) &&
-        load(a.cuda, "cuExternalMemoryGetMappedBuffer", a.mapBuffer) &&
-        load(a.cuda, "cuMemFree_v2", a.memFree) &&
-        load(a.cuda, "cuMemcpyDtoH_v2", a.copyDtoH) &&
-        load(a.cuda, "cuDestroyExternalMemory", a.destroyMemory) &&
-        load(a.cuda, "cuImportExternalSemaphore", a.importSemaphore) &&
-        load(a.cuda, "cuWaitExternalSemaphoresAsync", a.waitSemaphore) &&
-        load(a.cuda, "cuSignalExternalSemaphoresAsync", a.signalSemaphore) &&
-        load(a.cuda, "cuDestroyExternalSemaphore", a.destroySemaphore) &&
-        load(a.cublas, "cublasCreate_v2", a.blasCreate) &&
-        load(a.cublas, "cublasSetMathMode", a.setMathMode) &&
-        load(a.cublas, "cublasSgemm_v2", a.sgemm);
-    if (!symbols) {
-        fail("CUDA/cuBLAS symbol missing");
-        return false;
-    }
-
-    CUdevice dev = 0;
-    CUresult cr = a.init(0);
-    if (cr == CUDA_SUCCESS) cr = a.deviceGet(&dev, 0);
-    if (cr == CUDA_SUCCESS) cr = a.primaryCtxRetain(&a.context, dev);
-    if (cr == CUDA_SUCCESS) cr = a.ctxSetCurrent(a.context);
-    if (cr != CUDA_SUCCESS) {
-        fail("CUDA context creation failed", (int)cr);
-        return false;
-    }
-    cublasStatus_t bs = a.blasCreate(&a.handle);
-    if (bs != CUBLAS_STATUS_SUCCESS) {
-        fail("cublasCreate failed", (int)bs);
-        return false;
-    }
-    // Avoid TF32 and other reduced-precision substitutions.
-    bs = a.setMathMode(a.handle, CUBLAS_PEDANTIC_MATH);
-    if (bs != CUBLAS_STATUS_SUCCESS) {
-        fail("cublasSetMathMode failed", (int)bs);
-        return false;
-    }
-    a.ok = true;
-    std::snprintf(a.error, sizeof(a.error), "ok");
-    std::fprintf(stderr, "CUDA GEMM bridge: cuBLAS initialized\n");
     return true;
 }
 
-struct Mapping {
-    ID3D12Resource* resource = nullptr;
-    CUexternalMemory memory = nullptr;
-    CUdeviceptr pointer = 0;
-};
-
-void release(Mapping& m) {
-    Api& a = api();
-    if (m.pointer) a.memFree(m.pointer);
-    if (m.memory) a.destroyMemory(m.memory);
-    m = {};
+void setCu(CUresult st, const char* what) {
+    const char* s = nullptr;
+    if (g_api.cuGetErrorString) g_api.cuGetErrorString(st, &s);
+    std::snprintf(g_err, sizeof(g_err), "%s failed (%d%s%s)", what, (int)st,
+                  s ? ": " : "", s ? s : "");
 }
 
-bool mapResource(ID3D12Device* device, ID3D12Resource* resource, Mapping& out) {
-    HANDLE shared = nullptr;
-    HRESULT hr = device->CreateSharedHandle(resource, nullptr, GENERIC_ALL,
-                                             nullptr, &shared);
-    if (FAILED(hr)) {
-        fail("CreateSharedHandle failed", (int)hr);
+bool loadApi() {
+    if (g_api.nvcuda) return true;
+    g_api.nvcuda = LoadLibraryA("nvcuda.dll");
+    if (!g_api.nvcuda) {
+        std::snprintf(g_err, sizeof(g_err), "nvcuda.dll not found");
         return false;
     }
+    const char* cuda = std::getenv("CUDA_PATH");
+    if (cuda && cuda[0]) {
+        char path[MAX_PATH];
+        std::snprintf(path, sizeof(path), "%s\\bin\\x64\\cublas64_13.dll", cuda);
+        g_api.cublas = LoadLibraryA(path);
+        std::snprintf(path, sizeof(path), "%s\\bin\\x64\\nvrtc64_130_0.dll", cuda);
+        g_api.nvrtc = LoadLibraryA(path);
+    }
+    if (!g_api.cublas) g_api.cublas = LoadLibraryA("cublas64_13.dll");
+    if (!g_api.nvrtc) g_api.nvrtc = LoadLibraryA("nvrtc64_130_0.dll");
+    if (!g_api.cublas || !g_api.nvrtc) {
+        std::snprintf(g_err, sizeof(g_err), "cublas64_13.dll or nvrtc64_130_0.dll not found");
+        return false;
+    }
+    return loadOne(g_api.nvcuda, "cuInit", g_api.cuInit) &&
+           loadOne(g_api.nvcuda, "cuGetErrorString", g_api.cuGetErrorString) &&
+           loadOne(g_api.nvcuda, "cuDeviceGet", g_api.cuDeviceGet) &&
+           loadOne(g_api.nvcuda, "cuDeviceGetAttribute", g_api.cuDeviceGetAttribute) &&
+           loadOne(g_api.nvcuda, "cuDevicePrimaryCtxRetain", g_api.cuDevicePrimaryCtxRetain) &&
+           loadOne(g_api.nvcuda, "cuCtxSetCurrent", g_api.cuCtxSetCurrent) &&
+           loadOne(g_api.nvcuda, "cuCtxGetCurrent", g_api.cuCtxGetCurrent) &&
+           loadOne(g_api.nvcuda, "cuImportExternalMemory", g_api.cuImportExternalMemory) &&
+           loadOne(g_api.nvcuda, "cuExternalMemoryGetMappedBuffer", g_api.cuExternalMemoryGetMappedBuffer) &&
+           loadOne(g_api.nvcuda, "cuDestroyExternalMemory", g_api.cuDestroyExternalMemory) &&
+           loadOne(g_api.nvcuda, "cuMemcpyDtoH_v2", g_api.cuMemcpyDtoH) &&
+           loadOne(g_api.nvcuda, "cuStreamCreate", g_api.cuStreamCreate) &&
+           loadOne(g_api.nvcuda, "cuStreamSynchronize", g_api.cuStreamSynchronize) &&
+           loadOne(g_api.nvcuda, "cuStreamDestroy_v2", g_api.cuStreamDestroy) &&
+           loadOne(g_api.nvcuda, "cuModuleLoadData", g_api.cuModuleLoadData) &&
+           loadOne(g_api.nvcuda, "cuModuleGetFunction", g_api.cuModuleGetFunction) &&
+           loadOne(g_api.nvcuda, "cuModuleUnload", g_api.cuModuleUnload) &&
+           loadOne(g_api.nvcuda, "cuLaunchKernel", g_api.cuLaunchKernel) &&
+           loadOne(g_api.cublas, "cublasCreate_v2", g_api.cublasCreate) &&
+           loadOne(g_api.cublas, "cublasDestroy_v2", g_api.cublasDestroy) &&
+           loadOne(g_api.cublas, "cublasSetMathMode", g_api.cublasSetMathMode) &&
+           loadOne(g_api.cublas, "cublasSetStream_v2", g_api.cublasSetStream) &&
+           loadOne(g_api.cublas, "cublasSgemm_v2", g_api.cublasSgemm) &&
+           loadOne(g_api.nvrtc, "nvrtcCreateProgram", g_api.nvrtcCreateProgram) &&
+           loadOne(g_api.nvrtc, "nvrtcDestroyProgram", g_api.nvrtcDestroyProgram) &&
+           loadOne(g_api.nvrtc, "nvrtcCompileProgram", g_api.nvrtcCompileProgram) &&
+           loadOne(g_api.nvrtc, "nvrtcGetPTXSize", g_api.nvrtcGetPTXSize) &&
+           loadOne(g_api.nvrtc, "nvrtcGetPTX", g_api.nvrtcGetPTX) &&
+           loadOne(g_api.nvrtc, "nvrtcGetCUBINSize", g_api.nvrtcGetCUBINSize) &&
+           loadOne(g_api.nvrtc, "nvrtcGetCUBIN", g_api.nvrtcGetCUBIN) &&
+           loadOne(g_api.nvrtc, "nvrtcGetProgramLogSize", g_api.nvrtcGetProgramLogSize) &&
+           loadOne(g_api.nvrtc, "nvrtcGetProgramLog", g_api.nvrtcGetProgramLog);
+}
+
+bool enter() {
+    if (!g_ready) return false;
+    CUresult st = g_api.cuCtxSetCurrent(g_ctx);
+    if (st != CUDA_SUCCESS) {
+        setCu(st, "cuCtxSetCurrent");
+        return false;
+    }
+    return true;
+}
+
+void dropAll() {
+    if (g_ctx) g_api.cuCtxSetCurrent(g_ctx);
+    if (g_busy && g_stream) {
+        g_api.cuStreamSynchronize(g_stream);
+        g_busy = false;
+    }
+    for (auto& kv : g_maps) {
+        if (kv.second.mem) g_api.cuDestroyExternalMemory(kv.second.mem);
+    }
+    g_maps.clear();
+    g_fn.clear();
+    if (g_mod) {
+        g_api.cuModuleUnload(g_mod);
+        g_mod = nullptr;
+    }
+    if (g_blas) {
+        g_api.cublasDestroy(g_blas);
+        g_blas = nullptr;
+    }
+    if (g_stream) {
+        g_api.cuStreamDestroy(g_stream);
+        g_stream = nullptr;
+    }
+    g_busy = false;
+    g_ready = false;
+}
+
+bool ensureInit() {
+    if (g_ready) return enter();
+    if (g_failed) return false;
+    if (!loadApi()) {
+        g_failed = true;
+        return false;
+    }
+    if (!g_ctx) {
+        CUresult st = g_api.cuInit(0);
+        if (st != CUDA_SUCCESS) {
+            setCu(st, "cuInit");
+            g_failed = true;
+            return false;
+        }
+        st = g_api.cuDeviceGet(&g_dev, 0);
+        if (st != CUDA_SUCCESS) {
+            setCu(st, "cuDeviceGet");
+            g_failed = true;
+            return false;
+        }
+        st = g_api.cuDevicePrimaryCtxRetain(&g_ctx, g_dev);
+        if (st != CUDA_SUCCESS) {
+            setCu(st, "cuDevicePrimaryCtxRetain");
+            g_failed = true;
+            return false;
+        }
+    }
+    CUresult st = g_api.cuCtxSetCurrent(g_ctx);
+    if (st != CUDA_SUCCESS) {
+        setCu(st, "cuCtxSetCurrent");
+        g_failed = true;
+        return false;
+    }
+    // Flags 0: this stream orders with the legacy NULL stream. cublas is a
+    // runtime library; if SetStream does not attach, it keeps using NULL.
+    // A non-blocking stream would then race that gemm and fault the driver.
+    st = g_api.cuStreamCreate(&g_stream, 0);
+    if (st != CUDA_SUCCESS) {
+        setCu(st, "cuStreamCreate");
+        g_failed = true;
+        return false;
+    }
+    cublasStatus_t bs = g_api.cublasCreate(&g_blas);
+    if (bs != CUBLAS_STATUS_SUCCESS) {
+        std::snprintf(g_err, sizeof(g_err), "cublasCreate failed (%d)", (int)bs);
+        g_failed = true;
+        return false;
+    }
+    g_api.cublasSetMathMode(g_blas, CUBLAS_PEDANTIC_MATH);
+    bs = g_api.cublasSetStream(g_blas, reinterpret_cast<cudaStream_t>(g_stream));
+    if (bs != CUBLAS_STATUS_SUCCESS) {
+        std::snprintf(g_err, sizeof(g_err), "cublasSetStream failed (%d)", (int)bs);
+        g_failed = true;
+        return false;
+    }
+    g_ready = true;
+    std::snprintf(g_err, sizeof(g_err), "ok");
+    return true;
+}
+
+bool mapOf(ID3D12Device* device, ID3D12Resource* resource, CUdeviceptr* out) {
+    auto it = g_maps.find(resource);
+    if (it != g_maps.end()) {
+        *out = it->second.ptr;
+        return true;
+    }
     D3D12_RESOURCE_DESC rd = resource->GetDesc();
-    D3D12_RESOURCE_ALLOCATION_INFO allocation =
-        device->GetResourceAllocationInfo(0, 1, &rd);
-    CUDA_EXTERNAL_MEMORY_HANDLE_DESC md = {};
-    md.type = CU_EXTERNAL_MEMORY_HANDLE_TYPE_D3D12_RESOURCE;
-    md.handle.win32.handle = shared;
-    md.size = allocation.SizeInBytes;
-    md.flags = CUDA_EXTERNAL_MEMORY_DEDICATED;
-    CUresult cr = api().importMemory(&out.memory, &md);
-    CloseHandle(shared);
-    if (cr != CUDA_SUCCESS) {
-        fail("cuImportExternalMemory failed", (int)cr);
+    HANDLE handle = nullptr;
+    HRESULT hr = device->CreateSharedHandle(resource, nullptr, GENERIC_ALL, nullptr, &handle);
+    if (FAILED(hr) || !handle) {
+        std::snprintf(g_err, sizeof(g_err), "CreateSharedHandle failed (0x%08lx)", (unsigned long)hr);
+        return false;
+    }
+    CUDA_EXTERNAL_MEMORY_HANDLE_DESC hd = {};
+    hd.type = CU_EXTERNAL_MEMORY_HANDLE_TYPE_D3D12_RESOURCE;
+    hd.handle.win32.handle = handle;
+    hd.size = (unsigned long long)rd.Width;
+    hd.flags = CUDA_EXTERNAL_MEMORY_DEDICATED;
+    CUexternalMemory mem = nullptr;
+    CUresult st = g_api.cuImportExternalMemory(&mem, &hd);
+    CloseHandle(handle);
+    if (st != CUDA_SUCCESS) {
+        setCu(st, "cuImportExternalMemory");
         return false;
     }
     CUDA_EXTERNAL_MEMORY_BUFFER_DESC bd = {};
     bd.offset = 0;
-    bd.size = rd.Width;
-    cr = api().mapBuffer(&out.pointer, out.memory, &bd);
-    if (cr != CUDA_SUCCESS) {
-        fail("cuExternalMemoryGetMappedBuffer failed", (int)cr);
-        release(out);
+    bd.size = (unsigned long long)rd.Width;
+    CUdeviceptr ptr = 0;
+    st = g_api.cuExternalMemoryGetMappedBuffer(&ptr, mem, &bd);
+    if (st != CUDA_SUCCESS) {
+        setCu(st, "cuExternalMemoryGetMappedBuffer");
+        g_api.cuDestroyExternalMemory(mem);
         return false;
     }
-    out.resource = resource;
+    g_maps.emplace(resource, Map{mem, ptr});
+    *out = ptr;
     return true;
+}
+
+const char* kSrc = R"CUDA(
+extern "C" __global__ void add_bias(float* Y, float* BI, int a, int b, int c) {
+  int gid = blockIdx.x * blockDim.x + threadIdx.x;
+  if (gid >= b) return;
+  int row = gid / a;
+  int col = gid - row * a;
+  Y[row * c + col] += BI[col];
+}
+extern "C" __global__ void relu_fwd(float* Y, int a, int b, int c) {
+  int gid = blockIdx.x * blockDim.x + threadIdx.x;
+  if (gid >= b) return;
+  int row = gid / a;
+  int col = gid - row * a;
+  int i = row * c + col;
+  Y[i] = Y[i] > 0.f ? Y[i] : 0.f;
+}
+extern "C" __global__ void relu_bwd(float* Pre, float* Gout, float* Gin, int a, int b, int c, int d) {
+  int gid = blockIdx.x * blockDim.x + threadIdx.x;
+  if (gid >= b) return;
+  int row = gid / a;
+  int col = gid - row * a;
+  float pre = Pre[row * c + col];
+  float g = Gout[row * d + col];
+  Gin[row * d + col] = pre > 0.f ? g : 0.f;
+}
+extern "C" __global__ void gate_add(float* GP, float* GI, float* GH, float* BI, float* BH, int a, int b) {
+  int gid = blockIdx.x * blockDim.x + threadIdx.x;
+  if (gid >= b * a) return;
+  int q = gid - (gid / a) * a;
+  GP[gid] = GI[gid] + GH[gid] + BI[q] + BH[q];
+}
+extern "C" __global__ void lstm_cell_fwd(float* GP, float* CP, float* Hout, float* Cout,
+                                        int h, int B, int hasCp) {
+  int b = blockIdx.x * blockDim.x + threadIdx.x;
+  int u = blockIdx.y * blockDim.y + threadIdx.y;
+  if (b >= B || u >= h) return;
+  int base = b * (4 * h);
+  float iv = 1.f / (1.f + expf(-GP[base + u]));
+  float fv = 1.f / (1.f + expf(-GP[base + h + u]));
+  float gz = tanhf(GP[base + 2 * h + u]);
+  float ov = 1.f / (1.f + expf(-GP[base + 3 * h + u]));
+  float pc = hasCp ? CP[b * h + u] : 0.f;
+  float cc = fv * pc + iv * gz;
+  Cout[b * h + u] = cc;
+  Hout[b * h + u] = ov * tanhf(cc);
+}
+extern "C" __global__ void lstm_cell_bwd(float* GH, float* GP, float* CN, float* CP,
+                                        float* DH, float* DC, float* DG,
+                                        int h, int B, int hasCp) {
+  int b = blockIdx.x * blockDim.x + threadIdx.x;
+  int u = blockIdx.y * blockDim.y + threadIdx.y;
+  if (b >= B || u >= h) return;
+  int uh = h;
+  int base = b * (4 * uh);
+  float tc = tanhf(CN[b * uh + u]);
+  float iv = 1.f / (1.f + expf(-GP[base + u]));
+  float fv = 1.f / (1.f + expf(-GP[base + uh + u]));
+  float gz = tanhf(GP[base + 2 * uh + u]);
+  float ov = 1.f / (1.f + expf(-GP[base + 3 * uh + u]));
+  float dhn = GH[b * uh + u] + DH[b * uh + u];
+  float pc = hasCp ? CP[b * uh + u] : 0.f;
+  float dct = dhn * ov * (1.f - tc * tc) + DC[b * uh + u];
+  DG[base + u] = dct * gz * iv * (1.f - iv);
+  DG[base + uh + u] = dct * pc * fv * (1.f - fv);
+  DG[base + 2 * uh + u] = dct * iv * (1.f - gz * gz);
+  DG[base + 3 * uh + u] = dhn * tc * ov * (1.f - ov);
+  DC[b * uh + u] = dct * fv;
+}
+extern "C" __global__ void concat2(float* Z, float* A, float* B,
+                                  int n1, int n2, int rows, int zs, int as, int bs) {
+  int gid = blockIdx.x * blockDim.x + threadIdx.x;
+  int cols = n1 + n2;
+  if (gid >= rows * cols) return;
+  int i = gid / cols;
+  int j = gid - i * cols;
+  float v = (j < n1) ? A[i * as + j] : B[i * bs + (j - n1)];
+  Z[i * zs + j] = v;
+}
+extern "C" __global__ void split2(float* Z, float* A, float* B,
+                                 int n1, int n2, int rows, int zs, int as, int bs) {
+  int gid = blockIdx.x * blockDim.x + threadIdx.x;
+  int cols = n1 + n2;
+  if (gid >= rows * cols) return;
+  int i = gid / cols;
+  int j = gid - i * cols;
+  float v = Z[i * zs + j];
+  if (j < n1) A[i * as + j] = v;
+  else B[i * bs + (j - n1)] = v;
+}
+extern "C" __global__ void zero_and_last(float* All, float* GH, int B, int T, int h) {
+  int gid = blockIdx.x * blockDim.x + threadIdx.x;
+  int n = B * T * h;
+  if (gid >= n) return;
+  int span = B * h;
+  int t = gid / span;
+  int rem = gid - t * span;
+  All[gid] = (t + 1 == T) ? GH[rem] : 0.f;
+}
+extern "C" __global__ void mask_dyn(float* Logits, float* DS, float* Mask, int N, int B, int ls, int ms) {
+  int gid = blockIdx.x * blockDim.x + threadIdx.x;
+  if (gid >= B * N) return;
+  int i = gid / N;
+  int a = gid - i * N;
+  int li = i * ls + a;
+  if (Mask[i * ms + a] > 0.5f) Logits[li] += DS[(i * N + a) * 4];
+  else Logits[li] = -1.0e9f;
+}
+extern "C" __global__ void add_to(float* Dst, float* Src, int rows, int cols, int dc, int sc) {
+  int gid = blockIdx.x * blockDim.x + threadIdx.x;
+  if (gid >= rows * cols) return;
+  int i = gid / cols;
+  int j = gid - i * cols;
+  int di = i * dc + j;
+  Dst[di] += Src[i * sc + j];
+}
+extern "C" __global__ void bias_grad_add(float* G, float* DB, int B, int o, int gs) {
+  int gid = blockIdx.x * blockDim.x + threadIdx.x;
+  if (gid >= o) return;
+  float s = 0.f;
+  for (int i = 0; i < B; ++i) s += G[i * gs + gid];
+  DB[gid] += s;
+}
+extern "C" __global__ void slice_cols(float* Dst, float* Src, int B, int h, int off, int ds, int ss) {
+  int gid = blockIdx.x * blockDim.x + threadIdx.x;
+  if (gid >= B * h) return;
+  int i = gid / h;
+  int j = gid - i * h;
+  Dst[i * ds + j] = Src[i * ss + off + j];
+}
+extern "C" __global__ void flatten_rows(float* Dst, float* Src, int B, int N, int ss) {
+  int gid = blockIdx.x * blockDim.x + threadIdx.x;
+  if (gid >= B * N) return;
+  int i = gid / N;
+  int a = gid - i * N;
+  Dst[gid * 4] = Src[i * ss + a];
+}
+extern "C" __global__ void copy_mat(float* Dst, float* Src, int rows, int cols, int ds, int ss) {
+  int gid = blockIdx.x * blockDim.x + threadIdx.x;
+  if (gid >= rows * cols) return;
+  int i = gid / cols;
+  int j = gid - i * cols;
+  Dst[i * ds + j] = Src[i * ss + j];
+}
+extern "C" __global__ void adam_step(float* W, float* DW, float* M, float* V,
+                                    int n, float lr, float b1, float b2, float eps, float bc1, float bc2) {
+  int gid = blockIdx.x * blockDim.x + threadIdx.x;
+  if (gid >= n) return;
+  float g = DW[gid];
+  float mm = b1 * M[gid] + (1.f - b1) * g;
+  float vv = b2 * V[gid] + (1.f - b2) * g * g;
+  M[gid] = mm;
+  V[gid] = vv;
+  W[gid] = W[gid] - lr * (mm / bc1) / (sqrtf(vv / bc2) + eps);
+}
+)CUDA";
+
+bool ensureModule() {
+    if (g_mod) return true;
+    nvrtcProgram prog = nullptr;
+    nvrtcResult nr = g_api.nvrtcCreateProgram(&prog, kSrc, "elem.cu", 0, nullptr, nullptr);
+    if (nr != NVRTC_SUCCESS) {
+        std::snprintf(g_err, sizeof(g_err), "nvrtcCreateProgram failed (%d)", (int)nr);
+        return false;
+    }
+    int major = 0, minor = 0;
+    g_api.cuDeviceGetAttribute(&major, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR, g_dev);
+    g_api.cuDeviceGetAttribute(&minor, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR, g_dev);
+    char arch[64];
+    std::snprintf(arch, sizeof(arch), "--gpu-architecture=sm_%d%d", major, minor);
+    const char* opts[] = {arch, "--fmad=true"};
+    nr = g_api.nvrtcCompileProgram(prog, 2, opts);
+    if (nr != NVRTC_SUCCESS) {
+        size_t sz = 0;
+        g_api.nvrtcGetProgramLogSize(prog, &sz);
+        std::string log(sz, '\0');
+        g_api.nvrtcGetProgramLog(prog, log.data());
+        std::fprintf(stderr, "nvrtc: %s\n", log.c_str());
+        std::snprintf(g_err, sizeof(g_err), "nvrtcCompileProgram failed");
+        g_api.nvrtcDestroyProgram(&prog);
+        return false;
+    }
+    size_t cubinSize = 0;
+    g_api.nvrtcGetCUBINSize(prog, &cubinSize);
+    std::vector<char> cubin(cubinSize);
+    g_api.nvrtcGetCUBIN(prog, cubin.data());
+    g_api.nvrtcDestroyProgram(&prog);
+    CUresult st = g_api.cuModuleLoadData(&g_mod, cubin.data());
+    if (st != CUDA_SUCCESS) {
+        setCu(st, "cuModuleLoadData");
+        return false;
+    }
+    return true;
+}
+
+CUfunction functionOf(const char* name) {
+    auto it = g_fn.find(name);
+    if (it != g_fn.end()) return it->second;
+    CUfunction fn = nullptr;
+    CUresult st = g_api.cuModuleGetFunction(&fn, g_mod, name);
+    if (st != CUDA_SUCCESS) {
+        setCu(st, name);
+        return nullptr;
+    }
+    g_fn.emplace(name, fn);
+    return fn;
 }
 
 }  // namespace
 
-bool cudaBridgeGemm(ID3D12Device* device,
-                    ID3D12CommandQueue* queue,
-                    ID3D12Fence* fence, unsigned long long waitValue,
-                    unsigned long long signalValue,
-                    ID3D12Resource* aRes, size_t aOff,
-                    ID3D12Resource* bRes, size_t bOff,
-                    ID3D12Resource* cRes, size_t cOff,
-                    char transA, char transB,
-                    int M, int N, int K, int lda, int ldb, int ldc,
-                    float* hostOut, size_t hostOutBytes) {
-    static std::mutex bridgeMutex;
-    std::lock_guard<std::mutex> bridgeLock(bridgeMutex);
-    if (!init() || !device || !queue || !fence ||
-        !aRes || !bRes || !cRes) return false;
-    CUresult setCurrent = api().ctxSetCurrent(api().context);
-    if (setCurrent != CUDA_SUCCESS) {
-        fail("cuCtxSetCurrent failed", (int)setCurrent);
-        return false;
-    }
-    HANDLE fenceHandle = nullptr;
-    HRESULT hr = device->CreateSharedHandle(fence, nullptr, GENERIC_ALL,
-                                             nullptr, &fenceHandle);
-    if (FAILED(hr)) {
-        fail("CreateSharedHandle(fence) failed", (int)hr);
-        return false;
-    }
-    CUDA_EXTERNAL_SEMAPHORE_HANDLE_DESC sd = {};
-    sd.type = CU_EXTERNAL_SEMAPHORE_HANDLE_TYPE_D3D12_FENCE;
-    sd.handle.win32.handle = fenceHandle;
-    CUexternalSemaphore semaphore = nullptr;
-    CUresult cr = api().importSemaphore(&semaphore, &sd);
-    CloseHandle(fenceHandle);
-    if (cr != CUDA_SUCCESS) {
-        fail("cuImportExternalSemaphore failed", (int)cr);
-        return false;
-    }
-    CUDA_EXTERNAL_SEMAPHORE_WAIT_PARAMS wp = {};
-    wp.params.fence.value = waitValue;
-    cr = api().waitSemaphore(&semaphore, &wp, 1, nullptr);
-    if (cr != CUDA_SUCCESS) {
-        fail("cuWaitExternalSemaphoresAsync failed", (int)cr);
-        api().destroySemaphore(semaphore);
-        return false;
-    }
-    ID3D12Resource* resources[] = {aRes, bRes, cRes};
-    std::vector<Mapping> maps;
-    maps.reserve(3);
-    auto pointerFor = [&](ID3D12Resource* resource, size_t off,
-                          CUdeviceptr& pointer) -> bool {
-        auto it = std::find_if(maps.begin(), maps.end(),
-                               [&](const Mapping& m) {
-                                   return m.resource == resource;
-                               });
-        if (it == maps.end()) {
-            maps.emplace_back();
-            if (!mapResource(device, resource, maps.back())) return false;
-            it = maps.end() - 1;
-        }
-        pointer = it->pointer + off;
-        return true;
-    };
+void crumb(const char*) {}
 
-    CUdeviceptr ap = 0, bp = 0, cp = 0;
-    bool mapped = pointerFor(resources[0], aOff, ap) &&
-                  pointerFor(resources[1], bOff, bp) &&
-                  pointerFor(resources[2], cOff, cp);
-    cublasStatus_t bs = CUBLAS_STATUS_INTERNAL_ERROR;
-    if (mapped) {
-        const float alpha = 1.0f, beta = 0.0f;
-        cublasOperation_t opB =
-            transB == 'T' ? CUBLAS_OP_T : CUBLAS_OP_N;
-        cublasOperation_t opA =
-            transA == 'T' ? CUBLAS_OP_T : CUBLAS_OP_N;
-        // Row-major C = op(A) op(B) is column-major
-        // C^T = op(B)^T op(A)^T. The row strides become leading dimensions.
-        bs = api().sgemm(api().handle, opB, opA, N, M, K, &alpha,
-                         reinterpret_cast<const float*>(bp), ldb,
-                         reinterpret_cast<const float*>(ap), lda, &beta,
-                         reinterpret_cast<float*>(cp), ldc);
-        if (bs == CUBLAS_STATUS_SUCCESS) {
-            if (hostOut && hostOutBytes) {
-                cr = api().copyDtoH(hostOut, cp, hostOutBytes);
-                if (cr != CUDA_SUCCESS) {
-                    fail("cuMemcpyDtoH(output) failed", (int)cr);
-                    mapped = false;
-                }
-            }
-            CUDA_EXTERNAL_SEMAPHORE_SIGNAL_PARAMS sp = {};
-            sp.params.fence.value = signalValue;
-            cr = api().signalSemaphore(&semaphore, &sp, 1, nullptr);
-            // Queue the consumer wait while the CUDA signal is still pending;
-            // this is the cross-API memory dependency, not merely a CPU check
-            // of an already-completed fence value.
-            if (cr == CUDA_SUCCESS &&
-                FAILED(queue->Wait(fence, signalValue)))
-                cr = CUDA_ERROR_UNKNOWN;
-            if (cr == CUDA_SUCCESS) cr = api().ctxSync();
-            if (cr != CUDA_SUCCESS) {
-                fail("CUDA semaphore/synchronize failed", (int)cr);
-                mapped = false;
-            }
-        } else {
-            fail("cublasSgemm failed", (int)bs);
-            mapped = false;
-        }
+bool cudaBridgeGemm(ID3D12Device* device,
+                    ID3D12Resource* a, size_t aOff,
+                    ID3D12Resource* b, size_t bOff,
+                    ID3D12Resource* c, size_t cOff,
+                    char transA, char transB,
+                    int M, int N, int K, int lda, int ldb, int ldc) {
+    char line[200];
+    std::snprintf(line, sizeof(line), "gemm %c%c %d %d %d ld %d %d %d",
+                  transA, transB, M, N, K, lda, ldb, ldc);
+    crumb(line);
+    std::lock_guard<std::mutex> lock(g_mu);
+    if (!ensureInit()) return false;
+    CUdeviceptr pa = 0, pb = 0, pc = 0;
+    if (!mapOf(device, a, &pa) || !mapOf(device, b, &pb) || !mapOf(device, c, &pc)) {
+        crumb("gemm map fail");
+        return false;
     }
-    for (Mapping& m : maps) release(m);
-    api().destroySemaphore(semaphore);
-    return mapped && bs == CUBLAS_STATUS_SUCCESS;
+    std::snprintf(line, sizeof(line), "gemm ptr %llx %llx %llx off %zu %zu %zu",
+                  (unsigned long long)pa, (unsigned long long)pb, (unsigned long long)pc,
+                  aOff, bOff, cOff);
+    crumb(line);
+    cublasOperation_t opA = (transA == 'T') ? CUBLAS_OP_T : CUBLAS_OP_N;
+    cublasOperation_t opB = (transB == 'T') ? CUBLAS_OP_T : CUBLAS_OP_N;
+    const float alpha = 1.f, beta = 0.f;
+    const float* A = reinterpret_cast<const float*>(pa + aOff);
+    const float* B = reinterpret_cast<const float*>(pb + bOff);
+    float* C = reinterpret_cast<float*>(pc + cOff);
+    cublasStatus_t bs = g_api.cublasSgemm(g_blas, opB, opA, N, M, K, &alpha, B, ldb, A, lda, &beta, C, ldc);
+    std::snprintf(line, sizeof(line), "gemm done %d", (int)bs);
+    crumb(line);
+    if (bs != CUBLAS_STATUS_SUCCESS) {
+        std::snprintf(g_err, sizeof(g_err), "cublasSgemm failed (%d)", (int)bs);
+        return false;
+    }
+    g_busy = true;
+    return true;
 }
 
-const char* cudaBridgeError() { return api().error; }
+bool cudaBridgeKernel(ID3D12Device* device, const char* name,
+                      ID3D12Resource** resources, const size_t* offsets, int nbuf,
+                      const void* cst, size_t cbytes,
+                      unsigned gridX, unsigned gridY) {
+    char line[220];
+    std::snprintf(line, sizeof(line), "kern %s %u %u nbuf %d cbytes %zu",
+                  name, gridX, gridY, nbuf, cbytes);
+    crumb(line);
+    std::lock_guard<std::mutex> lock(g_mu);
+    if (!ensureInit() || !ensureModule()) {
+        crumb("kern init fail");
+        return false;
+    }
+    CUfunction fn = functionOf(name);
+    if (!fn) {
+        crumb("kern no fn");
+        return false;
+    }
+    CUdeviceptr base[8] = {};
+    if (nbuf > 8) return false;
+    for (int i = 0; i < nbuf; ++i) {
+        std::snprintf(line, sizeof(line), "kern map %d %p off %zu", i, (void*)resources[i], offsets[i]);
+        crumb(line);
+        if (!resources[i] || !mapOf(device, resources[i], &base[i])) {
+            crumb("kern map fail");
+            return false;
+        }
+        base[i] += offsets[i];
+    }
+    crumb("kern mapped");
+    int ints[16] = {};
+    int nint = (int)(cbytes / sizeof(int));
+    if (nint > 16) nint = 16;
+    if (cst && nint > 0) std::memcpy(ints, cst, (size_t)nint * sizeof(int));
+
+    unsigned bx = 64, by = 1;
+    if (std::strcmp(name, "lstm_cell_fwd") == 0 || std::strcmp(name, "lstm_cell_bwd") == 0) {
+        bx = 8;
+        by = 8;
+    } else if (std::strcmp(name, "adam_step") == 0) {
+        bx = 128;
+    }
+    if (gridX == 0) gridX = 1;
+    if (gridY == 0) gridY = 1;
+
+    void* args[16] = {};
+    int na = 0;
+    for (int i = 0; i < nbuf; ++i) args[na++] = &base[i];
+
+    struct Adam {
+        int n;
+        float lr, b1, b2, eps, bc1, bc2;
+    } adam{};
+    if (std::strcmp(name, "adam_step") == 0) {
+        if (cbytes < sizeof(adam)) return false;
+        std::memcpy(&adam, cst, sizeof(adam));
+        args[na++] = &adam.n;
+        args[na++] = &adam.lr;
+        args[na++] = &adam.b1;
+        args[na++] = &adam.b2;
+        args[na++] = &adam.eps;
+        args[na++] = &adam.bc1;
+        args[na++] = &adam.bc2;
+    } else {
+        for (int i = 0; i < nint; ++i) args[na++] = &ints[i];
+    }
+    crumb("kern launch");
+    CUresult st = g_api.cuLaunchKernel(fn, gridX, gridY, 1, bx, by, 1, 0, g_stream, args, nullptr);
+    if (st != CUDA_SUCCESS) {
+        setCu(st, name);
+        return false;
+    }
+    g_busy = true;
+    return true;
+}
+
+bool cudaBridgeHasWork() {
+    std::lock_guard<std::mutex> lock(g_mu);
+    return g_busy;
+}
+
+bool cudaBridgeSync() {
+    std::lock_guard<std::mutex> lock(g_mu);
+    if (!g_busy) return true;
+    if (!enter()) return false;
+    CUresult st = g_api.cuStreamSynchronize(g_stream);
+    g_busy = false;
+    if (st != CUDA_SUCCESS) {
+        setCu(st, "cuStreamSynchronize");
+        return false;
+    }
+    return true;
+}
+
+bool cudaBridgeDtoH(ID3D12Device* device, ID3D12Resource* resource, size_t offset,
+                    void* host, size_t bytes) {
+    char line[160];
+    std::snprintf(line, sizeof(line), "dtoh %zu", bytes);
+    crumb(line);
+    std::lock_guard<std::mutex> lock(g_mu);
+    if (!ensureInit()) return false;
+    if (g_busy) {
+        CUresult st = g_api.cuStreamSynchronize(g_stream);
+        g_busy = false;
+        if (st != CUDA_SUCCESS) {
+            setCu(st, "cuStreamSynchronize");
+            return false;
+        }
+    }
+    CUdeviceptr ptr = 0;
+    if (!mapOf(device, resource, &ptr)) return false;
+    CUresult st = g_api.cuMemcpyDtoH(host, ptr + offset, bytes);
+    if (st != CUDA_SUCCESS) {
+        setCu(st, "cuMemcpyDtoH");
+        return false;
+    }
+    return true;
+}
+
+void cudaBridgeDrop(ID3D12Resource* resource) {
+    if (!resource) return;
+    std::lock_guard<std::mutex> lock(g_mu);
+    if (!g_ready) return;
+    if (g_busy) {
+        g_api.cuCtxSetCurrent(g_ctx);
+        g_api.cuStreamSynchronize(g_stream);
+        g_busy = false;
+    }
+    auto it = g_maps.find(resource);
+    if (it == g_maps.end()) return;
+    if (it->second.mem) g_api.cuDestroyExternalMemory(it->second.mem);
+    g_maps.erase(it);
+}
+
+void cudaBridgeReset() {
+    std::lock_guard<std::mutex> lock(g_mu);
+    if (!g_api.nvcuda) return;
+    dropAll();
+    g_failed = false;
+}
+
+const char* cudaBridgeError() { return g_err; }
+
+}  // namespace nn
 
 #else
 
-bool cudaBridgeGemm(ID3D12Device*, ID3D12CommandQueue*, ID3D12Fence*,
-                    unsigned long long,
-                    unsigned long long, ID3D12Resource*, size_t,
-                    ID3D12Resource*, size_t, ID3D12Resource*, size_t,
-                    char, char, int, int, int, int, int, int,
-                    float*, size_t) {
-    return false;
-}
-
-const char* cudaBridgeError() {
-    return "built without CUDA Toolkit/cuBLAS";
-}
+namespace nn {
+bool cudaBridgeGemm(ID3D12Device*, ID3D12Resource*, size_t, ID3D12Resource*, size_t,
+                    ID3D12Resource*, size_t, char, char, int, int, int, int, int, int) { return false; }
+bool cudaBridgeKernel(ID3D12Device*, const char*, ID3D12Resource**, const size_t*, int,
+                      const void*, size_t, unsigned, unsigned) { return false; }
+bool cudaBridgeHasWork() { return false; }
+bool cudaBridgeSync() { return true; }
+bool cudaBridgeDtoH(ID3D12Device*, ID3D12Resource*, size_t, void*, size_t) { return false; }
+void cudaBridgeDrop(ID3D12Resource*) {}
+void cudaBridgeReset() {}
+const char* cudaBridgeError() { return "built without cuBLAS"; }
+}  // namespace nn
 
 #endif
-
-}  // namespace nn

@@ -111,7 +111,7 @@ int main(int argc, char** argv) {
     if (args.backend == "gpu" || args.backend == "cuda") nn::gemmSetGpu(true);
     std::cout << "PerfectDou CPP training\n";
     const char* backend = args.backend == "cuda"
-                              ? "GPU (cuBLAS GEMM + D3D12 kernels)"
+                              ? "GPU (cuBLAS + CUDA kernels)"
                               : nn::gemmGpuEnabled() ? nn::gemmGpuLabel() :
 #ifdef __APPLE__
                           "CPU (Accelerate)";

@@ -25,6 +25,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <mutex>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -87,6 +88,11 @@ struct Slot {
     bool dirty = false;
     bool shadowValid = false;
     void** owner = nullptr;
+    // Thread that inserted this slot. liveSlots is thread-local, so a drop
+    // marshalled onto the GPU owner must unlink it here or kick() writes
+    // through the freed slot. homeMu guards that vector against kick().
+    std::vector<Slot*>* home = nullptr;
+    std::mutex* homeMu = nullptr;
     std::vector<char> shadow;
 };
 
@@ -246,6 +252,23 @@ void noteLost(HRESULT hr) {
     }
 }
 
+// One training wave (forward, or backward, or Adam) records every copy and
+// every CUDA launch, then submits the copies once. Launching each GEMM as
+// its own D3D packet was ~8000 CPU fence waits per seat per update.
+struct CudaOp {
+    bool gemm = false;
+    char name[32] = {};
+    ID3D12Resource* res[8] = {};
+    size_t off[8] = {};
+    int nbuf = 0;
+    char transA = 'N';
+    char transB = 'N';
+    int M = 0, N = 0, K = 0, lda = 0, ldb = 0, ldc = 0;
+    unsigned gx = 1, gy = 1;
+    unsigned char cst[64] = {};
+    size_t cbytes = 0;
+};
+
 struct Ctx {
     ID3D12CommandQueue* queue = nullptr;
     ID3D12Fence* fence = nullptr;
@@ -263,6 +286,8 @@ struct Ctx {
     std::vector<Slot*> dirtyGrads;
     std::vector<Slot*> graveyard;
     std::vector<Slot*> liveSlots;
+    std::mutex slotMu;
+    std::vector<CudaOp> cudaOps;
     ID3D12Resource* readback = nullptr;
     char* rbMap = nullptr;
     size_t rbCap = 0;
@@ -273,8 +298,13 @@ struct Ctx {
 };
 
 Ctx& ctx() {
-    static thread_local Ctx c;
-    return c;
+    // Heap, not a thread_local object. MinGW runs the thread_local destructor
+    // after the TLS block is released, so ~Ctx frees its vectors through a
+    // dead heap header (0xC0000374) and, before that guard, calls through
+    // 0xFEEEFEEE. The context stays for the life of the process; the OS
+    // reclaims it. d3dReleaseThread() is the explicit COM release path.
+    static thread_local Ctx* c = new Ctx();
+    return *c;
 }
 
 size_t align256(size_t n) { return (n + 255u) & ~size_t(255); }
@@ -282,6 +312,13 @@ size_t align256(size_t n) { return (n + 255u) & ~size_t(255); }
 ID3D12Resource* createBuffer(size_t bytes, D3D12_HEAP_TYPE heap,
                              D3D12_RESOURCE_FLAGS flags,
                              D3D12_RESOURCE_STATES state) {
+    // A new committed resource while CUDA still owns the device has crashed
+    // this driver. The stream is idle before the allocation.
+    if (cudaBridgeHasWork() && !cudaBridgeSync()) {
+        std::fprintf(stderr, "CUDA sync before D3D alloc failed: %s\n", cudaBridgeError());
+        noteLost(E_FAIL);
+        return nullptr;
+    }
     D3D12_HEAP_PROPERTIES hp = {};
     hp.Type = heap;
     hp.CreationNodeMask = 1;
@@ -309,13 +346,34 @@ ID3D12Resource* createBuffer(size_t bytes, D3D12_HEAP_TYPE heap,
     return res;
 }
 
+void eraseSlotLocked(std::vector<Slot*>* live, std::mutex* mu, Slot* s) {
+    if (!live || !mu) return;
+    std::lock_guard<std::mutex> lk(*mu);
+    live->erase(std::remove(live->begin(), live->end(), s), live->end());
+}
+
 void releaseSlot(Slot* s) {
     if (!s) return;
     if (s->owner && *s->owner == s) *s->owner = nullptr;
-    Ctx& c = ctx();
-    auto& live = c.liveSlots;
-    live.erase(std::remove(live.begin(), live.end(), s), live.end());
-    if (s->gpu.p) s->gpu.p->Release();
+    std::vector<Slot*>* home = s->home;
+    std::mutex* homeMu = s->homeMu;
+    std::vector<Slot*>* here = &ctx().liveSlots;
+    std::mutex* hereMu = &ctx().slotMu;
+    s->home = nullptr;
+    s->homeMu = nullptr;
+    if (home == here) {
+        eraseSlotLocked(home, homeMu, s);
+    } else if (reinterpret_cast<uintptr_t>(homeMu) < reinterpret_cast<uintptr_t>(hereMu)) {
+        eraseSlotLocked(home, homeMu, s);
+        eraseSlotLocked(here, hereMu, s);
+    } else {
+        eraseSlotLocked(here, hereMu, s);
+        eraseSlotLocked(home, homeMu, s);
+    }
+    if (s->gpu.p) {
+        cudaBridgeDrop(s->gpu.p);
+        s->gpu.p->Release();
+    }
     delete s;
 }
 
@@ -342,7 +400,10 @@ void teardown(Ctx& c) {
     for (Slot* s : slots) {
         if (!s) continue;
         if (s->owner && *s->owner == s) *s->owner = nullptr;
-        if (s->gpu.p) s->gpu.p->Release();
+        if (s->gpu.p) {
+            cudaBridgeDrop(s->gpu.p);
+            s->gpu.p->Release();
+        }
         delete s;
     }
     for (Upload& u : c.uploads) {
@@ -354,7 +415,10 @@ void teardown(Ctx& c) {
     c.uploads.clear();
     c.pending.clear();
     for (Chunk& ch : c.chunks)
-        if (ch.res.p) ch.res.p->Release();
+        if (ch.res.p) {
+            cudaBridgeDrop(ch.res.p);
+            ch.res.p->Release();
+        }
     c.chunks.clear();
     if (c.readback) {
         if (c.rbMap) c.readback->Unmap(0, nullptr);
@@ -385,6 +449,7 @@ void teardown(Ctx& c) {
     }
     c.fenceValue = 0;
     c.sinceKick = 0;
+    c.cudaOps.clear();
 }
 
 // Buffers decay to COMMON when ExecuteCommandLists finishes, including
@@ -393,6 +458,7 @@ void teardown(Ctx& c) {
 void noteBufferDecay() {
     Ctx& c = ctx();
     for (Chunk& ch : c.chunks) ch.res.state = D3D12_RESOURCE_STATE_COMMON;
+    std::lock_guard<std::mutex> lk(c.slotMu);
     for (Slot* s : c.liveSlots)
         if (s) s->gpu.state = D3D12_RESOURCE_STATE_COMMON;
 }
@@ -402,6 +468,13 @@ Ctx::~Ctx() {
     // them after join. Freeing them here, while another learner is still
     // submitting, removes the device. d3dReleaseThread() is the path that
     // drops them, and only after every learner has stopped.
+    // A worker's TLS block can already be the heap free-fill pattern
+    // (0xFEEEFEEE) by the time this destructor runs. Those pointers are not
+    // COM objects; calling through them aborts process shutdown.
+    auto wild = [](const void* p) {
+        return reinterpret_cast<uintptr_t>(p) > 0x00007FFFFFFFFFFFULL;
+    };
+    if (wild(queue) || wild(fence) || wild(list)) return;
     if (event && fence && fenceValue > 0) {
         while (fence->GetCompletedValue() < fenceValue) {
             fence->SetEventOnCompletion(fenceValue, event);
@@ -421,8 +494,12 @@ Ctx::~Ctx() {
         }
     }
     uploads.clear();
-    for (Chunk& ch : chunks)
-        if (ch.res.p) ch.res.p->Release();
+    for (Chunk& ch : chunks) {
+        if (ch.res.p) {
+            cudaBridgeDrop(ch.res.p);
+            ch.res.p->Release();
+        }
+    }
     chunks.clear();
     if (readback) {
         if (rbMap) readback->Unmap(0, nullptr);
@@ -650,7 +727,7 @@ View allocScratch(size_t bytes, const void* seed) {
     v.off = ch->used;
     v.len = bytes;
     ch->used += need;
-        if (seed) {
+    if (seed) {
         UpAlloc u = allocUpload(bytes);
         if (!u.ptr) return {};
         std::memcpy(u.ptr, seed, bytes);
@@ -708,7 +785,10 @@ View bindFresh(const void* p, size_t bytes, const void* seed, bool toHost) {
 View kerIn(const void* p, size_t bytes) {
     View v = bindResolve(p);
     if (v.res) return v;
-    return allocScratch(bytes, p);
+    // Remember the upload. A second read of the same host pointer in this
+    // wave must reuse the device copy; allocating again recopied every input
+    // on every GEMM (about 2.5GB per seat per update).
+    return bindFresh(p, bytes, p, false);
 }
 
 View kerOut(const void* p, size_t bytes) {
@@ -736,6 +816,134 @@ ID3D12PipelineState* findPso(const char* name) {
     std::abort();
 }
 
+bool useCuda() {
+    static int on = -1;
+    if (on < 0) on = std::getenv("PD_CUBLAS") != nullptr ? 1 : 0;
+    return on == 1;
+}
+
+// A chunk is one D3D resource. Copying into one offset while CUDA still
+// writes another offset of that resource races, so any upload waits until
+// the CUDA stream is idle, then the CPU waits for that copy.
+bool settleD3D() {
+    Ctx& c = ctx();
+    if (c.pending.empty() && !c.recording) return !deviceLost();
+    if (cudaBridgeHasWork()) {
+        if (!cudaBridgeSync()) {
+            std::fprintf(stderr, "CUDA sync before D3D copy failed: %s\n", cudaBridgeError());
+            noteLost(E_FAIL);
+            return false;
+        }
+    }
+    // Keep the CUDA mapping. Destroying it on every copy leaked device VA on
+    // this driver. The stream is idle, and kick() waits for the copy, so the
+    // next launch sees the uploaded bytes.
+    flushPending();
+    if (deviceLost()) return false;
+    if (c.recording) kick(false);
+    return !deviceLost();
+}
+
+bool queueKernel(const char* name, const View* bufs, int nbuf, const void* cst,
+                 size_t cbytes, unsigned gx, unsigned gy) {
+    if (cbytes > sizeof(CudaOp::cst)) {
+        noteLost(E_FAIL);
+        return false;
+    }
+    CudaOp op;
+    op.gemm = false;
+    std::snprintf(op.name, sizeof(op.name), "%s", name ? name : "");
+    op.nbuf = nbuf < 8 ? nbuf : 8;
+    for (int i = 0; i < op.nbuf; ++i) {
+        if (!bufs[i].res || !bufs[i].res->p) {
+            noteLost(E_FAIL);
+            return false;
+        }
+        op.res[i] = bufs[i].res->p;
+        op.off[i] = bufs[i].off;
+    }
+    op.gx = std::max(gx, 1u);
+    op.gy = std::max(gy, 1u);
+    op.cbytes = cbytes;
+    if (cst && cbytes) std::memcpy(op.cst, cst, cbytes);
+    ctx().cudaOps.push_back(op);
+    return true;
+}
+
+bool queueGemm(const View& a, const View& b, const View& c, char transA, char transB,
+               int M, int N, int K, int lda, int ldb, int ldc) {
+    if (!a.res || !a.res->p || !b.res || !b.res->p || !c.res || !c.res->p) {
+        noteLost(E_FAIL);
+        return false;
+    }
+    CudaOp op;
+    op.gemm = true;
+    op.res[0] = a.res->p;
+    op.res[1] = b.res->p;
+    op.res[2] = c.res->p;
+    op.off[0] = a.off;
+    op.off[1] = b.off;
+    op.off[2] = c.off;
+    op.transA = transA;
+    op.transB = transB;
+    op.M = M;
+    op.N = N;
+    op.K = K;
+    op.lda = lda;
+    op.ldb = ldb;
+    op.ldc = ldc;
+    ctx().cudaOps.push_back(op);
+    return true;
+}
+
+// Copies land first, as one D3D packet. Every queued GEMM and elementwise
+// kernel then runs back to back on the CUDA stream. The CPU waits for that
+// stream once, at readback.
+bool replayCuda() {
+    Ctx& c = ctx();
+    if (c.cudaOps.empty() && c.pending.empty() && !c.recording) return !deviceLost();
+    if (cudaBridgeHasWork() && !cudaBridgeSync()) {
+        std::fprintf(stderr, "CUDA sync before replay failed: %s\n", cudaBridgeError());
+        noteLost(E_FAIL);
+        c.cudaOps.clear();
+        return false;
+    }
+    if (!c.pending.empty() || c.recording) {
+        flushPending();
+        if (deviceLost()) {
+            c.cudaOps.clear();
+            return false;
+        }
+        if (c.recording) kick(false);
+        if (deviceLost()) {
+            c.cudaOps.clear();
+            return false;
+        }
+    }
+    auto launchT0 = std::chrono::steady_clock::now();
+    for (CudaOp& op : c.cudaOps) {
+        bool ok = op.gemm
+                      ? cudaBridgeGemm(g_device, op.res[0], op.off[0], op.res[1], op.off[1],
+                                       op.res[2], op.off[2], op.transA, op.transB, op.M, op.N,
+                                       op.K, op.lda, op.ldb, op.ldc)
+                      : cudaBridgeKernel(g_device, op.name, op.res, op.off, op.nbuf, op.cst,
+                                         op.cbytes, op.gx, op.gy);
+        if (!ok) {
+            std::fprintf(stderr, "CUDA replay %s failed: %s\n",
+                         op.gemm ? "gemm" : op.name, cudaBridgeError());
+            noteLost(E_FAIL);
+            c.cudaOps.clear();
+            return false;
+        }
+        ++c.nCommit;
+    }
+    c.encSec += std::chrono::duration<double>(
+                    std::chrono::steady_clock::now() - launchT0)
+                    .count();
+    c.cudaOps.clear();
+    return !deviceLost();
+}
+
 void dispatch(const char* name, const View* bufs, int nbuf, const void* cst,
               size_t cbytes, UINT gx, UINT gy) {
     if (deviceLost()) return;
@@ -744,6 +952,15 @@ void dispatch(const char* name, const View* bufs, int nbuf, const void* cst,
             noteLost(E_FAIL);
             return;
         }
+    }
+    if (useCuda()) {
+        if (std::strncmp(name, "gemm_", 5) == 0) {
+            std::fprintf(stderr, "internal: %s reached the D3D dispatch under CUDA\n", name);
+            noteLost(E_FAIL);
+            return;
+        }
+        queueKernel(name, bufs, nbuf, cst, cbytes, gx, gy);
+        return;
     }
     auto t0 = std::chrono::steady_clock::now();
     flushPending();
@@ -837,14 +1054,17 @@ Slot* createSlot(void** owner, const void* host, size_t bytes) {
         delete s;
         return nullptr;
     }
-    ctx().liveSlots.push_back(s);
+    s->home = &ctx().liveSlots;
+    s->homeMu = &ctx().slotMu;
+    {
+        std::lock_guard<std::mutex> lk(ctx().slotMu);
+        ctx().liveSlots.push_back(s);
+    }
     s->shadow.assign(bytes, 0);
     if (bytes && host) {
         UpAlloc u = allocUpload(bytes);
         if (!u.ptr) {
-            ctx().liveSlots.pop_back();
-            s->gpu.p->Release();
-            delete s;
+            releaseSlot(s);
             return nullptr;
         }
         std::memcpy(u.ptr, host, bytes);
@@ -860,9 +1080,28 @@ void adoptSlot(Slot* s) {
     if (!s) return;
     Ctx& c = ctx();
     auto& live = c.liveSlots;
-    if (std::find(live.begin(), live.end(), s) != live.end()) return;
-    s->gpu.state = D3D12_RESOURCE_STATE_COMMON;
-    live.push_back(s);
+    if (s->home == &live) {
+        std::lock_guard<std::mutex> lk(c.slotMu);
+        if (std::find(live.begin(), live.end(), s) == live.end()) live.push_back(s);
+        return;
+    }
+    std::mutex* oldMu = s->homeMu;
+    std::vector<Slot*>* old = s->home;
+    if (reinterpret_cast<uintptr_t>(oldMu) < reinterpret_cast<uintptr_t>(&c.slotMu)) {
+        eraseSlotLocked(old, oldMu, s);
+        std::lock_guard<std::mutex> lk(c.slotMu);
+        s->home = &live;
+        s->homeMu = &c.slotMu;
+        s->gpu.state = D3D12_RESOURCE_STATE_COMMON;
+        if (std::find(live.begin(), live.end(), s) == live.end()) live.push_back(s);
+    } else {
+        std::lock_guard<std::mutex> lk(c.slotMu);
+        eraseSlotLocked(old, oldMu, s);
+        s->home = &live;
+        s->homeMu = &c.slotMu;
+        s->gpu.state = D3D12_RESOURCE_STATE_COMMON;
+        if (std::find(live.begin(), live.end(), s) == live.end()) live.push_back(s);
+    }
 }
 
 void markDirty(Slot* s) {
@@ -1473,6 +1712,7 @@ bool d3dDeviceOk() { return !g_initOk || !deviceLost(); }
 void d3dReleaseThread() { teardown(ctx()); }
 
 bool d3dRecreate() {
+    cudaBridgeReset();
     for (int i = 0; i < g_npipes; ++i) {
         if (g_pipes[i].pso) g_pipes[i].pso->Release();
         g_pipes[i].pso = nullptr;
@@ -1521,6 +1761,59 @@ void d3dStageInput(const void* p, size_t bytes) {
     bindFresh(p, bytes, p, false);
 }
 
+void cudaReadback(bool keepWindow) {
+    Ctx& c = ctx();
+    bool hostRead = false;
+    for (auto& kv : c.window)
+        if (kv.second.toHost) hostRead = true;
+    // Dirty gradients stay on the device until d3dFlushGrad. Copying them on
+    // every minibatch fence was more than a gigabyte per seat.
+    if (c.cudaOps.empty() && !c.recording && c.pending.empty() && !hostRead &&
+        !cudaBridgeHasWork())
+        return;
+    auto t0 = std::chrono::steady_clock::now();
+    if (!replayCuda() || !cudaBridgeSync()) {
+        if (cudaBridgeHasWork() || !c.cudaOps.empty()) {
+            std::fprintf(stderr, "CUDA readback sync failed: %s\n", cudaBridgeError());
+            noteLost(E_FAIL);
+        }
+        c.cudaOps.clear();
+        c.pending.clear();
+        c.window.clear();
+        c.dirtyGrads.clear();
+        return;
+    }
+    auto copyOut = [&](ID3D12Resource* res, size_t off, void* host, size_t bytes) {
+        if (!res || !host || bytes == 0) return true;
+        if (!cudaBridgeDtoH(g_device, res, off, host, bytes)) {
+            std::fprintf(stderr, "CUDA DtoH failed: %s\n", cudaBridgeError());
+            noteLost(E_FAIL);
+            return false;
+        }
+        c.flushBytes += (long long)bytes;
+        return true;
+    };
+    for (auto& kv : c.window) {
+        Bind& b = kv.second;
+        if (!b.toHost) continue;
+        if (!b.view.res || !copyOut(b.view.res->p, b.view.off, b.host, b.len)) {
+            c.pending.clear();
+            c.window.clear();
+            c.dirtyGrads.clear();
+            return;
+        }
+    }
+    if (!keepWindow) {
+        c.window.clear();
+        for (Chunk& ch : c.chunks) ch.used = 0;
+    }
+    for (Upload& u : c.uploads) u.used = 0;
+    for (Slot* s : c.graveyard) releaseSlot(s);
+    c.graveyard.clear();
+    ++c.nWait;
+    c.waitSec += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+}
+
 void d3dWait(bool keepWindow) {
     Ctx& c = ctx();
     if (deviceLost()) {
@@ -1528,6 +1821,10 @@ void d3dWait(bool keepWindow) {
         c.pending.clear();
         c.window.clear();
         c.dirtyGrads.clear();
+        return;
+    }
+    if (useCuda()) {
+        cudaReadback(keepWindow);
         return;
     }
     if (!c.recording && c.pending.empty() && c.dirtyGrads.empty()) return;
@@ -1653,6 +1950,26 @@ void d3dFlushGrad(void* slot, void* host, size_t bytes) {
     if (!slot || !host || bytes == 0 || deviceLost()) return;
     Slot* s = static_cast<Slot*>(slot);
     adoptSlot(s);
+    if (useCuda()) {
+        if (!ctx().cudaOps.empty() || !ctx().pending.empty() || ctx().recording ||
+            cudaBridgeHasWork())
+            d3dWait(true);
+        if (deviceLost()) return;
+        if (s->dirty || !s->shadowValid) {
+            if (!s->gpu.p ||
+                !cudaBridgeDtoH(g_device, s->gpu.p, 0, s->shadow.data(), s->bytes)) {
+                std::fprintf(stderr, "CUDA grad DtoH failed: %s\n", cudaBridgeError());
+                noteLost(E_FAIL);
+                return;
+            }
+            s->shadowValid = true;
+            s->dirty = false;
+            ctx().flushBytes += (long long)s->bytes;
+        }
+        size_t n = std::min(bytes, s->shadow.size());
+        std::memcpy(host, s->shadow.data(), n);
+        return;
+    }
     if (s->dirty || !s->shadowValid) d3dWait(true);
     if (deviceLost() || !s->shadowValid) return;
     size_t n = std::min(bytes, s->shadow.size());
@@ -1684,45 +2001,9 @@ void d3dCustomGemm(const GemmOp& g, const void* biasV, size_t biasBytes, int epi
     View bufs[4] = {rA, rB, rC, rBias};
     GParam p{g.M, g.N, g.K, g.lda, g.ldb, g.ldc,
              g.transA == 'T' ? 1 : 0, g.transB == 'T' ? 1 : 0, epi};
-    if (std::getenv("PD_CUBLAS")) {
-        // Materialize all uploads and finish preceding D3D kernels before
-        // cuBLAS touches the same shared resources. cuBLAS is synchronized on
-        // the CPU before recording the next D3D kernel.
-        flushPending();
-        if (ctx().recording) kick(false);
-        UINT64 waitValue = ctx().fenceValue;
-        UINT64 signalValue = waitValue + 1;
-        size_t outBytes = size_t(g.M) * g.ldc * sizeof(float);
-        std::vector<float> cudaOut(size_t(g.M) * g.ldc);
-        bool ok = !deviceLost() &&
-                  cudaBridgeGemm(g_device, ctx().queue, ctx().fence,
-                                 waitValue, signalValue,
-                                 rA.res->p, rA.off,
-                                 rB.res->p, rB.off,
-                                 rC.res->p, rC.off,
-                                 g.transA, g.transB,
-                                 g.M, g.N, g.K, g.lda, g.ldb, g.ldc,
-                                 cudaOut.data(), outBytes);
-        if (!ok) {
-            std::fprintf(stderr, "CUDA GEMM bridge failed: %s\n",
-                         cudaBridgeError());
-            noteLost(E_FAIL);
+    if (useCuda()) {
+        if (!queueGemm(rA, rB, rC, g.transA, g.transB, g.M, g.N, g.K, g.lda, g.ldb, g.ldc))
             return;
-        }
-        ctx().fenceValue = signalValue;
-        // CUDA -> D3D12 writes are copied through an upload heap for now.
-        // D3D -> CUDA uses shared memory directly; this conservative return
-        // path avoids relying on driver cache visibility that failed parity
-        // on this laptop.
-        UpAlloc outUpload = allocUpload(outBytes);
-        if (!outUpload.ptr) {
-            noteLost(E_FAIL);
-            return;
-        }
-        std::memcpy(outUpload.ptr, cudaOut.data(), outBytes);
-        ctx().pending.push_back(
-            {rC.res, rC.off, outUpload.res, outUpload.off, outBytes});
-        ctx().stageBytes += (long long)outBytes;
         if (epi == 1) {
             struct BiasP { int a, b, c; } bp{g.N, g.M * g.N, g.ldc};
             View add[2] = {rC, rBias};
@@ -1789,8 +2070,10 @@ void d3dCommitGemms(int count, const GemmOp* ops, long long) {
 }
 
 void d3dAddBias(Mat& y, const std::vector<float>& b) {
+    View yv = rOut(y);
+    View bv = rScalar(b);
     struct P { int a, b, c; } q{y.c, y.r * y.c, y.s};
-    launch1("add_bias", {rOut(y), rScalar(b)}, &q, sizeof(q), y.r * y.c);
+    launch1("add_bias", {yv, bv}, &q, sizeof(q), y.r * y.c);
 }
 void d3dRelu(Mat& x) {
     struct P { int a, b, c; } q{x.c, x.r * x.c, x.s};
