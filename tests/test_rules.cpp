@@ -119,20 +119,53 @@ static void testBottomCards() {
     CHECK(game.bottom.c[rank] == rankBefore - 1);
 }
 
-static void testGAE() {
-    std::vector<algo::Transition> tr(10);
-    for (int i = 0; i < 10; ++i) {
+static void testEpisodeReturn() {
+    std::vector<algo::Transition> tr(4);
+    for (int i = 0; i < 4; ++i) {
         tr[i].gameId = 3;
-        tr[i].reward = 1.0f;
-        tr[i].value = 0.0f;
+        tr[i].value = 0.5f;
     }
+    tr.back().reward = 4.0f;
     tr.back().terminal = true;
-    algo::computeGAE(tr, 1.0f, 1.0f, 3);
-    const float expected[] = {3, 2, 1, 3, 2, 1, 3, 2, 1, 1};
-    for (int i = 0; i < 10; ++i) {
-        CHECK(std::abs(tr[i].adv - expected[i]) < 1e-6f);
-        CHECK(std::abs(tr[i].ret - expected[i]) < 1e-6f);
+    algo::assignEpisodeReturns(tr);
+    for (int i = 0; i < 4; ++i) {
+        CHECK(std::abs(tr[i].ret - 4.0f) < 1e-6f);
+        CHECK(std::abs(tr[i].adv - 3.5f) < 1e-6f);
     }
+}
+
+static void testDouzeroFeatures() {
+    Game g;
+    g.turn = 0;
+    g.lastPlayer = 0;
+    g.hand[0].add(0, 1);
+    g.hand[1].add(1, 1);
+    g.hand[2].add(2, 2);
+    EncodedState e = encodeState(g);
+    auto bit = [&](int slot, int row, int rank) {
+        return e.imp[(slot * 12 + row) * kRanks + rank];
+    };
+    CHECK(bit(0, 0, 0) == 1);
+    CHECK(bit(1, 0, 0) == 0);
+    CHECK(bit(1, 0, 1) == 1);
+    CHECK(bit(1, 0, 2) == 1);
+    CHECK(bit(1, 1, 2) == 1);
+    CHECK(e.scalar[1] == 1.0f);                 // previous player holds 2
+    CHECK(e.scalar[kHandHot] == 1.0f);          // next player holds 1
+    CHECK(e.scalar[2 * kHandHot] == 1.0f);      // zero bombs
+    CHECK(e.scalar[kImpScalars - 1] == 1.0f);   // acting player has control
+
+    g.hand[0] = CardSet::parse("33344456");
+    g.hand[1] = CardSet{};
+    g.hand[2] = CardSet{};
+    bool sawKicker = false;
+    for (const LegalOption& o : legalOptions(g)) {
+        if (o.concrete.c[2] == 0 || o.concrete.c[3] == 0) continue;
+        CHECK(o.feature[2] == 1.0f);
+        CHECK(o.feature[3] == 1.0f);
+        sawKicker = true;
+    }
+    CHECK(sawKicker);
 }
 
 static void testGenerator() {
@@ -325,7 +358,8 @@ int main() {
     std::printf("testGenerator...\n"); testGenerator();
     std::printf("testOracle...\n"); testOracle();
     std::printf("testBottomCards...\n"); testBottomCards();
-    std::printf("testGAE...\n"); testGAE();
+    std::printf("testEpisodeReturn...\n"); testEpisodeReturn();
+    std::printf("testDouzeroFeatures...\n"); testDouzeroFeatures();
     std::printf("testRandomGames...\n"); testRandomGames();
     std::printf("testFeatures...\n"); testFeatures();
     std::printf("ALL TESTS PASSED\n");

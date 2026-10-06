@@ -9,6 +9,8 @@
 
 namespace algo {
 
+static_assert(nn::kImpInput == ddz::kNodeSize, "actor input must match node features");
+
 namespace {
 
 void writeDense(const Transition& t, float* xImp, float* seqSample, float* extra) {
@@ -135,7 +137,6 @@ void runWorker(const ModelSet& models, const RolloutConfig& cfg, int nGames,
     Rng sampleRng(seed ^ 0x123456789abcdef0ULL);
 
     std::vector<Game> games(nGames);
-    std::vector<std::array<int, 3>> oracleSteps(nGames);
     std::vector<bool> active(nGames, true);
     // index of the last transition of each game per seat
     std::array<std::vector<int>, 3> lastIdx;
@@ -144,11 +145,7 @@ void runWorker(const ModelSet& models, const RolloutConfig& cfg, int nGames,
     ActorInfer actorW[3];
     CriticInfer criticW[3];
 
-    for (int gi = 0; gi < nGames; ++gi) {
-        games[gi].deal(dealRng);
-        for (int s = 0; s < 3; ++s)
-            oracleSteps[gi][s] = minSteps(games[gi].hand[s]);
-    }
+    for (int gi = 0; gi < nGames; ++gi) games[gi].deal(dealRng);
 
     auto encodeTransition = [&](const Game& g,
                                 const std::vector<LegalOption>& options) {
@@ -236,33 +233,11 @@ void runWorker(const ModelSet& models, const RolloutConfig& cfg, int nGames,
                 Game& g = games[gi];
                 const CardSet& concrete = chosen[i]->concrete;
 
-                // The oracle is a perfect-information reward for both camps,
-                // not just for the player that happened to act.  Attribute
-                // this node-to-node reward to every seat's currently open
-                // transition; it will then cover the interval until that
-                // seat acts again.
-                const auto& before = oracleSteps[gi];
-                float advB = float(before[0] - std::min(before[1], before[2]));
-
                 int storedIndex = static_cast<int>(res.seats[seat].size());
                 res.seats[seat].push_back(std::move(tr[i]));
                 lastIdx[seat][gi] = storedIndex;
 
                 g.step(concrete);
-                if (cfg.rewardScale > 0.0f) {
-                    oracleSteps[gi][seat] = minSteps(g.hand[seat]);
-                    const auto& after = oracleSteps[gi];
-                    float advA =
-                        float(after[0] - std::min(after[1], after[2]));
-                    float dAdv = advA - advB;
-                    for (int s = 0; s < 3; ++s) {
-                        int idx = lastIdx[s][gi];
-                        if (idx >= 0)
-                            res.seats[s][idx].reward +=
-                                (s == kLandlord ? -1.0f : 0.5f) * dAdv *
-                                cfg.rewardScale;
-                    }
-                }
                 res.stats.moves += 1;
                 if (isBombLike(concrete)) res.stats.bombs += 1;
 

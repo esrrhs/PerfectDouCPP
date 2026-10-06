@@ -1,10 +1,10 @@
 // Node / action feature engineering, following PerfectDou paper Tables 1, 5, 6.
 //
 // Imperfect node features (observable by the acting player):
-//   23 card matrices of 12 x 15 = 4140 binaries
-//     hand, unplayed cards, my/prev/next played cards, the 3 bottom cards,
-//     last 15 moves, prev player's last move, next player's last move
-//   + 6 scalars (min play-out steps, three hand sizes, bomb count, control)
+//   24 card matrices of 12 x 15
+//     own hand, the other two players' cards, my/prev/next played cards,
+//     the 3 bottom cards, own/prev/next last move, last 15 moves
+//   + one-hot hand counts (20+20), one-hot bomb count (15), control flag
 // Additional perfect features (critic only):
 //   2 card matrices (prev hand, next hand) + 2 min-step scalars = 362
 //
@@ -32,10 +32,12 @@ constexpr int kStaticMatrices = 9;
 // own last move (the paper's table only lists the two opponents' last moves).
 constexpr int kImpMatrices = kStaticMatrices + kHistoryLen;
 constexpr int kImpBin = kImpMatrices * kCardMat;  // 4320
-constexpr int kImpScalars = 6;
+constexpr int kHandHot = 20;   // DouZero: one-hot of cards left, index = count-1
+constexpr int kBombHot = 15;   // DouZero: one-hot of bombs shown, including zero
+constexpr int kImpScalars = kHandHot + kHandHot + kBombHot + 1;
 constexpr int kImpSize = kImpBin + kImpScalars;  // stored transition feature
 constexpr int kNodeBin = kStaticMatrices * kCardMat;  // 1620
-constexpr int kNodeSize = kNodeBin + kImpScalars;     // 1626
+constexpr int kNodeSize = kNodeBin + kImpScalars;     // 1676
 constexpr int kExtraBin = 2 * kCardMat;          // 360
 constexpr int kExtraScalars = 2;
 constexpr int kExtraSize = kExtraBin + kExtraScalars;  // 362

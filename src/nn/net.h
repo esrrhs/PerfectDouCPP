@@ -13,7 +13,7 @@
 
 namespace nn {
 
-constexpr int kImpInput = 1626;  // 9*180 current-state binaries + 6 scalars
+constexpr int kImpInput = 1676;  // 9*180 current-state binaries + 56 one-hots
 constexpr int kExtraInput = 362;
 constexpr int kLstmSteps = 5;
 constexpr int kLstmIn = 540;     // three consecutive moves per LSTM step

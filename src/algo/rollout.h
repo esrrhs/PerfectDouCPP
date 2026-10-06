@@ -51,7 +51,6 @@ struct ModelSet {
 struct RolloutConfig {
     int gamesPerUpdate = 256;
     int threads = 4;
-    float rewardScale = 50.0f;  // l in the paper; 0 disables oracle shaping
     uint64_t seed = 1;
 };
 

@@ -51,10 +51,6 @@ struct Args {
     float lr = 3e-4f;
     float clip = 0.2f;
     float ent = 0.1f;
-    float gamma = 1.0f;
-    float gae = 0.95f;
-    int gaeSteps = 8;
-    float rewardScale = 50.0f;
     uint64_t seed = 1;
     std::string out = "ckpt";
     std::string resume;
@@ -87,10 +83,6 @@ void parseArgs(int argc, char** argv, Args& a) {
     a.lr = float(std::atof(argValue(argc, argv, "--lr", "3e-4")));
     a.clip = float(std::atof(argValue(argc, argv, "--clip", "0.2")));
     a.ent = float(std::atof(argValue(argc, argv, "--ent", "0.1")));
-    a.gamma = float(std::atof(argValue(argc, argv, "--gamma", "1.0")));
-    a.gae = float(std::atof(argValue(argc, argv, "--gae", "0.95")));
-    a.gaeSteps = std::atoi(argValue(argc, argv, "--gae-steps", "8"));
-    a.rewardScale = float(std::atof(argValue(argc, argv, "--reward-scale", "50")));
     a.seed = std::atoll(argValue(argc, argv, "--seed", "1"));
     a.out = argValue(argc, argv, "--out", "ckpt");
     a.backend = argValue(argc, argv, "--backend", "auto");
@@ -132,10 +124,7 @@ int main(int argc, char** argv) {
               << " lr=" << args.lr
               << " clip=" << args.clip
               << " ent=" << args.ent
-              << " gamma=" << args.gamma
-              << " gae=" << args.gae
-              << " gaeSteps=" << args.gaeSteps
-              << " rewardScale=" << args.rewardScale
+              << " target=terminal-adp"
               << " seed=" << args.seed << std::endl;
 
     nn::NetConfig cfg{args.hidden, args.lstmHidden};
@@ -156,9 +145,6 @@ int main(int argc, char** argv) {
     algo::PPOConfig ppo;
     ppo.clip = args.clip;
     ppo.entCoef = args.ent;
-    ppo.gamma = args.gamma;
-    ppo.lambda = args.gae;
-    ppo.gaeSteps = args.gaeSteps;
     ppo.epochs = args.epochs;
     ppo.minibatch = args.minibatch;
 
@@ -202,7 +188,6 @@ int main(int argc, char** argv) {
             algo::RolloutConfig rc;
             rc.gamesPerUpdate = args.games;
             rc.threads = 1;
-            rc.rewardScale = args.rewardScale;
             rc.seed = args.seed + uint64_t(upd) * 7919ULL;
             algo::RolloutStats rs;
             auto wall0 = std::chrono::steady_clock::now();
@@ -410,7 +395,6 @@ int main(int argc, char** argv) {
             algo::RolloutConfig rc;
             rc.gamesPerUpdate = args.games;
             rc.threads = args.threads;
-            rc.rewardScale = args.rewardScale;
             rc.seed = args.seed + uint64_t(chunk + 1) * 7919ULL;
             Sample sample;
             auto t0 = std::chrono::steady_clock::now();

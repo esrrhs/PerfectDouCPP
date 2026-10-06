@@ -74,8 +74,11 @@ EncodedState encodeState(const Game& g) {
     auto put = [&](int slot, const CardSet& cs) {
         cardMatrix(cs, e.imp.data() + slot * kCardMat);
     };
+    CardSet others;
+    for (int r = 0; r < kRanks; ++r)
+        others.add(r, g.hand[prev].c[r] + g.hand[nxt].c[r]);
     put(0, g.hand[seat]);
-    put(1, g.unplayed());
+    put(1, others);
     put(2, g.played[seat]);
     put(3, g.played[prev]);
     put(4, g.played[nxt]);
@@ -91,12 +94,14 @@ EncodedState encodeState(const Game& g) {
         put(kStaticMatrices + (kHistoryLen - hlen) + i, m);
     }
 
-    e.scalar[0] = float(minSteps(g.hand[seat])) / 20.0f;
-    e.scalar[1] = float(g.hand[seat].total()) / 20.0f;
-    e.scalar[2] = float(g.hand[prev].total()) / 20.0f;
-    e.scalar[3] = float(g.hand[nxt].total()) / 20.0f;
-    e.scalar[4] = float(std::min(g.bombCount, 8)) / 8.0f;
-    e.scalar[5] = (g.lastPlayer == seat) ? 1.0f : 0.0f;
+    auto oneHot = [](float* dst, int n, int value) {
+        if (value >= 0 && value < n) dst[value] = 1.0f;
+    };
+    oneHot(e.scalar.data(), kHandHot, g.hand[prev].total() - 1);
+    oneHot(e.scalar.data() + kHandHot, kHandHot, g.hand[nxt].total() - 1);
+    oneHot(e.scalar.data() + 2 * kHandHot, kBombHot,
+           std::min(g.bombCount, kBombHot - 1));
+    e.scalar[kImpScalars - 1] = (g.lastPlayer == seat) ? 1.0f : 0.0f;
 
     // perfect information extras
     cardMatrix(g.hand[prev], e.extra.data());
@@ -161,10 +166,10 @@ std::vector<LegalOption> legalOptions(const Game& g) {
         o.abstractId = id;
         o.concrete = chosen;
         const AbstractAction& a = abstractTable()[id];
-        int size = abstractSize(a);
-        // The action card matrix is binary but the network consumes floats.
+        int size = chosen.total();
+        // The network has to see the kickers that will actually be played.
         std::array<uint8_t, kCardMat> card{};
-        actionCardMatrix(id, card);
+        cardMatrix(chosen, card.data());
         for (int j = 0; j < kCardMat; ++j) o.feature[j] = float(card[j]);
         float* ex = o.feature.data() + kCardMat;
         ex[0] = (a.kind == MT_BOMB || a.kind == MT_ROCKET) ? 1.0f : 0.0f;

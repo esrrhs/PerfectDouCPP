@@ -17,32 +17,17 @@
 
 namespace algo {
 
-void computeGAE(std::vector<Transition>& tr, float gamma, float lambda,
-                int horizon) {
-    // group indices by game (chronological within each game)
+void assignEpisodeReturns(std::vector<Transition>& tr) {
     std::unordered_map<int, std::vector<size_t>> groups;
     for (size_t i = 0; i < tr.size(); ++i) groups[tr[i].gameId].push_back(i);
 
     for (auto& [id, is] : groups) {
         (void)id;
-        int n = static_cast<int>(is.size());
-        int h = horizon <= 0 ? n : horizon;
-        // Non-overlapping segments. The value at the first decision after a
-        // segment bootstraps that segment; a terminal decision bootstraps 0.
-        for (int begin = 0; begin < n; begin += h) {
-            int end = std::min(n, begin + h);
-            bool terminal = tr[is[end - 1]].terminal;
-            float nextValue = (end < n && !terminal) ? tr[is[end]].value : 0.0f;
-            float gae = 0.0f;
-            for (int k = end - 1; k >= begin; --k) {
-                Transition& t = tr[is[k]];
-                float bootstrap = t.terminal ? 0.0f : nextValue;
-                float delta = t.reward + gamma * bootstrap - t.value;
-                gae = delta + gamma * lambda * (t.terminal ? 0.0f : gae);
-                t.adv = gae;
-                t.ret = gae + t.value;
-                nextValue = t.value;
-            }
+        float total = 0.0f;
+        for (size_t k : is) total += tr[k].reward;
+        for (size_t k : is) {
+            tr[k].ret = total;
+            tr[k].adv = total - tr[k].value;
         }
     }
 }
@@ -133,7 +118,7 @@ bool ppoUpdate(nn::Actor& actor, nn::Critic& critic,
     int N = static_cast<int>(tr.size());
     if (N == 0) return true;
 
-    computeGAE(tr, cfg.gamma, cfg.lambda, cfg.gaeSteps);
+    assignEpisodeReturns(tr);
 
     double mean = 0.0, var = 0.0;
     for (const Transition& t : tr) mean += t.adv;

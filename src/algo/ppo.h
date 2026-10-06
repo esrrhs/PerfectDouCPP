@@ -1,6 +1,5 @@
-// PPO update with GAE (paper Sec. 4.3 / Table 7):
-//   clipped policy gradient, entropy bonus 0.1, value-function MSE against
-//   GAE returns of the perfect-information critic.
+// PPO update. The critic target of every decision is that seat's final ADP,
+// the same quantity DouZero regresses onto and the quantity we evaluate.
 #pragma once
 
 #include <vector>
@@ -16,11 +15,6 @@ struct PPOConfig {
     float vfCoef = 0.5f;
     int epochs = 4;
     int minibatch = 1024;
-    float gamma = 1.0f;
-    float lambda = 0.95f;
-    // Paper Table 7: GAE step 24 environment steps, 8 decisions per player.
-    // 0 keeps the whole episode.
-    int gaeSteps = 8;
     float maxGradNorm = 0.5f;
 };
 
@@ -33,12 +27,9 @@ struct PPOStats {
     double meanAbsOldLogp = 0;
 };
 
-// Computes GAE returns/advantages in place. Transitions are grouped by gameId
-// and are chronological within a game. `horizon` is the maximum number of
-// this player's own decisions that an advantage may look ahead (paper: 8).
-// A non-positive horizon uses the rest of the game.
-void computeGAE(std::vector<Transition>& tr, float gamma, float lambda,
-                int horizon);
+// Sets every decision in a game to that seat's total reward. After rollout
+// the only reward is the terminal ADP, so each return equals the final score.
+void assignEpisodeReturns(std::vector<Transition>& tr);
 
 // One PPO update of one seat's actor + critic over its rollout stream.
 // False means the GPU device was removed before Adam wrote host weights, so
