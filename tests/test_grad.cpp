@@ -35,12 +35,11 @@ static void snapGrads(const std::vector<Param*>& ps, GradSnap& s) {
 static const char* kActorParamNames[] = {
     "lstm.Wi", "lstm.bi", "lstm.Wh", "lstm.bh",
     "l1.W", "l1.b", "l2.W", "l2.b", "l3.W", "l3.b",
-    "l4.W", "l4.b", "head.W", "head.b", "dyn.W", "dyn.b"};
+    "l4.W", "l4.b", "head.W", "head.b"};
 static const char* kCriticParamNames[] = {
     "lstm.Wi", "lstm.bi", "lstm.Wh", "lstm.bh",
-    "i1.W", "i1.b", "i2.W", "i2.b", "i3.W", "i3.b",
-    "p1.W", "p1.b", "p2.W", "p2.b", "c1.W", "c1.b",
-    "c2.W", "c2.b", "out.W", "out.b"};
+    "c1.W", "c1.b", "c2.W", "c2.b", "c3.W", "c3.b",
+    "c4.W", "c4.b", "out.W", "out.b"};
 
 static void cmpGrads(const char* tag, const std::vector<Param*>& ps,
                      const GradSnap& ref, int& failed) {
@@ -106,9 +105,33 @@ static void invalidateWeights(const std::vector<Param*>& ps) {
     for (Param* p : ps) gpuDropCache(&p->devW);
 }
 
+static void makeActions(int B, int perSample, std::mt19937& rng,
+                        Mat& feat, Mat& sample, Mat& id, Mat& offset,
+                        std::vector<int>& acts) {
+    int L = B * perSample;
+    feat.resize(L, kActionInput);
+    sample.resize(L, 1);
+    id.resize(L, 1);
+    offset.resize(B + 1, 1);
+    acts.resize(B);
+    fillRandom(feat, rng, 0.05f);
+    for (int i = 0; i < B; ++i) {
+        offset.row(i)[0] = float(i * perSample);
+        for (int j = 0; j < perSample; ++j) {
+            int r = i * perSample + j;
+            sample.row(r)[0] = float(i);
+            id.row(r)[0] = float(j == perSample - 1 ? 620 : j * 7 + 5);
+        }
+        acts[i] = int(id.row(i * perSample + (i % perSample))[0]);
+    }
+    offset.row(B)[0] = float(L);
+}
+
 // Runs forward+backward on the given backend; returns output snapshots.
 static void runNet(Actor& actor, Critic& critic, const Mat& xImp,
-                   const Mat& seq, const Mat& mask, const Mat& dynFeat,
+                   const Mat& seq, const Mat& actionFeat,
+                   const Mat& actionSample, const Mat& actionId,
+                   const Mat& actionOffset,
                    const Mat& extra, const std::vector<int>& acts,
                    bool useGpu, Mat& logitsOut, Mat& valueOut,
                    GradSnap& ag, GradSnap& cg) {
@@ -117,7 +140,8 @@ static void runNet(Actor& actor, Critic& critic, const Mat& xImp,
     int B = xImp.r;
 
     actor.zeroGrad();
-    Mat& lg = actor.forward(xImp, seq, mask, dynFeat);
+    Mat& lg = actor.forward(xImp, seq, actionFeat, actionSample, actionId,
+                            actionOffset);
     if (useGpu) {
         gpuMarkHost(lg.data());
         gpuWaitEx(true);
@@ -168,27 +192,23 @@ static int gpuParity() {
         actor.head.buildWT();
     }
 
-    Mat xImp(B, kImpInput), seq(B * kLstmSteps, kLstmIn), mask(B, kNumActions),
-        dynFeat(B * kNumActions, kActionDyn), extra(B, kExtraInput);
+    Mat xImp(B, kImpInput), seq(B * kLstmSteps, kLstmIn);
+    Mat actionFeat, actionSample, actionId, actionOffset;
+    Mat extra(B, kExtraInput);
     fillRandom(xImp, rng, 0.1f);
     fillRandom(seq, rng, 0.1f);
     fillRandom(extra, rng, 0.1f);
-    for (int i = 0; i < B; ++i) {
-        for (int j = 0; j < kNumActions; ++j) mask.row(i)[j] = 0.0f;
-        mask.row(i)[5] = 1.0f;
-        mask.row(i)[620] = 1.0f;
-        for (int j = 0; j < kNumActions; ++j)
-            for (int k = 0; k < kActionDyn; ++k)
-                dynFeat.row(i * kNumActions + j)[k] = 0.0f;
-        dynFeat.row(i * kNumActions + 5)[6] = 0.1f;
-    }
-    std::vector<int> acts = {5, 620};
+    std::vector<int> acts;
+    makeActions(B, 2, rng, actionFeat, actionSample, actionId, actionOffset,
+                acts);
 
     Mat lgCpu, vCpu, lgGpu, vGpu;
     GradSnap aCpu, cCpu, aGpu, cGpu;
-    runNet(actor, critic, xImp, seq, mask, dynFeat, extra, acts, false,
+    runNet(actor, critic, xImp, seq, actionFeat, actionSample, actionId,
+           actionOffset, extra, acts, false,
            lgCpu, vCpu, aCpu, cCpu);
-    runNet(actor, critic, xImp, seq, mask, dynFeat, extra, acts, true,
+    runNet(actor, critic, xImp, seq, actionFeat, actionSample, actionId,
+           actionOffset, extra, acts, true,
            lgGpu, vGpu, aGpu, cGpu);
     gemmSetGpu(false);
 
@@ -208,7 +228,7 @@ static int gpuParity() {
 // ---- Full training-loop parity: realistic sizes, gradient accumulation
 // across multiple minibatches/epochs/windows, and Adam weight updates. ----
 struct Batch {
-    Mat xImp, seq, mask, dynFeat, extra;
+    Mat xImp, seq, actionFeat, actionSample, actionId, actionOffset, extra;
     std::vector<int> acts;
     std::vector<float> tgt;
 };
@@ -221,20 +241,12 @@ static void makeBatches(std::vector<Batch>& batches, int nBatches, int B,
         bt.tgt.resize(B);
         fillRandom(bt.xImp = Mat(B, kImpInput), rng, 0.1f);
         fillRandom(bt.seq = Mat(B * kLstmSteps, kLstmIn), rng, 0.1f);
-        fillRandom(bt.dynFeat = Mat(B * kNumActions, kActionDyn), rng, 0.05f);
         bt.extra.resize(B, kExtraInput);
         fillRandom(bt.extra, rng, 0.1f);
-        bt.mask.resize(B, kNumActions);
-        std::uniform_real_distribution<float> legal(0.0f, 1.0f), tv(-1.0f, 1.0f);
-        std::uniform_int_distribution<int> act(0, kNumActions - 1);
+        makeActions(B, 8, rng, bt.actionFeat, bt.actionSample, bt.actionId,
+                    bt.actionOffset, bt.acts);
+        std::uniform_real_distribution<float> tv(-1.0f, 1.0f);
         for (int i = 0; i < B; ++i) {
-            for (int a = 0; a < kNumActions; ++a)
-                bt.mask.row(i)[a] = (legal(rng) < 0.02f) ? 1.0f : 0.0f;
-            // ensure at least one legal action and pick a legal one
-            bt.mask.row(i)[0] = 1.0f;
-            int a;
-            do { a = act(rng); } while (bt.mask.row(i)[a] < 0.5f);
-            bt.acts[i] = a;
             bt.tgt[i] = tv(rng);
         }
     }
@@ -243,7 +255,8 @@ static void makeBatches(std::vector<Batch>& batches, int nBatches, int B,
 static void trainStep(Actor& actor, Critic& critic, const Batch& bt,
                       bool useGpu, std::vector<float>* lgTrace = nullptr) {
     int B = bt.xImp.r;
-    Mat& lg = actor.forward(bt.xImp, bt.seq, bt.mask, bt.dynFeat);
+    Mat& lg = actor.forward(bt.xImp, bt.seq, bt.actionFeat, bt.actionSample,
+                            bt.actionId, bt.actionOffset);
     if (useGpu) { gpuMarkHost(lg.data()); gpuWaitEx(true); }
     if (lgTrace)
         for (int i = 0; i < lg.r * lg.c; ++i)
@@ -472,24 +485,19 @@ int main() {
     critic.init(cfg, 99);
 
     std::mt19937 rng(7);
-    Mat xImp(B, kImpInput), seq(B * kLstmSteps, kLstmIn), mask(B, kNumActions),
-        dynFeat(B * kNumActions, kActionDyn), extra(B, kExtraInput);
+    Mat xImp(B, kImpInput), seq(B * kLstmSteps, kLstmIn);
+    Mat actionFeat, actionSample, actionId, actionOffset;
+    Mat extra(B, kExtraInput);
     fillRandom(xImp, rng, 0.1f);
     fillRandom(seq, rng, 0.1f);
     fillRandom(extra, rng, 0.1f);
-    for (int i = 0; i < B; ++i) {
-        for (int j = 0; j < kNumActions; ++j) mask.row(i)[j] = 0.0f;
-        mask.row(i)[5] = 1.0f;
-        mask.row(i)[620] = 1.0f;
-        for (int j = 0; j < kNumActions; ++j)
-            for (int k = 0; k < kActionDyn; ++k)
-                dynFeat.row(i * kNumActions + j)[k] = 0.0f;
-        dynFeat.row(i * kNumActions + 5)[6] = 0.1f;
-    }
-    std::vector<int> acts = {5, 620};
+    std::vector<int> acts;
+    makeActions(B, 2, rng, actionFeat, actionSample, actionId, actionOffset,
+                acts);
 
     auto actorLoss = [&]() {
-        Mat& lg = actor.forward(xImp, seq, mask, dynFeat);
+        Mat& lg = actor.forward(xImp, seq, actionFeat, actionSample, actionId,
+                                actionOffset);
         double l = 0;
         for (int i = 0; i < B; ++i) {
             float mx = -1e30f;
@@ -559,7 +567,6 @@ int main() {
     checkParam("lstm.Wi", actor.lstm.Wi);
     checkParam("lstm.Wh", actor.lstm.Wh);
     checkParam("lstm.bi", actor.lstm.bi);
-    checkParam("dyn.W", actor.dyn.W);
 
     // ---- critic ----
     auto criticLoss = [&]() {
@@ -601,10 +608,10 @@ int main() {
             ++checked;
         }
     };
-    checkCritic("i1.W", critic.i1.W);
     checkCritic("c1.W", critic.c1.W);
+    checkCritic("c3.W", critic.c3.W);
+    checkCritic("c4.W", critic.c4.W);
     checkCritic("out.W", critic.out.W);
-    checkCritic("p1.W", critic.p1.W);
     checkCritic("lstm.Wh", critic.lstm.Wh);
 
     std::printf("gradient check: %d params, %d failures\n", checked, failed);

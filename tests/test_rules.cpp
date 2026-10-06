@@ -12,6 +12,7 @@
 #include "ddz/game.h"
 #include "ddz/moves.h"
 #include "ddz/oracle.h"
+#include "algo/ppo.h"
 
 using namespace ddz;
 
@@ -88,6 +89,50 @@ static void testActionSpace() {
     roundTrip("333345");
     roundTrip("3333");
     roundTrip("BR");
+
+    // The official specific_map maps ambiguous long planes to every matching
+    // abstract template, not only to the detector's preferred interpretation.
+    CardSet ambiguous = CardSet::parse("333444555666");
+    int matches = 0;
+    for (const AbstractAction& a : tab)
+        if (abstractMatches(a, ambiguous)) ++matches;
+    CHECK(matches > 1);
+}
+
+static void testBottomCards() {
+    Rng rng(17);
+    Game game;
+    game.deal(rng);
+    int rank = -1;
+    for (int r = 0; r < kRanks; ++r)
+        if (game.bottom.c[r] > 0) {
+            rank = r;
+            break;
+        }
+    CHECK(rank >= 0);
+    int before = game.bottom.total();
+    int rankBefore = game.bottom.c[rank];
+    CardSet move;
+    move.add(rank);
+    game.step(move);
+    CHECK(game.bottom.total() == before - 1);
+    CHECK(game.bottom.c[rank] == rankBefore - 1);
+}
+
+static void testGAE() {
+    std::vector<algo::Transition> tr(10);
+    for (int i = 0; i < 10; ++i) {
+        tr[i].gameId = 3;
+        tr[i].reward = 1.0f;
+        tr[i].value = 0.0f;
+    }
+    tr.back().terminal = true;
+    algo::computeGAE(tr, 1.0f, 1.0f, 3);
+    const float expected[] = {3, 2, 1, 3, 2, 1, 3, 2, 1, 1};
+    for (int i = 0; i < 10; ++i) {
+        CHECK(std::abs(tr[i].adv - expected[i]) < 1e-6f);
+        CHECK(std::abs(tr[i].ret - expected[i]) < 1e-6f);
+    }
 }
 
 static void testGenerator() {
@@ -279,6 +324,8 @@ int main() {
     std::printf("testActionSpace...\n"); testActionSpace();
     std::printf("testGenerator...\n"); testGenerator();
     std::printf("testOracle...\n"); testOracle();
+    std::printf("testBottomCards...\n"); testBottomCards();
+    std::printf("testGAE...\n"); testGAE();
     std::printf("testRandomGames...\n"); testRandomGames();
     std::printf("testFeatures...\n"); testFeatures();
     std::printf("ALL TESTS PASSED\n");

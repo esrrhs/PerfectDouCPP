@@ -54,6 +54,14 @@ bool d3dLstmSeqBwd(const Mat& ghAll, const Mat& gpre, const Mat& statesC,
 #endif
 void PD_BE(Concat)(Mat& z, const Mat& a, int n1, const Mat& b, int n2);
 void PD_BE(Split)(const Mat& z, int n1, Mat& a, Mat& b, int n2);
+void PD_BE(RaggedConcat)(Mat& z, const Mat& node, const Mat& action,
+                         const Mat& sample);
+void PD_BE(RaggedNodeReduce)(Mat& nodeGrad, const Mat& concatGrad,
+                             const Mat& offset, int nodeCols);
+void PD_BE(RaggedScatter)(Mat& logits, const Mat& scores, const Mat& sample,
+                          const Mat& actionId, int batch, int actions);
+void PD_BE(RaggedGather)(Mat& scores, const Mat& logits, const Mat& sample,
+                         const Mat& actionId);
 void PD_BE(ZeroAndLast)(Mat& all, const Mat& gh, int B, int T, int h);
 void PD_BE(MaskDyn)(Mat& logits, const Mat& ds, const Mat& mask, int N);
 void PD_BE(AddTo)(float* dst, void** gSlot, int dstCols, const Mat& src);
@@ -419,6 +427,63 @@ void kSplit(const Mat& z, int n1, Mat& a, Mat& b, int n2) {
         std::copy(z.row(i), z.row(i) + n1, a.row(i));
         std::copy(z.row(i) + n1, z.row(i) + n1 + n2, b.row(i));
     }
+}
+
+void kRaggedConcat(Mat& z, const Mat& node, const Mat& action,
+                   const Mat& sample) {
+#ifdef PD_HAVE_GPU
+    if (gpuActive()) { PD_BE(RaggedConcat)(z, node, action, sample); return; }
+#endif
+    for (int r = 0; r < z.r; ++r) {
+        int s = int(sample.row(r)[0]);
+        std::copy(node.row(s), node.row(s) + node.c, z.row(r));
+        std::copy(action.row(r), action.row(r) + action.c,
+                  z.row(r) + node.c);
+    }
+}
+
+void kRaggedNodeReduce(Mat& nodeGrad, const Mat& concatGrad,
+                       const Mat& offset, int nodeCols) {
+#ifdef PD_HAVE_GPU
+    if (gpuActive()) {
+        PD_BE(RaggedNodeReduce)(nodeGrad, concatGrad, offset, nodeCols);
+        return;
+    }
+#endif
+    std::fill(nodeGrad.d.begin(), nodeGrad.d.end(), 0.0f);
+    for (int s = 0; s < nodeGrad.r; ++s)
+        for (int r = int(offset.row(s)[0]); r < int(offset.row(s + 1)[0]); ++r)
+            for (int j = 0; j < nodeCols; ++j)
+                nodeGrad.row(s)[j] += concatGrad.row(r)[j];
+}
+
+void kRaggedScatter(Mat& logits, const Mat& scores, const Mat& sample,
+                    const Mat& actionId, int batch, int actions) {
+    logits.resize(batch, actions);
+#ifdef PD_HAVE_GPU
+    if (gpuActive()) {
+        PD_BE(RaggedScatter)(logits, scores, sample, actionId, batch, actions);
+        return;
+    }
+#endif
+    std::fill(logits.d.begin(), logits.d.end(), -1e9f);
+    for (int r = 0; r < scores.r; ++r)
+        logits.row(int(sample.row(r)[0]))[int(actionId.row(r)[0])] =
+            scores.row(r)[0];
+}
+
+void kRaggedGather(Mat& scores, const Mat& logits, const Mat& sample,
+                   const Mat& actionId) {
+    scores.resize(sample.r, 1);
+#ifdef PD_HAVE_GPU
+    if (gpuActive()) {
+        PD_BE(RaggedGather)(scores, logits, sample, actionId);
+        return;
+    }
+#endif
+    for (int r = 0; r < scores.r; ++r)
+        scores.row(r)[0] =
+            logits.row(int(sample.row(r)[0]))[int(actionId.row(r)[0])];
 }
 
 void kZeroAndLast(Mat& all, const Mat& gh, int B, int T, int h) {

@@ -80,15 +80,16 @@ EncodedState encodeState(const Game& g) {
     put(3, g.played[prev]);
     put(4, g.played[nxt]);
     put(5, g.bottom);
+    put(6, g.lastMove[seat]);
+    put(7, g.lastMove[prev]);
+    put(8, g.lastMove[nxt]);
 
     // last 15 moves, chronological, zero-padded at the front
     int hlen = std::min<int>(kHistoryLen, g.seq.size());
     for (int i = 0; i < hlen; ++i) {
         const CardSet& m = g.seq[g.seq.size() - hlen + i];
-        put(6 + (kHistoryLen - hlen) + i, m);
+        put(kStaticMatrices + (kHistoryLen - hlen) + i, m);
     }
-    put(21, g.lastMove[prev]);
-    put(22, g.lastMove[nxt]);
 
     e.scalar[0] = float(minSteps(g.hand[seat])) / 20.0f;
     e.scalar[1] = float(g.hand[seat].total()) / 20.0f;
@@ -145,22 +146,35 @@ std::vector<LegalOption> legalOptions(const Game& g) {
         int id = concreteToAbstract(m, info);
         // The DouZero generator can produce a few degenerate combinations that
         // its own detector labels WRONG (not legal under Tencent rules); skip.
-        if (id < 0 || !seen.insert(id).second) continue;
+        if (id >= 0) seen.insert(id);
+        // The official 27,472 -> 621 mapping is one-to-many for ambiguous
+        // planes (e.g. four consecutive trios can also be a shorter plane
+        // with trio kickers). Preserve all official abstract choices.
+        for (const AbstractAction& a : abstractTable())
+            if (a.hasKicker && abstractMatches(a, m)) seen.insert(a.id);
+    }
+    std::vector<int> ids(seen.begin(), seen.end());
+    std::sort(ids.begin(), ids.end());
+    for (int id : ids) {
         CardSet chosen = decodeConcrete(id, concrete, g.hand[seat]);
         LegalOption o;
         o.abstractId = id;
         o.concrete = chosen;
         const AbstractAction& a = abstractTable()[id];
         int size = abstractSize(a);
-        o.dyn[0] = (a.kind == MT_BOMB || a.kind == MT_ROCKET) ? 1.0f : 0.0f;
-        o.dyn[1] = isLargest(a) ? 1.0f : 0.0f;
-        o.dyn[2] = (size == g.hand[nxt].total()) ? 1.0f : 0.0f;
-        o.dyn[3] = (size == g.hand[prev].total()) ? 1.0f : 0.0f;
+        // The action card matrix is binary but the network consumes floats.
+        std::array<uint8_t, kCardMat> card{};
+        actionCardMatrix(id, card);
+        for (int j = 0; j < kCardMat; ++j) o.feature[j] = float(card[j]);
+        float* ex = o.feature.data() + kCardMat;
+        ex[0] = (a.kind == MT_BOMB || a.kind == MT_ROCKET) ? 1.0f : 0.0f;
+        ex[1] = isLargest(a) ? 1.0f : 0.0f;
+        ex[2] = (size == g.hand[nxt].total()) ? 1.0f : 0.0f;
+        ex[3] = (size == g.hand[prev].total()) ? 1.0f : 0.0f;
         CardSet after = g.hand[seat];
         after.sub(chosen);
-        o.dyn[4] = float(minSteps(after)) / 20.0f;
-        o.dyn[5] = 1.0f;
-        o.dyn[6] = float(id) / float(kAbstractActions - 1);
+        ex[4] = float(minSteps(after)) / 20.0f;
+        ex[5] = 1.0f;  // validity marker, needed for the all-zero pass matrix
         out.push_back(std::move(o));
     }
     return out;

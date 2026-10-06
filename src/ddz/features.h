@@ -25,14 +25,22 @@ namespace ddz {
 
 constexpr int kCardMat = 12 * kRanks;  // 180
 constexpr int kHistoryLen = 15;
-constexpr int kImpMatrices = 23;
-constexpr int kImpBin = kImpMatrices * kCardMat;  // 4140
+constexpr int kHistoryGroups = 5;  // official model: 5 LSTM steps x 3 moves
+constexpr int kStaticMatrices = 9;
+// The released model has 24 imperfect matrices: nine current-state matrices
+// and the last 15 moves.  The ninth static matrix is the current player's
+// own last move (the paper's table only lists the two opponents' last moves).
+constexpr int kImpMatrices = kStaticMatrices + kHistoryLen;
+constexpr int kImpBin = kImpMatrices * kCardMat;  // 4320
 constexpr int kImpScalars = 6;
-constexpr int kImpSize = kImpBin + kImpScalars;  // 4146
+constexpr int kImpSize = kImpBin + kImpScalars;  // stored transition feature
+constexpr int kNodeBin = kStaticMatrices * kCardMat;  // 1620
+constexpr int kNodeSize = kNodeBin + kImpScalars;     // 1626
 constexpr int kExtraBin = 2 * kCardMat;          // 360
 constexpr int kExtraScalars = 2;
 constexpr int kExtraSize = kExtraBin + kExtraScalars;  // 362
-constexpr int kActionDyn = 7;
+constexpr int kActionExtra = 6;
+constexpr int kActionSize = kCardMat + kActionExtra;  // 186
 
 struct EncodedState {
     std::array<uint8_t, kImpBin> imp{};
@@ -44,7 +52,7 @@ struct EncodedState {
 struct LegalOption {
     int abstractId;
     CardSet concrete;
-    std::array<float, kActionDyn> dyn{};
+    std::array<float, kActionSize> feature{};
 };
 
 // Encodes the node for the player whose turn it currently is.

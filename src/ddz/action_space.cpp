@@ -185,9 +185,44 @@ int chainId(int base, int minLen, int start, int len) {
     return chainOffset(base, len, minLen) + start;
 }
 
+bool matchesAbstractImpl(const AbstractAction& a, const CardSet& concrete) {
+    for (int r = 0; r < kRanks; ++r)
+        if (concrete.c[r] < a.main.c[r]) return false;
+    if (!a.hasKicker) return concrete == a.main;
+
+    CardSet wing = concrete;
+    wing.sub(a.main);
+    if (a.kind == MT_PLANE_SOLO)
+        return wing.total() == a.len;
+    if (a.kind == MT_PLANE_PAIR) {
+        if (wing.total() != 2 * a.len) return false;
+        int pairs = 0;
+        for (int r = 0; r < kRanks; ++r) {
+            if (wing.c[r] == 2) ++pairs;
+            else if (wing.c[r] != 0) return false;
+        }
+        return pairs == a.len;
+    }
+    if (a.kind == MT_FOUR_TWO) return wing.total() == 2;
+    if (a.kind == MT_FOUR_TWO_PAIR) {
+        if (wing.total() != 4) return false;
+        int pairs = 0;
+        for (int r = 0; r < kRanks; ++r) {
+            if (wing.c[r] == 2) ++pairs;
+            else if (wing.c[r] != 0) return false;
+        }
+        return pairs == 2;
+    }
+    return false;
+}
+
 }  // namespace
 
 const std::vector<AbstractAction>& abstractTable() { return table(); }
+
+bool abstractMatches(const AbstractAction& action, const CardSet& concrete) {
+    return matchesAbstractImpl(action, concrete);
+}
 
 int concreteToAbstract(const CardSet& concrete, const MoveInfo& info) {
     switch (info.type) {
@@ -271,7 +306,7 @@ CardSet decodeConcrete(int abstractId,
     std::vector<Cand> candidates;
     for (const CardSet& m : legalConcrete) {
         MoveInfo mi = detectMove(m);
-        if (concreteToAbstract(m, mi) != abstractId) continue;
+        if (!matchesAbstractImpl(a, m)) continue;
         // kickers = multiset difference, expressed as a sorted string
         std::string kicker;
         for (int r = 0; r < kRanks; ++r) {
@@ -290,8 +325,15 @@ CardSet decodeConcrete(int abstractId,
     double bestScore = 1e18;
     for (size_t i = 0; i < candidates.size(); ++i) {
         int n = 0;
+        CardSet kickerCards = CardSet::parse(candidates[i].kicker);
         for (const CardSet& p : playable) {
-            if (p.str().find(candidates[i].kicker) != std::string::npos) ++n;
+            bool contains = true;
+            for (int r = 0; r < kRanks; ++r)
+                if (p.c[r] < kickerCards.c[r]) {
+                    contains = false;
+                    break;
+                }
+            if (contains) ++n;
         }
         double rankSum = 0;
         for (char ch : candidates[i].kicker) rankSum += charRank(ch);

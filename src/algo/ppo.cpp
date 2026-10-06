@@ -17,22 +17,32 @@
 
 namespace algo {
 
-void computeGAE(std::vector<Transition>& tr, float gamma, float lambda) {
+void computeGAE(std::vector<Transition>& tr, float gamma, float lambda,
+                int horizon) {
     // group indices by game (chronological within each game)
     std::unordered_map<int, std::vector<size_t>> groups;
     for (size_t i = 0; i < tr.size(); ++i) groups[tr[i].gameId].push_back(i);
 
     for (auto& [id, is] : groups) {
         (void)id;
-        float gae = 0.0f;
-        float nextValue = 0.0f;  // bootstrap with 0 at terminal
-        for (int k = static_cast<int>(is.size()) - 1; k >= 0; --k) {
-            Transition& t = tr[is[k]];
-            float delta = t.reward + gamma * nextValue - t.value;
-            gae = delta + gamma * lambda * gae;
-            t.adv = gae;
-            t.ret = gae + t.value;
-            nextValue = t.value;
+        int n = static_cast<int>(is.size());
+        int h = horizon <= 0 ? n : horizon;
+        // Non-overlapping segments. The value at the first decision after a
+        // segment bootstraps that segment; a terminal decision bootstraps 0.
+        for (int begin = 0; begin < n; begin += h) {
+            int end = std::min(n, begin + h);
+            bool terminal = tr[is[end - 1]].terminal;
+            float nextValue = (end < n && !terminal) ? tr[is[end]].value : 0.0f;
+            float gae = 0.0f;
+            for (int k = end - 1; k >= begin; --k) {
+                Transition& t = tr[is[k]];
+                float bootstrap = t.terminal ? 0.0f : nextValue;
+                float delta = t.reward + gamma * bootstrap - t.value;
+                gae = delta + gamma * lambda * (t.terminal ? 0.0f : gae);
+                t.adv = gae;
+                t.ret = gae + t.value;
+                nextValue = t.value;
+            }
         }
     }
 }
@@ -106,8 +116,9 @@ void dumpRound(int batchNo, const std::vector<Transition*>& mb, const Batch& bat
     }
     writeMat("build-win/repro/xImp.bin", batch.xImp);
     writeMat("build-win/repro/seq.bin", batch.seq);
-    writeMat("build-win/repro/mask.bin", batch.mask);
-    writeMat("build-win/repro/dyn.bin", batch.dynFeat);
+    writeMat("build-win/repro/action.bin", batch.actionFeat);
+    writeMat("build-win/repro/action_sample.bin", batch.actionSample);
+    writeMat("build-win/repro/action_id.bin", batch.actionId);
     writeMat("build-win/repro/extra.bin", batch.extra);
     std::remove("build-win/repro/logits.bin");
     std::remove("build-win/repro/values.bin");
@@ -122,7 +133,7 @@ bool ppoUpdate(nn::Actor& actor, nn::Critic& critic,
     int N = static_cast<int>(tr.size());
     if (N == 0) return true;
 
-    computeGAE(tr, cfg.gamma, cfg.lambda);
+    computeGAE(tr, cfg.gamma, cfg.lambda, cfg.gaeSteps);
 
     double mean = 0.0, var = 0.0;
     for (const Transition& t : tr) mean += t.adv;
@@ -143,7 +154,7 @@ bool ppoUpdate(nn::Actor& actor, nn::Critic& critic,
     // 150 MB per seat, so the prepare thread only gathers a minibatch.
     std::vector<float> xAll, seqAll, eAll;
     cacheTransitionFeatures(tr, xAll, seqAll, eAll);
-    const int xStride = nn::padStride(ddz::kImpSize);
+    const int xStride = nn::padStride(ddz::kNodeSize);
     const int eStride = nn::padStride(ddz::kExtraSize);
     struct PreparedBatch {
         std::vector<Transition*> mb;
@@ -190,7 +201,8 @@ bool ppoUpdate(nn::Actor& actor, nn::Critic& critic,
         buildBatchFromCache(
             out.mb, tr.data(), xAll.data(), xStride, seqAll.data(),
             eAll.data(), eStride, out.data.xImp, out.data.seq,
-            out.data.mask, out.data.dynFeat, out.data.extra);
+            out.data.actionFeat, out.data.actionSample, out.data.actionId,
+            out.data.actionOffset, out.data.extra);
         produced.store(tail + 1, std::memory_order_release);
         prodLo = hi;
         return true;
@@ -231,7 +243,8 @@ bool ppoUpdate(nn::Actor& actor, nn::Critic& critic,
                 buildBatchFromCache(
                     out.mb, tr.data(), xAll.data(), xStride, seqAll.data(),
                     eAll.data(), eStride, out.data.xImp, out.data.seq,
-                    out.data.mask, out.data.dynFeat, out.data.extra);
+                    out.data.actionFeat, out.data.actionSample,
+                    out.data.actionId, out.data.actionOffset, out.data.extra);
                 produced.store(tail + 1, std::memory_order_release);
                 slotCv.notify_one();
             }
@@ -287,8 +300,10 @@ bool ppoUpdate(nn::Actor& actor, nn::Critic& critic,
             nn::Mat* logitRows = nullptr;
             nn::Mat* valueRows = nullptr;
             onGpu([&] {
-                logitRows = &actor.forward(batch.xImp, batch.seq, batch.mask,
-                                           batch.dynFeat);
+                logitRows =
+                    &actor.forward(batch.xImp, batch.seq, batch.actionFeat,
+                                   batch.actionSample, batch.actionId,
+                                   batch.actionOffset);
                 valueRows = &critic.forward(batch.xImp, batch.seq, batch.extra);
                 nn::gpuMarkHost(logitRows->data());
                 nn::gpuMarkHost(valueRows->data());
@@ -336,7 +351,10 @@ bool ppoUpdate(nn::Actor& actor, nn::Critic& critic,
                     g = ratio * s;
                 else
                     g = 0.0f;
-                float scale = 1.0f / float(N);
+                // Each PPO minibatch is an optimizer batch (paper: 1024
+                // samples total), rather than a tile accumulated into one
+                // giant full-rollout gradient.
+                float scale = 1.0f / float(B);
                 float pa = probs[act];
                 // sumW is E[W]. The taken-action weight is -g/p, so its
                 // expectation is -g, not +g. The positive baseline kept a
@@ -356,7 +374,7 @@ bool ppoUpdate(nn::Actor& actor, nn::Critic& critic,
             for (int i = 0; i < B; ++i) {
                 float err = values.row(i)[0] - mb[i]->ret;
                 vLossSum += 0.5 * err * err;
-                dValue.row(i)[0] = cfg.vfCoef * err / float(N);
+                dValue.row(i)[0] = cfg.vfCoef * err / float(B);
             }
 
             onGpu([&] {
@@ -378,6 +396,30 @@ bool ppoUpdate(nn::Actor& actor, nn::Critic& critic,
                 deviceOk = false;
                 break;
             }
+
+            // PPO performs an Adam update for each shuffled minibatch.  The
+            // previous implementation accumulated every minibatch and epoch
+            // into one step, making the published batch size only a tiling
+            // parameter and leaving old-logp clipping mostly ineffective.
+            onGpu([&] {
+                actorOpt.applyGradNorm(actor.params(), cfg.maxGradNorm);
+                criticOpt.applyGradNorm(critic.params(), cfg.maxGradNorm);
+                if (!nn::gpuDeviceOk()) return;
+                for (nn::Param* p : actor.params())
+                    nn::gpuStaleCache(&p->devW);
+                for (nn::Param* p : critic.params())
+                    nn::gpuStaleCache(&p->devW);
+            });
+            if (!nn::gpuDeviceOk()) {
+                deviceOk = false;
+                break;
+            }
+            actor.prepareInference();
+            critic.prepareInference();
+            onGpu([&] {
+                actor.zeroGrad();
+                critic.zeroGrad();
+            });
             ++mbCount;
     }
     stopProducer.store(true, std::memory_order_release);
@@ -385,20 +427,8 @@ bool ppoUpdate(nn::Actor& actor, nn::Critic& critic,
     if (prepareThread.joinable()) prepareThread.join();
     if (!deviceOk) return false;
 
-    onGpu([&] {
-        actorOpt.applyGradNorm(actor.params(), cfg.maxGradNorm);
-        criticOpt.applyGradNorm(critic.params(), cfg.maxGradNorm);
-        if (!nn::gpuDeviceOk()) return;
-        // Host weights were updated in place. Re-upload into the existing
-        // device buffers; destroying them leaks CUDA memory on this driver.
-        // Transposed wt Mats are marked the same way by prepareInference.
-        for (nn::Param* p : actor.params()) nn::gpuStaleCache(&p->devW);
-        for (nn::Param* p : critic.params()) nn::gpuStaleCache(&p->devW);
-        nn::gpuPrintStats("ppo-update");
-    });
+    onGpu([&] { nn::gpuPrintStats("ppo-update"); });
     if (!nn::gpuDeviceOk()) return false;
-    actor.prepareInference();
-    critic.prepareInference();
 
     double samples = double(N) * cfg.epochs;
     stats.pgLoss = -pgLossSum / samples;

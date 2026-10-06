@@ -51,6 +51,18 @@ void kConcat(Mat& z, const Mat& a, int n1, const Mat& b, int n2);
 // inverse: split z rows into a (first n1) and b (next n2)
 void kSplit(const Mat& z, int n1, Mat& a, Mat& b, int n2);
 
+// Ragged legal-action helpers. `sample` and `actionId` are float-backed
+// integer columns so they can share the existing Mat/device-cache machinery.
+// Legal rows are grouped by sample; offset has B+1 entries.
+void kRaggedConcat(Mat& z, const Mat& node, const Mat& action,
+                   const Mat& sample);
+void kRaggedNodeReduce(Mat& nodeGrad, const Mat& concatGrad,
+                       const Mat& offset, int nodeCols);
+void kRaggedScatter(Mat& logits, const Mat& scores, const Mat& sample,
+                    const Mat& actionId, int batch, int actions);
+void kRaggedGather(Mat& scores, const Mat& logits, const Mat& sample,
+                   const Mat& actionId);
+
 // Fill ghAll (B*T x h) with zero and copy gh into the last time block.
 void kZeroAndLast(Mat& ghAll, const Mat& gh, int B, int T, int h);
 

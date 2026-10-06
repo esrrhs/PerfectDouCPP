@@ -47,12 +47,13 @@ struct Args {
     int epochs = 4;
     int minibatch = 1024;
     int snapshotEvery = 20;
-    int buffer = 2;
+    int buffer = 1;
     float lr = 3e-4f;
     float clip = 0.2f;
     float ent = 0.1f;
     float gamma = 1.0f;
     float gae = 0.95f;
+    int gaeSteps = 8;
     float rewardScale = 50.0f;
     uint64_t seed = 1;
     std::string out = "ckpt";
@@ -82,12 +83,13 @@ void parseArgs(int argc, char** argv, Args& a) {
     a.epochs = std::atoi(argValue(argc, argv, "--epochs", "4"));
     a.minibatch = std::atoi(argValue(argc, argv, "--mb", "1024"));
     a.snapshotEvery = std::atoi(argValue(argc, argv, "--snapshot-every", "20"));
-    a.buffer = std::atoi(argValue(argc, argv, "--buffer", "2"));
+    a.buffer = std::atoi(argValue(argc, argv, "--buffer", "1"));
     a.lr = float(std::atof(argValue(argc, argv, "--lr", "3e-4")));
     a.clip = float(std::atof(argValue(argc, argv, "--clip", "0.2")));
     a.ent = float(std::atof(argValue(argc, argv, "--ent", "0.1")));
     a.gamma = float(std::atof(argValue(argc, argv, "--gamma", "1.0")));
     a.gae = float(std::atof(argValue(argc, argv, "--gae", "0.95")));
+    a.gaeSteps = std::atoi(argValue(argc, argv, "--gae-steps", "8"));
     a.rewardScale = float(std::atof(argValue(argc, argv, "--reward-scale", "50")));
     a.seed = std::atoll(argValue(argc, argv, "--seed", "1"));
     a.out = argValue(argc, argv, "--out", "ckpt");
@@ -132,6 +134,7 @@ int main(int argc, char** argv) {
               << " ent=" << args.ent
               << " gamma=" << args.gamma
               << " gae=" << args.gae
+              << " gaeSteps=" << args.gaeSteps
               << " rewardScale=" << args.rewardScale
               << " seed=" << args.seed << std::endl;
 
@@ -155,6 +158,7 @@ int main(int argc, char** argv) {
     ppo.entCoef = args.ent;
     ppo.gamma = args.gamma;
     ppo.lambda = args.gae;
+    ppo.gaeSteps = args.gaeSteps;
     ppo.epochs = args.epochs;
     ppo.minibatch = args.minibatch;
 

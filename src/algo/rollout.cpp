@@ -12,10 +12,11 @@ namespace algo {
 namespace {
 
 void writeDense(const Transition& t, float* xImp, float* seqSample, float* extra) {
-    for (int j = 0; j < ddz::kImpBin; ++j) xImp[j] = float(t.imp[j]);
-    std::copy(t.scalar.begin(), t.scalar.end(), xImp + ddz::kImpBin);
+    for (int j = 0; j < ddz::kNodeBin; ++j) xImp[j] = float(t.imp[j]);
+    std::copy(t.scalar.begin(), t.scalar.end(), xImp + ddz::kNodeBin);
     for (int k = 0; k < ddz::kHistoryLen; ++k) {
-        const uint8_t* src = t.imp.data() + (6 + k) * ddz::kCardMat;
+        const uint8_t* src =
+            t.imp.data() + (ddz::kStaticMatrices + k) * ddz::kCardMat;
         float* dst = seqSample + k * ddz::kCardMat;
         for (int j = 0; j < ddz::kCardMat; ++j) dst[j] = float(src[j]);
     }
@@ -23,36 +24,32 @@ void writeDense(const Transition& t, float* xImp, float* seqSample, float* extra
     std::copy(t.extraScalar.begin(), t.extraScalar.end(), extra + ddz::kExtraBin);
 }
 
-void scatterMaskDyn(const std::vector<Transition*>& tr, nn::Mat& mask,
-                    nn::Mat& dynFeat) {
-    // Illegal dyn rows are ignored by the mask. Only the mask has to be
-    // cleared; legal rows are overwritten below. New rows come in zero from
-    // Mat::resize, so a stale illegal row stays finite and is never sampled.
-    std::fill(mask.d.begin(), mask.d.end(), 0.0f);
+void gatherActions(const std::vector<Transition*>& tr, nn::Mat& actionFeat,
+                   nn::Mat& actionSample, nn::Mat& actionId,
+                   nn::Mat& actionOffset) {
     int B = static_cast<int>(tr.size());
+    int L = 0;
+    for (const Transition* t : tr) L += static_cast<int>(t->actions.size());
+    actionFeat.resize(L, ddz::kActionSize);
+    actionSample.resize(L, 1);
+    actionId.resize(L, 1);
+    actionOffset.resize(B + 1, 1);
+    int row = 0;
     for (int i = 0; i < B; ++i) {
-        const Transition& t = *tr[i];
-        for (int w = 0; w < 10; ++w) {
-            uint64_t bits = t.mask[w];
-            while (bits) {
-                int b = __builtin_ctzll(bits);
-                mask.row(i)[w * 64 + b] = 1.0f;
-                bits &= bits - 1;
-            }
-        }
-        for (const auto& [id, d] : t.dyn) {
-            float* df = dynFeat.row(i * ddz::kAbstractActions + id);
-            for (int j = 0; j < ddz::kActionDyn; ++j) df[j] = d[j];
+        actionOffset.row(i)[0] = float(row);
+        for (const auto& [id, feature] : tr[i]->actions) {
+            std::copy(feature.begin(), feature.end(), actionFeat.row(row));
+            actionSample.row(row)[0] = float(i);
+            actionId.row(row)[0] = float(id);
+            ++row;
         }
     }
+    actionOffset.row(B)[0] = float(row);
 }
 
-void sizeBatch(int B, nn::Mat& xImp, nn::Mat& seq, nn::Mat& mask, nn::Mat& dynFeat,
-               nn::Mat& extra) {
-    xImp.resize(B, ddz::kImpSize);
-    seq.resize(B * ddz::kHistoryLen, ddz::kCardMat);
-    mask.resize(B, ddz::kAbstractActions);
-    dynFeat.resize(B * ddz::kAbstractActions, ddz::kActionDyn);
+void sizeBatch(int B, nn::Mat& xImp, nn::Mat& seq, nn::Mat& extra) {
+    xImp.resize(B, ddz::kNodeSize);
+    seq.resize(B * ddz::kHistoryGroups, 3 * ddz::kCardMat);
     extra.resize(B, ddz::kExtraSize);
 }
 
@@ -62,7 +59,7 @@ void cacheTransitionFeatures(const std::vector<Transition>& tr,
                              std::vector<float>& xImp, std::vector<float>& seq,
                              std::vector<float>& extra) {
     int N = static_cast<int>(tr.size());
-    int xs = nn::padStride(ddz::kImpSize);
+    int xs = nn::padStride(ddz::kNodeSize);
     int es = nn::padStride(ddz::kExtraSize);
     xImp.assign(size_t(N) * xs, 0.0f);
     seq.assign(size_t(N) * ddz::kHistoryLen * ddz::kCardMat, 0.0f);
@@ -75,34 +72,38 @@ void cacheTransitionFeatures(const std::vector<Transition>& tr,
 }
 
 void buildBatch(const std::vector<Transition*>& tr, nn::Mat& xImp, nn::Mat& seq,
-                nn::Mat& mask, nn::Mat& dynFeat, nn::Mat& extra) {
+                nn::Mat& actionFeat, nn::Mat& actionSample, nn::Mat& actionId,
+                nn::Mat& actionOffset, nn::Mat& extra) {
     int B = static_cast<int>(tr.size());
-    sizeBatch(B, xImp, seq, mask, dynFeat, extra);
-    scatterMaskDyn(tr, mask, dynFeat);
+    sizeBatch(B, xImp, seq, extra);
+    gatherActions(tr, actionFeat, actionSample, actionId, actionOffset);
     for (int i = 0; i < B; ++i) {
         float seqSample[ddz::kHistoryLen * ddz::kCardMat];
         writeDense(*tr[i], xImp.row(i), seqSample, extra.row(i));
-        for (int k = 0; k < ddz::kHistoryLen; ++k)
-            std::copy(seqSample + k * ddz::kCardMat,
-                      seqSample + (k + 1) * ddz::kCardMat, seq.row(k * B + i));
+        for (int k = 0; k < ddz::kHistoryGroups; ++k)
+            std::copy(seqSample + k * 3 * ddz::kCardMat,
+                      seqSample + (k + 1) * 3 * ddz::kCardMat,
+                      seq.row(k * B + i));
     }
 }
 
 void buildBatchFromCache(const std::vector<Transition*>& tr,
                          const Transition* base, const float* xAll, int xStride,
                          const float* seqAll, const float* eAll, int eStride,
-                         nn::Mat& xImp, nn::Mat& seq, nn::Mat& mask,
-                         nn::Mat& dynFeat, nn::Mat& extra) {
+                         nn::Mat& xImp, nn::Mat& seq, nn::Mat& actionFeat,
+                         nn::Mat& actionSample, nn::Mat& actionId,
+                         nn::Mat& actionOffset, nn::Mat& extra) {
     int B = static_cast<int>(tr.size());
-    sizeBatch(B, xImp, seq, mask, dynFeat, extra);
-    scatterMaskDyn(tr, mask, dynFeat);
+    sizeBatch(B, xImp, seq, extra);
+    gatherActions(tr, actionFeat, actionSample, actionId, actionOffset);
     for (int i = 0; i < B; ++i) {
         int id = static_cast<int>(tr[i] - base);
         std::copy(xAll + size_t(id) * xStride,
-                  xAll + size_t(id) * xStride + ddz::kImpSize, xImp.row(i));
+                  xAll + size_t(id) * xStride + ddz::kNodeSize, xImp.row(i));
         const float* ss = seqAll + size_t(id) * ddz::kHistoryLen * ddz::kCardMat;
-        for (int k = 0; k < ddz::kHistoryLen; ++k)
-            std::copy(ss + k * ddz::kCardMat, ss + (k + 1) * ddz::kCardMat,
+        for (int k = 0; k < ddz::kHistoryGroups; ++k)
+            std::copy(ss + k * 3 * ddz::kCardMat,
+                      ss + (k + 1) * 3 * ddz::kCardMat,
                       seq.row(k * B + i));
         std::copy(eAll + size_t(id) * eStride,
                   eAll + size_t(id) * eStride + ddz::kExtraSize, extra.row(i));
@@ -134,6 +135,7 @@ void runWorker(const ModelSet& models, const RolloutConfig& cfg, int nGames,
     Rng sampleRng(seed ^ 0x123456789abcdef0ULL);
 
     std::vector<Game> games(nGames);
+    std::vector<std::array<int, 3>> oracleSteps(nGames);
     std::vector<bool> active(nGames, true);
     // index of the last transition of each game per seat
     std::array<std::vector<int>, 3> lastIdx;
@@ -142,7 +144,11 @@ void runWorker(const ModelSet& models, const RolloutConfig& cfg, int nGames,
     ActorInfer actorW[3];
     CriticInfer criticW[3];
 
-    for (int gi = 0; gi < nGames; ++gi) games[gi].deal(dealRng);
+    for (int gi = 0; gi < nGames; ++gi) {
+        games[gi].deal(dealRng);
+        for (int s = 0; s < 3; ++s)
+            oracleSteps[gi][s] = minSteps(games[gi].hand[s]);
+    }
 
     auto encodeTransition = [&](const Game& g,
                                 const std::vector<LegalOption>& options) {
@@ -154,7 +160,7 @@ void runWorker(const ModelSet& models, const RolloutConfig& cfg, int nGames,
         t.extraScalar = e.extraScalar;
         for (const LegalOption& o : options) {
             t.mask[o.abstractId >> 6] |= uint64_t(1) << (o.abstractId & 63);
-            t.dyn.emplace_back(o.abstractId, o.dyn);
+            t.actions.emplace_back(o.abstractId, o.feature);
         }
         return t;
     };
@@ -171,27 +177,23 @@ void runWorker(const ModelSet& models, const RolloutConfig& cfg, int nGames,
             std::vector<Transition> tr(B);
             std::vector<const LegalOption*> chosen(B, nullptr);
             std::vector<std::vector<LegalOption>> options(B);
-            std::vector<std::array<float, 3>> steps(B);
             for (int i = 0; i < B; ++i) {
                 const Game& g = games[idxs[i]];
                 options[i] = legalOptions(g);
                 tr[i] = encodeTransition(g, options[i]);
                 tr[i].gameId = idxs[i];
-                int prev = g.prevSeat();
-                int nxt = g.nextSeat();
-                steps[i][seat] = tr[i].scalar[0] * 20.0f;
-                steps[i][prev] = tr[i].extraScalar[0] * 20.0f;
-                steps[i][nxt] = tr[i].extraScalar[1] * 20.0f;
             }
 
             std::vector<Transition*> ptrs(B);
             for (int i = 0; i < B; ++i) ptrs[i] = &tr[i];
-            Mat xImp, seq, mask, dynFeat, extra;
-            buildBatch(ptrs, xImp, seq, mask, dynFeat, extra);
+            Mat xImp, seq, actionFeat, actionSample, actionId, actionOffset, extra;
+            buildBatch(ptrs, xImp, seq, actionFeat, actionSample, actionId,
+                       actionOffset, extra);
 
             const Mat& logits = actorInferForward(*models.actor[seat],
                                                   actorW[seat], xImp, seq,
-                                                  mask, dynFeat);
+                                                  actionFeat, actionSample,
+                                                  actionId, actionOffset);
             const Mat& values = criticInferForward(*models.critic[seat],
                                                    criticW[seat], xImp, seq,
                                                    extra);
@@ -234,23 +236,33 @@ void runWorker(const ModelSet& models, const RolloutConfig& cfg, int nGames,
                 Game& g = games[gi];
                 const CardSet& concrete = chosen[i]->concrete;
 
-                // oracle shaped reward (distance-to-win advantage delta)
-                std::array<float, 3> after = steps[i];
-                CardSet nh = g.hand[seat];
-                nh.sub(concrete);
-                after[seat] = float(minSteps(nh));
-                float advB = steps[i][0] - std::min(steps[i][1], steps[i][2]);
-                float advA = after[0] - std::min(after[1], after[2]);
-                float dAdv = advA - advB;
-                if (cfg.rewardScale > 0.0f)
-                    tr[i].reward = (seat == kLandlord ? -1.0f : 0.5f) * dAdv *
-                                   cfg.rewardScale;
+                // The oracle is a perfect-information reward for both camps,
+                // not just for the player that happened to act.  Attribute
+                // this node-to-node reward to every seat's currently open
+                // transition; it will then cover the interval until that
+                // seat acts again.
+                const auto& before = oracleSteps[gi];
+                float advB = float(before[0] - std::min(before[1], before[2]));
 
                 int storedIndex = static_cast<int>(res.seats[seat].size());
                 res.seats[seat].push_back(std::move(tr[i]));
                 lastIdx[seat][gi] = storedIndex;
 
                 g.step(concrete);
+                if (cfg.rewardScale > 0.0f) {
+                    oracleSteps[gi][seat] = minSteps(g.hand[seat]);
+                    const auto& after = oracleSteps[gi];
+                    float advA =
+                        float(after[0] - std::min(after[1], after[2]));
+                    float dAdv = advA - advB;
+                    for (int s = 0; s < 3; ++s) {
+                        int idx = lastIdx[s][gi];
+                        if (idx >= 0)
+                            res.seats[s][idx].reward +=
+                                (s == kLandlord ? -1.0f : 0.5f) * dAdv *
+                                cfg.rewardScale;
+                    }
+                }
                 res.stats.moves += 1;
                 if (isBombLike(concrete)) res.stats.bombs += 1;
 

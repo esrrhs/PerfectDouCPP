@@ -1401,6 +1401,78 @@ void concat2(uint3 gtid : SV_DispatchThreadID) {
     st(Z, i * (uint)zs + j, v);
 }
 )HLSL"},
+{"ragged_concat", R"HLSL(
+cbuffer CB : register(b0) { int nodeCols, actionCols, rows, zs, ns, as_; };
+RWByteAddressBuffer Z : register(u0);
+RWByteAddressBuffer Node : register(u1);
+RWByteAddressBuffer Action : register(u2);
+RWByteAddressBuffer Sample : register(u3);
+[numthreads(64,1,1)]
+void ragged_concat(uint3 tid : SV_DispatchThreadID) {
+    uint cols = (uint)nodeCols + (uint)actionCols;
+    uint gid = tid.x;
+    if (gid >= (uint)rows * cols) return;
+    uint r = gid / cols, j = gid - r * cols;
+    uint s = (uint)ld(Sample, r * 4u);
+    float v = j < (uint)nodeCols ? ld(Node, s * (uint)ns + j)
+                                 : ld(Action, r * (uint)as_ + j - nodeCols);
+    st(Z, r * (uint)zs + j, v);
+}
+)HLSL"},
+{"ragged_reduce", R"HLSL(
+cbuffer CB : register(b0) { int rows, cols, gs, cs; };
+RWByteAddressBuffer G : register(u0);
+RWByteAddressBuffer C : register(u1);
+RWByteAddressBuffer Offset : register(u2);
+[numthreads(64,1,1)]
+void ragged_reduce(uint3 tid : SV_DispatchThreadID) {
+    uint gid = tid.x;
+    if (gid >= (uint)rows * (uint)cols) return;
+    uint s = gid / (uint)cols, j = gid - s * (uint)cols;
+    uint lo = (uint)ld(Offset, s * 4u), hi = (uint)ld(Offset, (s + 1u) * 4u);
+    float v = 0.0f;
+    for (uint r = lo; r < hi; ++r) v += ld(C, r * (uint)cs + j);
+    st(G, s * (uint)gs + j, v);
+}
+)HLSL"},
+{"ragged_fill", R"HLSL(
+cbuffer CB : register(b0) { int B, actions, ls; };
+RWByteAddressBuffer L : register(u0);
+[numthreads(64,1,1)]
+void ragged_fill(uint3 tid : SV_DispatchThreadID) {
+    uint gid = tid.x;
+    if (gid >= (uint)B * (uint)actions) return;
+    st(L, (gid / actions) * (uint)ls + gid % actions, -1e9f);
+}
+)HLSL"},
+{"ragged_scatter", R"HLSL(
+cbuffer CB : register(b0) { int rows, ls; };
+RWByteAddressBuffer L : register(u0);
+RWByteAddressBuffer Score : register(u1);
+RWByteAddressBuffer Sample : register(u2);
+RWByteAddressBuffer ActionId : register(u3);
+[numthreads(64,1,1)]
+void ragged_scatter(uint3 tid : SV_DispatchThreadID) {
+    uint r = tid.x;
+    if (r >= (uint)rows) return;
+    uint s = (uint)ld(Sample, r * 4u), a = (uint)ld(ActionId, r * 4u);
+    st(L, s * (uint)ls + a, ld(Score, r * 4u));
+}
+)HLSL"},
+{"ragged_gather", R"HLSL(
+cbuffer CB : register(b0) { int rows, ls; };
+RWByteAddressBuffer Score : register(u0);
+RWByteAddressBuffer L : register(u1);
+RWByteAddressBuffer Sample : register(u2);
+RWByteAddressBuffer ActionId : register(u3);
+[numthreads(64,1,1)]
+void ragged_gather(uint3 tid : SV_DispatchThreadID) {
+    uint r = tid.x;
+    if (r >= (uint)rows) return;
+    uint s = (uint)ld(Sample, r * 4u), a = (uint)ld(ActionId, r * 4u);
+    st(Score, r * 4u, ld(L, s * (uint)ls + a));
+}
+)HLSL"},
 {"split2", R"HLSL(
 cbuffer CB : register(b0) { int n1, n2, rows, zs, as, bs; };
 RWByteAddressBuffer Z : register(u0);
@@ -2322,6 +2394,38 @@ void d3dConcat(Mat& z, const Mat& a, int n1, const Mat& b, int n2) {
 void d3dSplit(const Mat& z, int n1, Mat& a, Mat& b, int n2) {
     struct P { int n1, n2, B, zs, as, bs; } p{n1, n2, z.r, z.s, a.s, b.s};
     launch1("split2", {rIn(z), rOut(a), rOut(b)}, &p, sizeof(p), z.r * (n1 + n2));
+}
+void d3dRaggedConcat(Mat& z, const Mat& node, const Mat& action,
+                     const Mat& sample) {
+    struct P { int nc, ac, rows, zs, ns, as; }
+        p{node.c, action.c, z.r, z.s, node.s, action.s};
+    launch1("ragged_concat",
+            {rOut(z), rIn(node), rIn(action), rIn(sample)}, &p, sizeof(p),
+            z.r * z.c);
+}
+void d3dRaggedNodeReduce(Mat& nodeGrad, const Mat& concatGrad,
+                         const Mat& offset, int nodeCols) {
+    struct P { int rows, cols, gs, cs; }
+        p{nodeGrad.r, nodeCols, nodeGrad.s, concatGrad.s};
+    launch1("ragged_reduce",
+            {rOut(nodeGrad), rIn(concatGrad), rIn(offset)}, &p, sizeof(p),
+            nodeGrad.r * nodeCols);
+}
+void d3dRaggedScatter(Mat& logits, const Mat& scores, const Mat& sample,
+                      const Mat& actionId, int batch, int actions) {
+    struct FillP { int B, actions, ls; } fp{batch, actions, logits.s};
+    launch1("ragged_fill", {rOut(logits)}, &fp, sizeof(fp), batch * actions);
+    struct P { int rows, ls; } p{scores.r, logits.s};
+    launch1("ragged_scatter",
+            {rOut(logits), rIn(scores), rIn(sample), rIn(actionId)}, &p,
+            sizeof(p), scores.r);
+}
+void d3dRaggedGather(Mat& scores, const Mat& logits, const Mat& sample,
+                     const Mat& actionId) {
+    struct P { int rows, ls; } p{scores.r, logits.s};
+    launch1("ragged_gather",
+            {rOut(scores), rIn(logits), rIn(sample), rIn(actionId)}, &p,
+            sizeof(p), scores.r);
 }
 void d3dZeroAndLast(Mat& all, const Mat& gh, int B, int T, int h) {
     struct P { int B, T, h; } p{B, T, h};

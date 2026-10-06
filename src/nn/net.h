@@ -13,12 +13,12 @@
 
 namespace nn {
 
-constexpr int kImpInput = 4146;  // 23*180 binaries + 6 scalars
+constexpr int kImpInput = 1626;  // 9*180 current-state binaries + 6 scalars
 constexpr int kExtraInput = 362;
-constexpr int kLstmSteps = 15;
-constexpr int kLstmIn = 180;
+constexpr int kLstmSteps = 5;
+constexpr int kLstmIn = 540;     // three consecutive moves per LSTM step
 constexpr int kNumActions = 621;
-constexpr int kActionDyn = 7;
+constexpr int kActionInput = 186; // 12*15 action matrix + 6 properties
 
 struct Param {
     std::vector<float> w;   // values (storage rounded up to 4 floats)
@@ -134,25 +134,27 @@ struct NetConfig {
 };
 
 // Imperfect-information policy network.
-//   LSTM(180 -> 128) over the last 15 moves
-//   concat with node features -> MLP [256,256,256,512]
-//   621 action logits + dynamic action-feature score, masked
+// Released-model architecture:
+//   LSTM(540 -> 128) over five groups of three historical moves
+//   concat node embedding with every legal 186-D action representation
+//   shared MLP [256,256,256,512,1], scattered into 621 logits
 struct Actor {
     NetConfig cfg;
     Lstm lstm;
-    Linear l1, l2, l3, l4, head, dyn;
+    Linear l1, l2, l3, l4, head;
 
     // forward caches
-    Mat z, f1, f2, f3, feat, logits, gDs;
+    Mat node, joint, f1, f2, f3, feat, scores, logits;
+    Mat actionSampleCache, actionIdCache, actionOffsetCache;
     // backward caches (kept as members so GPU encodes outlive function scope)
-    Mat gFeat, gF3, gP3, gF2, gP2, gF1, gP1, gZ, ghLast, ghAll, gDynFeat;
+    Mat gScores, gFeat, gF3, gP3, gF2, gP2, gF1, gP1, gJoint;
+    Mat gNode, gXImp, ghLast, ghAll;
 
     void init(const NetConfig& c, uint64_t seed);
     void prepareInference();  // rebuild transposed weights after an optimizer step
-    // xImp: B x 4146; seq: B*15 x 180; mask: B x 621 (1 legal);
-    // dynFeat: B*621 x 7
-    Mat& forward(const Mat& xImp, const Mat& seq, const Mat& mask,
-                 const Mat& dynFeat);
+    Mat& forward(const Mat& xImp, const Mat& seq, const Mat& actionFeat,
+                 const Mat& actionSample, const Mat& actionId,
+                 const Mat& actionOffset);
     void backward(const Mat& dLogits);
     void zeroGrad();
     std::vector<Param*> params();
@@ -160,19 +162,17 @@ struct Actor {
     void load(const char* path);
 };
 
-// Perfect-information value network (shared-shape imperfect trunk plus an
-// encoder of the perfect-only features).
+// Perfect-information value network: imperfect node embedding plus the two
+// hidden hands/min-step features, followed by the paper's four 256-wide MLPs.
 struct Critic {
     NetConfig cfg;
     Lstm lstm;
-    Linear i1, i2, i3;      // imperfect trunk -> hidden
-    Linear p1, p2;          // perfect extras -> hidden
-    Linear c1, c2, out;     // concat -> hidden -> hidden -> 1
+    Linear c1, c2, c3, c4, out;
 
-    Mat z, f1, f2, imp, pf1, pe, cat, q1, q2, value;
+    Mat node, all, q1, q2, q3, q4, value;
     // backward caches (persistent for GPU encodes)
-    Mat gQ2, gP2, gQ1, gQ0, gCat, gImp, gPe, gPf1, gPf0, gExtra;
-    Mat giF2, giP3, giF1, giP1, giZ, ghLast, ghAll;
+    Mat gQ4, gP4, gQ3, gP3, gQ2, gP2, gQ1, gP1, gAll;
+    Mat gNode, gExtra, ghLast, ghAll;
 
     void init(const NetConfig& c, uint64_t seed);
     void prepareInference();
@@ -200,15 +200,16 @@ void lstmInferForward(const Lstm& l, const Mat& x, int B, int T, LstmInfer& w);
 
 struct ActorInfer {
     LstmInfer lstm;
-    Mat z, f1, f2, f3, feat, logits, ds;
+    Mat node, joint, f1, f2, f3, feat, scores, logits;
 };
 const Mat& actorInferForward(const Actor& a, ActorInfer& w, const Mat& xImp,
-                             const Mat& seq, const Mat& mask,
-                             const Mat& dynFeat);
+                             const Mat& seq, const Mat& actionFeat,
+                             const Mat& actionSample, const Mat& actionId,
+                             const Mat& actionOffset);
 
 struct CriticInfer {
     LstmInfer lstm;
-    Mat z, f1, f2, imp, pf1, pe, cat, q1, q2, value;
+    Mat node, all, q1, q2, q3, q4, value;
 };
 const Mat& criticInferForward(const Critic& c, CriticInfer& w,
                               const Mat& xImp, const Mat& seq,

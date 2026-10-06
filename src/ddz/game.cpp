@@ -45,6 +45,14 @@ void Game::step(const CardSet& m) {
         lastPlayer = turn;
         if (isBombLike(m)) ++bombCount;
         hand[turn].sub(m);
+        // The released PerfectDou environment exposes the still-unplayed
+        // subset of the three public bottom cards.
+        if (turn == kLandlord) {
+            CardSet used;
+            for (int r = 0; r < kRanks; ++r)
+                used.add(r, std::min(bottom.c[r], m.c[r]));
+            bottom.sub(used);
+        }
         for (int r = 0; r < kRanks; ++r) played[turn].add(r, m.c[r]);
         if (hand[turn].total() == 0) {
             over = true;

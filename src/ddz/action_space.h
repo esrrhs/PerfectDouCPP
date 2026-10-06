@@ -32,6 +32,10 @@ const std::vector<AbstractAction>& abstractTable();
 // Requires the MoveInfo of the concrete move (pass it in to avoid recompute).
 int concreteToAbstract(const CardSet& concrete, const MoveInfo& info);
 
+// Whether a concrete legal play is represented by an abstract action. Some
+// concrete planes map to more than one official abstract template.
+bool abstractMatches(const AbstractAction& action, const CardSet& concrete);
+
 // Number of cards of a concrete play of an abstract action.
 int abstractSize(const AbstractAction& a);
 

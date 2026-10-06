@@ -67,6 +67,8 @@ add_executable(perfectdou_train src/train.cpp)
 target_link_libraries(perfectdou_train PRIVATE perfectdou)
 if(WIN32)
   target_link_libraries(perfectdou_train PRIVATE powrprof)
+  add_executable(perfectdou_eval src/eval_douzero.cpp)
+  target_link_libraries(perfectdou_eval PRIVATE perfectdou ws2_32)
 endif()
 
 enable_testing()

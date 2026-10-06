@@ -543,6 +543,44 @@ extern "C" __global__ void concat2(float* Z, float* A, float* B,
   float v = (j < n1) ? A[i * as + j] : B[i * bs + (j - n1)];
   Z[i * zs + j] = v;
 }
+extern "C" __global__ void ragged_concat(float* Z, float* Node, float* Action,
+                                         float* Sample, int nc, int ac,
+                                         int rows, int zs, int ns, int as) {
+  int gid = blockIdx.x * blockDim.x + threadIdx.x;
+  int cols = nc + ac;
+  if (gid >= rows * cols) return;
+  int r = gid / cols, j = gid - r * cols, s = (int)Sample[r * 4];
+  Z[r * zs + j] = j < nc ? Node[s * ns + j] : Action[r * as + j - nc];
+}
+extern "C" __global__ void ragged_reduce(float* G, float* C, float* Offset,
+                                         int rows, int cols, int gs, int cs) {
+  int gid = blockIdx.x * blockDim.x + threadIdx.x;
+  if (gid >= rows * cols) return;
+  int s = gid / cols, j = gid - s * cols;
+  int lo = (int)Offset[s * 4], hi = (int)Offset[(s + 1) * 4];
+  float v = 0.f;
+  for (int r = lo; r < hi; ++r) v += C[r * cs + j];
+  G[s * gs + j] = v;
+}
+extern "C" __global__ void ragged_fill(float* L, int B, int actions, int ls) {
+  int gid = blockIdx.x * blockDim.x + threadIdx.x;
+  if (gid >= B * actions) return;
+  L[(gid / actions) * ls + gid % actions] = -1.0e9f;
+}
+extern "C" __global__ void ragged_scatter(float* L, float* Score,
+                                          float* Sample, float* ActionId,
+                                          int rows, int ls) {
+  int r = blockIdx.x * blockDim.x + threadIdx.x;
+  if (r >= rows) return;
+  L[(int)Sample[r * 4] * ls + (int)ActionId[r * 4]] = Score[r * 4];
+}
+extern "C" __global__ void ragged_gather(float* Score, float* L,
+                                         float* Sample, float* ActionId,
+                                         int rows, int ls) {
+  int r = blockIdx.x * blockDim.x + threadIdx.x;
+  if (r >= rows) return;
+  Score[r * 4] = L[(int)Sample[r * 4] * ls + (int)ActionId[r * 4]];
+}
 extern "C" __global__ void split2(float* Z, float* A, float* B,
                                  int n1, int n2, int rows, int zs, int as, int bs) {
   int gid = blockIdx.x * blockDim.x + threadIdx.x;

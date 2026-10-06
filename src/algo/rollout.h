@@ -22,8 +22,8 @@ struct Transition {
     std::array<uint8_t, ddz::kExtraBin> extra{};
     std::array<float, ddz::kExtraScalars> extraScalar{};
     std::array<uint64_t, 10> mask{};  // 621 action bits
-    // dynamic features for the legal actions (abstract id -> 7 values)
-    std::vector<std::pair<int, std::array<float, ddz::kActionDyn>>> dyn;
+    // Released-model action representation (abstract id -> 12x15 + 6).
+    std::vector<std::pair<int, std::array<float, ddz::kActionSize>>> actions;
     int action = -1;
     int gameId = -1;
     bool terminal = false;
@@ -62,21 +62,22 @@ void collectRollout(const ModelSet& models, const RolloutConfig& cfg,
 
 // Assembles the network input batch for a set of transitions.
 struct Batch {
-    nn::Mat xImp, seq, mask, dynFeat, extra;
+    nn::Mat xImp, seq, actionFeat, actionSample, actionId, actionOffset, extra;
 };
 // Float features for one stream, built once and reused across PPO epochs.
 void cacheTransitionFeatures(const std::vector<Transition>& tr,
                              std::vector<float>& xImp, std::vector<float>& seq,
                              std::vector<float>& extra);
 void buildBatch(const std::vector<Transition*>& tr, nn::Mat& xImp,
-                nn::Mat& seq, nn::Mat& mask, nn::Mat& dynFeat,
-                nn::Mat& extra);
+                nn::Mat& seq, nn::Mat& actionFeat, nn::Mat& actionSample,
+                nn::Mat& actionId, nn::Mat& actionOffset, nn::Mat& extra);
 // `base` is the stream the cached rows were built from. Each pointer in
 // `tr` must address an element of that stream.
 void buildBatchFromCache(const std::vector<Transition*>& tr,
                          const Transition* base, const float* xAll, int xStride,
                          const float* seqAll, const float* eAll, int eStride,
-                         nn::Mat& xImp, nn::Mat& seq, nn::Mat& mask,
-                         nn::Mat& dynFeat, nn::Mat& extra);
+                         nn::Mat& xImp, nn::Mat& seq, nn::Mat& actionFeat,
+                         nn::Mat& actionSample, nn::Mat& actionId,
+                         nn::Mat& actionOffset, nn::Mat& extra);
 
 }  // namespace algo

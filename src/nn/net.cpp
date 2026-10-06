@@ -327,16 +327,13 @@ void Actor::init(const NetConfig& c, uint64_t seed) {
     cfg = c;
     Rng64 rng(seed);
     lstm.init(kLstmIn, c.lstmHidden, rng);
-    l1.init(kImpInput + c.lstmHidden, c.hidden, rng);
+    l1.init(kImpInput + c.lstmHidden + kActionInput, c.hidden, rng);
     l2.init(c.hidden, c.hidden, rng);
     l3.init(c.hidden, c.hidden, rng);
     l4.init(c.hidden, c.hidden * 2, rng);
-    head.init(c.hidden * 2, kNumActions, rng);
+    head.init(c.hidden * 2, 1, rng);
     std::fill(head.W.w.begin(), head.W.w.end(), 0.0f);
     std::fill(head.b.w.begin(), head.b.w.end(), 0.0f);
-    dyn.init(kActionDyn, 1, rng);
-    std::fill(dyn.W.w.begin(), dyn.W.w.end(), 0.0f);
-    std::fill(dyn.b.w.begin(), dyn.b.w.end(), 0.0f);
     prepareInference();
 }
 
@@ -347,59 +344,47 @@ void Actor::prepareInference() {
     l3.buildWT();
     l4.buildWT();
     head.buildWT();
-    dyn.buildWT();
 }
 
-Mat& Actor::forward(const Mat& xImp, const Mat& seq, const Mat& mask,
-                    const Mat& dynFeat) {
+Mat& Actor::forward(const Mat& xImp, const Mat& seq, const Mat& actionFeat,
+                    const Mat& actionSample, const Mat& actionId,
+                    const Mat& actionOffset) {
     int B = xImp.r;
     lstm.forward(seq, B, kLstmSteps);
-    z.resize(B, kImpInput + cfg.lstmHidden);
-    kConcat(z, xImp, kImpInput, lstm.hlLast, cfg.lstmHidden);
-    f1.ref(l1.forwardAct(z));
+    node.resize(B, kImpInput + cfg.lstmHidden);
+    kConcat(node, xImp, kImpInput, lstm.hlLast, cfg.lstmHidden);
+    joint.resize(actionFeat.r, node.c + kActionInput);
+    kRaggedConcat(joint, node, actionFeat, actionSample);
+    actionSampleCache.ref(actionSample);
+    actionIdCache.ref(actionId);
+    actionOffsetCache.ref(actionOffset);
+    f1.ref(l1.forwardAct(joint));
     f2.ref(l2.forwardAct(f1));
     f3.ref(l3.forwardAct(f2));
-    feat.ref(l4.forward(f3));
-    logits.ref(head.forward(feat));
-    const Mat& ds = dyn.forward(dynFeat);
-    kMaskDyn(logits, ds, mask, kNumActions);
+    feat.ref(l4.forwardAct(f3));
+    scores.ref(head.forward(feat));
+    kRaggedScatter(logits, scores, actionSample, actionId, B, kNumActions);
     return logits;
 }
 
 void Actor::backward(const Mat& dLogits) {
     int B = dLogits.r;
-    // dynamic action head (gradient w.r.t. its dense input is discarded)
-    // dLogits is on host; dyn.inCache is dynFeat on host.
-    // Illegal actions have dLogits == 0, so computing this on CPU is instantaneous
-    // and eliminates two massive GPU GEMMs (1x7x158976 and 158976x7x1).
-    float db = 0.0f;
-    float dw[kActionDyn] = {0.0f};
-    for (int i = 0; i < B; ++i) {
-        const float* dl_row = dLogits.row(i);
-        for (int a = 0; a < kNumActions; ++a) {
-            float g = dl_row[a];
-            if (g == 0.0f) continue;
-            db += g;
-            const float* f = dyn.inCache.row(i * kNumActions + a);
-            for (int k = 0; k < kActionDyn; ++k) {
-                dw[k] += g * f[k];
-            }
-        }
-    }
-    for (int k = 0; k < kActionDyn; ++k) dyn.W.dw[k] += dw[k];
-    dyn.b.dw[0] += db;
+    kRaggedGather(gScores, dLogits, actionSampleCache, actionIdCache);
+    head.backward(gScores, gFeat);
+    kReluBwd(feat, gFeat, gF3);
+    l4.backward(gF3, gP3);
+    kReluBwd(f3, gP3, gF2);
+    l3.backward(gF2, gP2);
+    kReluBwd(f2, gP2, gF1);
+    l2.backward(gF1, gP1);
+    kReluBwd(f1, gP1, gXImp);
+    l1.backward(gXImp, gJoint);
 
-    head.backward(dLogits, gFeat);
-    l4.backward(gFeat, gF3);
-    kReluBwd(f3, gF3, gP3);
-    l3.backward(gP3, gF2);
-    kReluBwd(f2, gF2, gP2);
-    l2.backward(gP2, gF1);
-    kReluBwd(f1, gF1, gP1);
-    l1.backward(gP1, gZ);
+    gNode.resize(B, kImpInput + cfg.lstmHidden);
+    kRaggedNodeReduce(gNode, gJoint, actionOffsetCache, gNode.c);
 
     ghLast.resize(B, cfg.lstmHidden);
-    kSlice(ghLast, gZ, kImpInput, cfg.lstmHidden);
+    kSlice(ghLast, gNode, kImpInput, cfg.lstmHidden);
     ghAll.resize(B * kLstmSteps, cfg.lstmHidden);
     kZeroAndLast(ghAll, ghLast, B, kLstmSteps, cfg.lstmHidden);
     lstm.backward(ghAll);
@@ -412,13 +397,12 @@ void Actor::zeroGrad() {
     l3.zeroGrad();
     l4.zeroGrad();
     head.zeroGrad();
-    dyn.zeroGrad();
 }
 
 std::vector<Param*> Actor::params() {
     return {&lstm.Wi, &lstm.bi, &lstm.Wh, &lstm.bh,
             &l1.W, &l1.b, &l2.W, &l2.b, &l3.W, &l3.b,
-            &l4.W, &l4.b, &head.W, &head.b, &dyn.W, &dyn.b};
+            &l4.W, &l4.b, &head.W, &head.b};
 }
 
 void Actor::save(const char* path) const {
@@ -442,6 +426,7 @@ void Actor::load(const char* path) {
     init(c, 1);
     loadParams(f, params());
     std::fclose(f);
+    prepareInference();
 }
 
 // ---------------------------------------------------------------------------
@@ -451,74 +436,56 @@ void Critic::init(const NetConfig& c, uint64_t seed) {
     cfg = c;
     Rng64 rng(seed);
     lstm.init(kLstmIn, c.lstmHidden, rng);
-    i1.init(kImpInput + c.lstmHidden, c.hidden, rng);
-    i2.init(c.hidden, c.hidden, rng);
-    i3.init(c.hidden, c.hidden, rng);
-    p1.init(kExtraInput, c.hidden, rng);
-    p2.init(c.hidden, c.hidden, rng);
-    c1.init(2 * c.hidden, c.hidden, rng);
+    c1.init(kImpInput + c.lstmHidden + kExtraInput, c.hidden, rng);
     c2.init(c.hidden, c.hidden, rng);
+    c3.init(c.hidden, c.hidden, rng);
+    c4.init(c.hidden, c.hidden, rng);
     out.init(c.hidden, 1, rng);
     prepareInference();
 }
 
 void Critic::prepareInference() {
     lstm.buildWT();
-    i1.buildWT();
-    i2.buildWT();
-    i3.buildWT();
-    p1.buildWT();
-    p2.buildWT();
     c1.buildWT();
     c2.buildWT();
+    c3.buildWT();
+    c4.buildWT();
     out.buildWT();
 }
 
 Mat& Critic::forward(const Mat& xImp, const Mat& seq, const Mat& extra) {
     int B = xImp.r;
     lstm.forward(seq, B, kLstmSteps);
-    z.resize(B, kImpInput + cfg.lstmHidden);
-    kConcat(z, xImp, kImpInput, lstm.hlLast, cfg.lstmHidden);
-
-    f1.ref(i1.forwardAct(z));
-    f2.ref(i2.forwardAct(f1));
-    imp.ref(i3.forward(f2));
-
-    pf1.ref(p1.forwardAct(extra));
-    pe.ref(p2.forward(pf1));
-
-    cat.resize(B, 2 * cfg.hidden);
-    kConcat(cat, imp, cfg.hidden, pe, cfg.hidden);
-    q1.ref(c1.forwardAct(cat));
+    node.resize(B, kImpInput + cfg.lstmHidden);
+    kConcat(node, xImp, kImpInput, lstm.hlLast, cfg.lstmHidden);
+    all.resize(B, node.c + kExtraInput);
+    kConcat(all, node, node.c, extra, kExtraInput);
+    q1.ref(c1.forwardAct(all));
     q2.ref(c2.forwardAct(q1));
-    value.ref(out.forward(q2));
+    q3.ref(c3.forwardAct(q2));
+    q4.ref(c4.forwardAct(q3));
+    value.ref(out.forward(q4));
     return value;
 }
 
 void Critic::backward(const Mat& dValue) {
     int B = dValue.r;
-    out.backward(dValue, gQ2);
+    out.backward(dValue, gQ4);
+    kReluBwd(q4, gQ4, gP4);
+    c4.backward(gP4, gQ3);
+    kReluBwd(q3, gQ3, gP3);
+    c3.backward(gP3, gQ2);
     kReluBwd(q2, gQ2, gP2);
     c2.backward(gP2, gQ1);
-    kReluBwd(q1, gQ1, gQ0);
-    c1.backward(gQ0, gCat);
+    kReluBwd(q1, gQ1, gP1);
+    c1.backward(gP1, gAll);
 
-    gImp.resize(B, cfg.hidden);
-    gPe.resize(B, cfg.hidden);
-    kSplit(gCat, cfg.hidden, gImp, gPe, cfg.hidden);
-
-    p2.backward(gPe, gPf1);
-    kReluBwd(pf1, gPf1, gPf0);
-    p1.backward(gPf0, gExtra);
-
-    i3.backward(gImp, giF2);
-    kReluBwd(f2, giF2, giP3);
-    i2.backward(giP3, giF1);
-    kReluBwd(f1, giF1, giP1);
-    i1.backward(giP1, giZ);
+    gNode.resize(B, kImpInput + cfg.lstmHidden);
+    gExtra.resize(B, kExtraInput);
+    kSplit(gAll, gNode.c, gNode, gExtra, kExtraInput);
 
     ghLast.resize(B, cfg.lstmHidden);
-    kSlice(ghLast, giZ, kImpInput, cfg.lstmHidden);
+    kSlice(ghLast, gNode, kImpInput, cfg.lstmHidden);
     ghAll.resize(B * kLstmSteps, cfg.lstmHidden);
     kZeroAndLast(ghAll, ghLast, B, kLstmSteps, cfg.lstmHidden);
     lstm.backward(ghAll);
@@ -526,21 +493,17 @@ void Critic::backward(const Mat& dValue) {
 
 void Critic::zeroGrad() {
     lstm.zeroGrad();
-    i1.zeroGrad();
-    i2.zeroGrad();
-    i3.zeroGrad();
-    p1.zeroGrad();
-    p2.zeroGrad();
     c1.zeroGrad();
     c2.zeroGrad();
+    c3.zeroGrad();
+    c4.zeroGrad();
     out.zeroGrad();
 }
 
 std::vector<Param*> Critic::params() {
     return {&lstm.Wi, &lstm.bi, &lstm.Wh, &lstm.bh,
-            &i1.W, &i1.b, &i2.W, &i2.b, &i3.W, &i3.b,
-            &p1.W, &p1.b, &p2.W, &p2.b, &c1.W, &c1.b,
-            &c2.W, &c2.b, &out.W, &out.b};
+            &c1.W, &c1.b, &c2.W, &c2.b, &c3.W, &c3.b,
+            &c4.W, &c4.b, &out.W, &out.b};
 }
 
 void Critic::save(const char* path) const {
@@ -564,6 +527,7 @@ void Critic::load(const char* path) {
     init(c, 1);
     loadParams(f, params());
     std::fclose(f);
+    prepareInference();
 }
 
 // ---------------------------------------------------------------------------
@@ -613,32 +577,39 @@ void lstmInferForward(const Lstm& l, const Mat& x, int B, int T,
 }
 
 const Mat& actorInferForward(const Actor& a, ActorInfer& w, const Mat& xImp,
-                             const Mat& seq, const Mat& mask,
-                             const Mat& dynFeat) {
+                             const Mat& seq, const Mat& actionFeat,
+                             const Mat& actionSample, const Mat& actionId,
+                             const Mat& actionOffset) {
+    (void)actionOffset;
     int B = xImp.r;
     lstmInferForward(a.lstm, seq, B, kLstmSteps, w.lstm);
-    w.z.resize(B, kImpInput + a.cfg.lstmHidden);
+    w.node.resize(B, kImpInput + a.cfg.lstmHidden);
     for (int i = 0; i < B; ++i) {
-        std::copy(xImp.row(i), xImp.row(i) + kImpInput, w.z.row(i));
+        std::copy(xImp.row(i), xImp.row(i) + kImpInput, w.node.row(i));
         std::copy(w.lstm.hl.row(i), w.lstm.hl.row(i) + a.cfg.lstmHidden,
-                  w.z.row(i) + kImpInput);
+                  w.node.row(i) + kImpInput);
     }
-    linearForward(w.z, a.l1.wt, a.l1.b.w, w.f1);
+    w.joint.resize(actionFeat.r, w.node.c + kActionInput);
+    for (int r = 0; r < actionFeat.r; ++r) {
+        int s = int(actionSample.row(r)[0]);
+        std::copy(w.node.row(s), w.node.row(s) + w.node.c, w.joint.row(r));
+        std::copy(actionFeat.row(r), actionFeat.row(r) + kActionInput,
+                  w.joint.row(r) + w.node.c);
+    }
+    linearForward(w.joint, a.l1.wt, a.l1.b.w, w.f1);
     reluFwd(w.f1);
     linearForward(w.f1, a.l2.wt, a.l2.b.w, w.f2);
     reluFwd(w.f2);
     linearForward(w.f2, a.l3.wt, a.l3.b.w, w.f3);
     reluFwd(w.f3);
     linearForward(w.f3, a.l4.wt, a.l4.b.w, w.feat);
-    linearForward(w.feat, a.head.wt, a.head.b.w, w.logits);
-    linearForward(dynFeat, a.dyn.wt, a.dyn.b.w, w.ds);
-    for (int i = 0; i < B; ++i)
-        for (int j = 0; j < kNumActions; ++j) {
-            if (mask.row(i)[j] > 0.5f)
-                w.logits.row(i)[j] += w.ds.row(i * kNumActions + j)[0];
-            else
-                w.logits.row(i)[j] = -1e9f;
-        }
+    reluFwd(w.feat);
+    linearForward(w.feat, a.head.wt, a.head.b.w, w.scores);
+    w.logits.resize(B, kNumActions);
+    std::fill(w.logits.d.begin(), w.logits.d.end(), -1e9f);
+    for (int r = 0; r < actionFeat.r; ++r)
+        w.logits.row(int(actionSample.row(r)[0]))[int(actionId.row(r)[0])] =
+            w.scores.row(r)[0];
     return w.logits;
 }
 
@@ -647,31 +618,27 @@ const Mat& criticInferForward(const Critic& c, CriticInfer& w,
                               const Mat& extra) {
     int B = xImp.r;
     lstmInferForward(c.lstm, seq, B, kLstmSteps, w.lstm);
-    w.z.resize(B, kImpInput + c.cfg.lstmHidden);
+    w.node.resize(B, kImpInput + c.cfg.lstmHidden);
     for (int i = 0; i < B; ++i) {
-        std::copy(xImp.row(i), xImp.row(i) + kImpInput, w.z.row(i));
+        std::copy(xImp.row(i), xImp.row(i) + kImpInput, w.node.row(i));
         std::copy(w.lstm.hl.row(i), w.lstm.hl.row(i) + c.cfg.lstmHidden,
-                  w.z.row(i) + kImpInput);
+                  w.node.row(i) + kImpInput);
     }
-    linearForward(w.z, c.i1.wt, c.i1.b.w, w.f1);
-    reluFwd(w.f1);
-    linearForward(w.f1, c.i2.wt, c.i2.b.w, w.f2);
-    reluFwd(w.f2);
-    linearForward(w.f2, c.i3.wt, c.i3.b.w, w.imp);
-    linearForward(extra, c.p1.wt, c.p1.b.w, w.pf1);
-    reluFwd(w.pf1);
-    linearForward(w.pf1, c.p2.wt, c.p2.b.w, w.pe);
-    w.cat.resize(B, 2 * c.cfg.hidden);
+    w.all.resize(B, w.node.c + kExtraInput);
     for (int i = 0; i < B; ++i) {
-        std::copy(w.imp.row(i), w.imp.row(i) + c.cfg.hidden, w.cat.row(i));
-        std::copy(w.pe.row(i), w.pe.row(i) + c.cfg.hidden,
-                  w.cat.row(i) + c.cfg.hidden);
+        std::copy(w.node.row(i), w.node.row(i) + w.node.c, w.all.row(i));
+        std::copy(extra.row(i), extra.row(i) + kExtraInput,
+                  w.all.row(i) + w.node.c);
     }
-    linearForward(w.cat, c.c1.wt, c.c1.b.w, w.q1);
+    linearForward(w.all, c.c1.wt, c.c1.b.w, w.q1);
     reluFwd(w.q1);
     linearForward(w.q1, c.c2.wt, c.c2.b.w, w.q2);
     reluFwd(w.q2);
-    linearForward(w.q2, c.out.wt, c.out.b.w, w.value);
+    linearForward(w.q2, c.c3.wt, c.c3.b.w, w.q3);
+    reluFwd(w.q3);
+    linearForward(w.q3, c.c4.wt, c.c4.b.w, w.q4);
+    reluFwd(w.q4);
+    linearForward(w.q4, c.out.wt, c.out.b.w, w.value);
     return w.value;
 }
 

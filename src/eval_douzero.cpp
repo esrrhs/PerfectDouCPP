@@ -143,12 +143,15 @@ ddz::CardSet ourMove(nn::Actor& actor, nn::ActorInfer& w, const ddz::Game& g,
     t.extraScalar = e.extraScalar;
     for (const ddz::LegalOption& o : options) {
         t.mask[o.abstractId >> 6] |= uint64_t(1) << (o.abstractId & 63);
-        t.dyn.emplace_back(o.abstractId, o.dyn);
+        t.actions.emplace_back(o.abstractId, o.feature);
     }
     std::vector<algo::Transition*> ptrs{&t};
-    nn::Mat xImp, seq, mask, dynFeat, extra;
-    algo::buildBatch(ptrs, xImp, seq, mask, dynFeat, extra);
-    const nn::Mat& logits = nn::actorInferForward(actor, w, xImp, seq, mask, dynFeat);
+    nn::Mat xImp, seq, actionFeat, actionSample, actionId, actionOffset, extra;
+    algo::buildBatch(ptrs, xImp, seq, actionFeat, actionSample, actionId,
+                     actionOffset, extra);
+    const nn::Mat& logits =
+        nn::actorInferForward(actor, w, xImp, seq, actionFeat, actionSample,
+                              actionId, actionOffset);
     int best = options.front().abstractId;
     float bestL = logits.row(0)[best];
     for (const ddz::LegalOption& o : options) {
