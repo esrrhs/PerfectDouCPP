@@ -34,6 +34,12 @@ jobs:
         run: ctest --test-dir build -C Release --output-on-failure
 
       - name: E2E Training Smoke Test
+        shell: bash
         run: |
-          ./build/Release/perfectdou_train --updates 2 --games 16 --mb 64 --epochs 2 --threads 2 --pool-every 1 || \
-          ./build/perfectdou_train --updates 2 --games 16 --mb 64 --epochs 2 --threads 2 --pool-every 1
+          if [ -f "./build/Release/perfectdou_train.exe" ]; then
+            ./build/Release/perfectdou_train.exe --updates 2 --games 16 --mb 64 --epochs 2 --threads 2 --pool-every 1
+          elif [ -f "./build/Release/perfectdou_train" ]; then
+            ./build/Release/perfectdou_train --updates 2 --games 16 --mb 64 --epochs 2 --threads 2 --pool-every 1
+          else
+            ./build/perfectdou_train --updates 2 --games 16 --mb 64 --epochs 2 --threads 2 --pool-every 1
+          fi
