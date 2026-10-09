@@ -24,10 +24,11 @@
 namespace nn {
 
 void gemmInit();                       // initialize GPU backend (if present)
-bool gemmHasGpu();
+bool gemmHasGpu();                     // Windows: CUDA+D3D; Apple: Metal
 void gemmSetGpu(bool enabled);         // process-wide default
 bool gemmGpuEnabled();
-const char* gemmGpuLabel();            // "GPU (Metal)" / "GPU (D3D12: ...)"
+const char* gemmGpuLabel();            // "GPU (cuBLAS...)" / "GPU (Metal)"
+const char* gemmCudaError();           // why CUDA is unavailable (Windows)
 void gemmSetThreadGpu(int enabled);    // per-thread override (-1 = follow default)
 
 void sgemm(char transA, char transB, int M, int N, int K,

@@ -33,7 +33,7 @@ namespace nn {
 
 namespace {
 // Accelerate/AMX beats the Metal GEMM kernels on the training shapes, so the
-// default backend is CPU. --backend gpu still opts into Metal.
+// default backend is CPU. Windows GPU training is CUDA-only (--backend cuda).
 bool g_enabled = false;
 thread_local int t_override = -1;  // -1: follow g_enabled, 0/1: explicit
 thread_local int g_boundSeat = 0;
@@ -183,34 +183,58 @@ void gemmInit() {
     setenv("VECLIB_MAXIMUM_THREADS", "1", /*overwrite=*/0);
 #endif
 #if defined(PD_HAVE_D3D)
+    // Pure D3D12 GEMM hangs on some NVIDIA drivers (gemm_block TDR). Windows
+    // GPU training is CUDA-only; keep the device warm for the cuBLAS bridge.
     extern bool d3dInit();
-    g_enabled = d3dInit();
+    d3dInit();
+    g_enabled = false;
 #elif defined(PD_HAVE_GPU)
     extern bool PD_BE(Init)();
     if (!PD_BE(Init)()) g_enabled = false;
 #endif
 }
 bool gemmHasGpu() {
-#ifdef PD_HAVE_GPU
+#if defined(PD_HAVE_D3D)
+    extern bool d3dAvailable();
+    extern bool cudaBridgeAvailable();
+    return d3dAvailable() && cudaBridgeAvailable();
+#elif defined(PD_HAVE_GPU)
     extern bool PD_BE(Available)();
     return PD_BE(Available)();
 #else
     return false;
 #endif
 }
-void gemmSetGpu(bool enabled) { g_enabled = enabled && gemmHasGpu(); }
+void gemmSetGpu(bool enabled) {
+#if defined(PD_HAVE_D3D)
+    // Windows GPU == CUDA bridge. Pure D3D12 GEMM is not offered.
+    if (enabled) {
+        if (!std::getenv("PD_CUBLAS")) _putenv_s("PD_CUBLAS", "1");
+        g_enabled = gemmHasGpu();
+        return;
+    }
+#endif
+    g_enabled = enabled && gemmHasGpu();
+}
 void gemmSetThreadGpu(int enabled) { t_override = enabled; }
 bool gemmGpuEnabled() {
     return t_override >= 0 ? (t_override != 0) : g_enabled;
 }
 const char* gemmGpuLabel() {
 #if defined(PD_HAVE_D3D)
-    extern const char* d3dLabel();
-    return d3dLabel();
+    return "GPU (cuBLAS + CUDA kernels)";
 #elif defined(PD_HAVE_MPS)
     return "GPU (Metal)";
 #else
     return "GPU";
+#endif
+}
+const char* gemmCudaError() {
+#if defined(PD_HAVE_D3D)
+    extern const char* cudaBridgeError();
+    return cudaBridgeError();
+#else
+    return "CUDA backend is Windows-only";
 #endif
 }
 bool gpuActive() {

@@ -70,7 +70,7 @@ struct Args {
     uint64_t seed = 1;
     std::string out = "ckpt";
     std::string resume;
-    std::string backend = "auto";  // auto | gpu | cuda | cpu
+    std::string backend = "auto";  // auto | cuda | cpu
 };
 
 const char* argValue(int argc, char** argv, const char* key, const char* def) {
@@ -127,16 +127,51 @@ int main(int argc, char** argv) {
     parseArgs(argc, argv, args);
     if (args.threads <= 0) args.threads = 1;
 
-#if defined(_WIN32)
-    if (args.backend == "cuda") _putenv_s("PD_CUBLAS", "1");
-#endif
+    if (args.backend == "gpu") {
+        std::fprintf(stderr,
+                     "--backend gpu was removed (pure D3D12 GEMM hangs on some "
+                     "NVIDIA drivers). Use --backend cuda or --backend cpu.\n");
+        return 1;
+    }
+    if (args.backend != "auto" && args.backend != "cuda" &&
+        args.backend != "cpu") {
+        std::fprintf(stderr,
+                     "unknown --backend %s (expected auto|cuda|cpu)\n",
+                     args.backend.c_str());
+        return 1;
+    }
+
     nn::gemmInit();
-    if (args.backend == "cpu") nn::gemmSetGpu(false);
-    if (args.backend == "gpu" || args.backend == "cuda") nn::gemmSetGpu(true);
+#if defined(_WIN32)
+    // Windows GPU path is CUDA-only. auto falls back to CPU when cuBLAS is
+    // unavailable (no toolkit / not built with PD_HAVE_CUBLAS).
+    const bool wantCuda = args.backend == "cuda" || args.backend == "auto";
+    if (args.backend == "cpu") {
+        nn::gemmSetGpu(false);
+    } else if (wantCuda) {
+        _putenv_s("PD_CUBLAS", "1");
+        nn::gemmSetGpu(true);
+        if (!nn::gemmGpuEnabled()) {
+            if (args.backend == "cuda") {
+                std::fprintf(stderr,
+                             "--backend cuda unavailable: %s\n"
+                             "Install CUDA Toolkit, reconfigure/rebuild, then "
+                             "retry (or use --backend cpu).\n",
+                             nn::gemmCudaError());
+                return 1;
+            }
+            nn::gemmSetGpu(false);
+        }
+    }
+#else
+    if (args.backend == "cuda") {
+        std::fprintf(stderr, "--backend cuda is Windows-only; use --backend cpu\n");
+        return 1;
+    }
+    nn::gemmSetGpu(false);
+#endif
     std::cout << "PerfectDou CPP training\n";
-    const char* backend = args.backend == "cuda"
-                              ? "GPU (cuBLAS + CUDA kernels)"
-                              : nn::gemmGpuEnabled() ? nn::gemmGpuLabel() :
+    const char* backend = nn::gemmGpuEnabled() ? nn::gemmGpuLabel() :
 #ifdef __APPLE__
                           "CPU (Accelerate)";
 #else

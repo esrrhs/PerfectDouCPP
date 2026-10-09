@@ -18,7 +18,7 @@ jobs:
             os: ubuntu-latest
           - name: macOS (Clang / Accelerate)
             os: macos-latest
-          - name: Windows (MSVC / Direct3D 12)
+          - name: Windows (MSVC / CUDA-or-CPU)
             os: windows-latest
 
     steps:

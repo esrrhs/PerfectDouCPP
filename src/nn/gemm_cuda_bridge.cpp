@@ -162,18 +162,39 @@ bool loadApi() {
         std::snprintf(g_err, sizeof(g_err), "nvcuda.dll not found");
         return false;
     }
+    // Prefer CUDA 12.x on Pascal (GTX 10xx): Toolkit 13+ drops sm_61.
+    // Fall back to 13.x DLL names for Turing+ machines.
+    const char* cublasNames[] = {"cublas64_12.dll", "cublas64_13.dll", nullptr};
+    const char* nvrtcNames[] = {"nvrtc64_120_0.dll", "nvrtc64_130_0.dll",
+                                "nvrtc64_120_0.alt.dll", nullptr};
     const char* cuda = std::getenv("CUDA_PATH");
-    if (cuda && cuda[0]) {
+    auto loadFrom = [](const char* dir, const char* name) -> HMODULE {
+        if (!dir || !dir[0] || !name) return nullptr;
         char path[MAX_PATH];
-        std::snprintf(path, sizeof(path), "%s\\bin\\x64\\cublas64_13.dll", cuda);
-        g_api.cublas = LoadLibraryA(path);
-        std::snprintf(path, sizeof(path), "%s\\bin\\x64\\nvrtc64_130_0.dll", cuda);
-        g_api.nvrtc = LoadLibraryA(path);
+        std::snprintf(path, sizeof(path), "%s\\%s", dir, name);
+        return LoadLibraryA(path);
+    };
+    if (cuda && cuda[0]) {
+        char binX64[MAX_PATH], bin[MAX_PATH];
+        std::snprintf(binX64, sizeof(binX64), "%s\\bin\\x64", cuda);
+        std::snprintf(bin, sizeof(bin), "%s\\bin", cuda);
+        for (int i = 0; cublasNames[i] && !g_api.cublas; ++i) {
+            g_api.cublas = loadFrom(binX64, cublasNames[i]);
+            if (!g_api.cublas) g_api.cublas = loadFrom(bin, cublasNames[i]);
+        }
+        for (int i = 0; nvrtcNames[i] && !g_api.nvrtc; ++i) {
+            g_api.nvrtc = loadFrom(binX64, nvrtcNames[i]);
+            if (!g_api.nvrtc) g_api.nvrtc = loadFrom(bin, nvrtcNames[i]);
+        }
     }
-    if (!g_api.cublas) g_api.cublas = LoadLibraryA("cublas64_13.dll");
-    if (!g_api.nvrtc) g_api.nvrtc = LoadLibraryA("nvrtc64_130_0.dll");
+    for (int i = 0; cublasNames[i] && !g_api.cublas; ++i)
+        g_api.cublas = LoadLibraryA(cublasNames[i]);
+    for (int i = 0; nvrtcNames[i] && !g_api.nvrtc; ++i)
+        g_api.nvrtc = LoadLibraryA(nvrtcNames[i]);
     if (!g_api.cublas || !g_api.nvrtc) {
-        std::snprintf(g_err, sizeof(g_err), "cublas64_13.dll or nvrtc64_130_0.dll not found");
+        std::snprintf(g_err, sizeof(g_err),
+                      "cublas/nvrtc DLL not found (need CUDA 12.x for Pascal "
+                      "GTX 10xx, or 13.x for Turing+)");
         return false;
     }
     return loadOne(g_api.nvcuda, "cuInit", g_api.cuInit) &&
@@ -928,6 +949,11 @@ void cudaBridgeReset() {
 
 const char* cudaBridgeError() { return g_err; }
 
+bool cudaBridgeAvailable() {
+    std::lock_guard<std::mutex> lock(g_mu);
+    return ensureInit();
+}
+
 }  // namespace nn
 
 #else
@@ -945,6 +971,7 @@ bool cudaBridgeDtoH(ID3D12Device*, ID3D12Resource*, size_t, void*, size_t) { ret
 void cudaBridgeDrop(ID3D12Resource*) {}
 void cudaBridgeReset() {}
 const char* cudaBridgeError() { return "built without cuBLAS"; }
+bool cudaBridgeAvailable() { return false; }
 }  // namespace nn
 
 #endif

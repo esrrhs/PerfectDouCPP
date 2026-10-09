@@ -58,6 +58,9 @@ if(WIN32)
   target_link_libraries(perfectdou PUBLIC d3d12 dxgi d3dcompiler)
   find_path(CUDA_TOOLKIT_INCLUDE cuda.h
     HINTS "$ENV{CUDA_PATH}/include"
+          "C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v12.9/include"
+          "C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v12.8/include"
+          "C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v12.6/include"
           "C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v13.4/include")
   if(CUDA_TOOLKIT_INCLUDE)
     target_include_directories(perfectdou PRIVATE "${CUDA_TOOLKIT_INCLUDE}")
