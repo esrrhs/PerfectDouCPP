@@ -123,6 +123,17 @@ struct ThreadResult {
     RolloutStats stats;
 };
 
+enum PlayerType : uint8_t {
+    PLAYER_LATEST = 0,
+    PLAYER_HISTORICAL = 1,
+    PLAYER_RULE = 2
+};
+
+struct SeatAssignment {
+    PlayerType type = PLAYER_LATEST;
+    int histModelIdx = -1;
+};
+
 void runWorker(const ModelSet& models, const RolloutConfig& cfg, int nGames,
                uint64_t seed, ThreadResult& res) {
     using namespace nn;
@@ -148,17 +159,6 @@ void runWorker(const ModelSet& models, const RolloutConfig& cfg, int nGames,
 
     ActorInfer actorW[3];
     CriticInfer criticW[3];
-
-    enum PlayerType : uint8_t {
-        PLAYER_LATEST = 0,
-        PLAYER_HISTORICAL = 1,
-        PLAYER_RULE = 2
-    };
-
-    struct SeatAssignment {
-        PlayerType type = PLAYER_LATEST;
-        int histModelIdx = -1;
-    };
 
     std::vector<std::array<SeatAssignment, 3>> gameSeats(nGames);
     bool hasHistPool = cfg.historicalPool && !cfg.historicalPool->empty();
