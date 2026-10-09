@@ -69,3 +69,8 @@ vcpkg_installed/
 Testing/
 .cache/
 ckpt/
+ckpt_*/
+eval_runs/
+logs/
+third_party/
+baselines/**/*.ckpt

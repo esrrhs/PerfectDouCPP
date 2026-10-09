@@ -109,13 +109,30 @@ ctest --test-dir build          # 规则测试 + 神经网络数值梯度检查
 - **稳定指标**：ep（三座位实际完成的 Epoch 数，显示早停状态）、kl（末轮近似 KL 散度）、cf（PPO Clip 触发比例）；
 - **收益规模**：ret（三座位平均累积回报）、n（三座位样本数量）。
 
+## 对 DouZero-ADP 周期性评测
+
+训练写盘的同时，可用 `tools/eval_vs_douzero_loop.py` 每隔一段时间复制模型、在
+CPU 上与公开 DouZero-ADP 对打（每副牌打两次并互换角色），把 WP/ADP 追加到 CSV
+并刷新带拟合线的曲线图。依赖：本仓库的 `perfectdou_eval`、DouZero 源码、
+`baselines/douzero_ADP/*.ckpt`、Python 包 `torch`/`numpy`/`matplotlib`。用法见
+脚本顶部 docstring。
+
+```bash
+# 需先准备 third_party/DouZero 与 baselines/douzero_ADP/{landlord,landlord_up,landlord_down}.ckpt
+export PYTHONPATH=third_party/DouZero   # Windows: set PYTHONPATH=...
+python tools/eval_vs_douzero_loop.py \
+    --train-dir ckpt_long --out-dir eval_runs \
+    --interval-sec 600 --decks 100
+```
+
 ## 目录结构
 
 ```
 src/ddz/      牌、牌型识别/生成、621 动作空间、oracle、对局、特征
 src/nn/       矩阵运算、Linear/ReLU/LSTM、演员/评论家、Adam、模型存取
 src/algo/     批量自对弈 rollout、GAE、PPO 更新
-src/          训练入口 train.cpp
+src/          训练入口 train.cpp；Windows 另有 eval_douzero.cpp
+tools/        DouZero TCP 服务与周期性评测脚本
 tests/        规则单测（随机自对弈校验）与数值梯度检查
 ```
 
