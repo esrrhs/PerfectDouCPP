@@ -60,7 +60,9 @@ ctest --test-dir build          # 规则测试 + 神经网络数值梯度检查
 --epochs N          每批数据 PPO epoch 数（论文未披露；默认采用 PPO2 常见值 4）
 --mb N              minibatch（论文 batch size 1024，8 卡时每卡 128；单机默认 1024）
 --buffer N          rollout 队列深度（默认 1，对齐论文最大模型延迟 1）
---lr/--ent           学习率（默认 3e-4）和熵系数（默认 0.1）
+--lr/--ent           初始学习率（默认 3e-4）和熵系数（默认 0.1），默认按余弦曲线退火
+--no-lr-decay       禁用学习率余弦退火（保持固定学习率）
+--no-ent-decay      禁用熵系数余弦退火（保持固定熵系数）
 --clip N            PPO clip（默认 0.2）
 --snapshot-every K  每 K 轮落盘，最后一轮必存
 --resume DIR        从 actor{0,1,2}.bin / critic{0,1,2}.bin 继续

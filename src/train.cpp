@@ -54,6 +54,8 @@ struct Args {
     float lr = 3e-4f;
     float clip = 0.2f;
     float ent = 0.1f;
+    bool lrDecay = true;
+    bool entDecay = true;
     uint64_t seed = 1;
     std::string out = "ckpt";
     std::string resume;
@@ -86,6 +88,8 @@ void parseArgs(int argc, char** argv, Args& a) {
     a.lr = float(std::atof(argValue(argc, argv, "--lr", "3e-4")));
     a.clip = float(std::atof(argValue(argc, argv, "--clip", "0.2")));
     a.ent = float(std::atof(argValue(argc, argv, "--ent", "0.1")));
+    if (hasFlag(argc, argv, "--no-lr-decay")) a.lrDecay = false;
+    if (hasFlag(argc, argv, "--no-ent-decay")) a.entDecay = false;
     a.seed = std::atoll(argValue(argc, argv, "--seed", "1"));
     a.out = argValue(argc, argv, "--out", "ckpt");
     a.backend = argValue(argc, argv, "--backend", "auto");
@@ -124,9 +128,9 @@ int main(int argc, char** argv) {
               << " epochs=" << args.epochs
               << " hidden=" << args.hidden
               << " lstm=" << args.lstmHidden
-              << " lr=" << args.lr
+              << " lr=" << args.lr << (args.lrDecay ? " (cosine)" : " (fixed)")
               << " clip=" << args.clip
-              << " ent=" << args.ent
+              << " ent=" << args.ent << (args.entDecay ? " (cosine)" : " (fixed)")
               << " target=terminal-adp"
               << " seed=" << args.seed << std::endl;
 
@@ -202,6 +206,25 @@ int main(int argc, char** argv) {
             double rollSecs = std::chrono::duration<double>(
                                   std::chrono::steady_clock::now() - wall0)
                                   .count();
+            float progress = args.updates > 1
+                                 ? float(upd - 1) / float(args.updates - 1)
+                                 : 0.0f;
+            float currentLr = args.lr;
+            if (args.lrDecay) {
+                const float minLr = 1e-5f;
+                currentLr = minLr + 0.5f * (args.lr - minLr) *
+                                        (1.0f + std::cos(progress * 3.141592653589793f));
+            }
+            if (args.entDecay) {
+                const float minEnt = 0.01f;
+                ppo.entCoef = minEnt + 0.5f * (args.ent - minEnt) *
+                                           (1.0f + std::cos(progress * 3.141592653589793f));
+            }
+            for (int s = 0; s < 3; ++s) {
+                aOpt[s].lr = currentLr;
+                cOpt[s].lr = currentLr;
+            }
+
             auto t1 = std::chrono::steady_clock::now();
             auto learnSeats = [&](unsigned mask) {
                 unsigned failed = 0;
@@ -246,8 +269,8 @@ int main(int argc, char** argv) {
             double adp = double(rs.landlordScore) / std::max(1, rs.games);
             std::printf(
                 "upd %4d | wall %.1fs rollout %.1fs learn %.1fs threads 1 | "
-                "WP %.3f ADP %7.2f | ent %5.3f/%5.3f/%5.3f | n %lld/%lld/%lld\n",
-                upd, wallSecs, rollSecs, learnSecs, wp, adp, ps[0].entropy,
+                "WP %.3f ADP %7.2f | lr %.2e ent %5.3f/%5.3f/%5.3f | n %lld/%lld/%lld\n",
+                upd, wallSecs, rollSecs, learnSecs, wp, adp, currentLr, ps[0].entropy,
                 ps[1].entropy, ps[2].entropy, rs.transitions[0],
                 rs.transitions[1], rs.transitions[2]);
             std::fflush(stdout);
@@ -447,6 +470,25 @@ int main(int argc, char** argv) {
         double rollSecs = sample.rollSecs;
         auto t1 = std::chrono::steady_clock::now();
 
+        float progress = args.updates > 1
+                             ? float(upd - 1) / float(args.updates - 1)
+                             : 0.0f;
+        float currentLr = args.lr;
+        if (args.lrDecay) {
+            const float minLr = 1e-5f;
+            currentLr = minLr + 0.5f * (args.lr - minLr) *
+                                    (1.0f + std::cos(progress * 3.141592653589793f));
+        }
+        if (args.entDecay) {
+            const float minEnt = 0.01f;
+            ppo.entCoef = minEnt + 0.5f * (args.ent - minEnt) *
+                                       (1.0f + std::cos(progress * 3.141592653589793f));
+        }
+        for (int s = 0; s < 3; ++s) {
+            aOpt[s].lr = currentLr;
+            cOpt[s].lr = currentLr;
+        }
+
         {
             std::lock_guard<std::mutex> lock(job.mu);
             job.upd = upd;
@@ -513,11 +555,11 @@ int main(int argc, char** argv) {
         std::printf(
             "upd %4d | q %d/%d left %d end %d | wall %.1fs rollout %.1fs learn %.1fs "
             "games %d mb %d epochs %d threads %d | WP %.3f ADP %7.2f bomb/g %.2f "
-            "moves/g %.1f | ent %5.3f/%5.3f/%5.3f vL %7.2f/%7.2f/%7.2f "
+            "moves/g %.1f | lr %.2e ent %5.3f/%5.3f/%5.3f vL %7.2f/%7.2f/%7.2f "
             "ret %7.1f/%7.1f/%7.1f | n %lld/%lld/%lld\n",
             upd, qReady, buf.cap, qLeft, qEnd, wallSecs, rollSecs, learnSecs,
             rs.games, args.minibatch, args.epochs, args.threads, wp, adp, bpg, mpg,
-            ps[0].entropy, ps[1].entropy, ps[2].entropy,
+            currentLr, ps[0].entropy, ps[1].entropy, ps[2].entropy,
             ps[0].vLoss, ps[1].vLoss, ps[2].vLoss,
             ps[0].meanRet, ps[1].meanRet, ps[2].meanRet,
             rs.transitions[0], rs.transitions[1], rs.transitions[2]);
