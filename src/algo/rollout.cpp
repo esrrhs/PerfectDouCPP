@@ -178,7 +178,7 @@ void runWorker(const ModelSet& models, const RolloutConfig& cfg, int nGames,
                 if (hasRecent && hasArchive) {
                     float subR = float((dealRng.nextU64() >> 11) / double(1ULL << 53));
                     pickArchive = (subR < 0.3f);
-                } else if (!hasRecent) {
+                } else if (hasArchive) {
                     pickArchive = true;
                 }
                 if (pickArchive) {

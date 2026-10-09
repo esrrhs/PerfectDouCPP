@@ -203,7 +203,7 @@ int main(int argc, char** argv) {
                             ES_AWAYMODE_REQUIRED);
 #endif
 
-    algo::HistoricalPool histPool;
+    std::shared_ptr<const algo::HistoricalPool> histPool = std::make_shared<algo::HistoricalPool>();
     std::mutex histPoolMu;
     auto pushHistPool = [&](std::array<nn::Actor, 3>& srcActor, int currentUpdate) {
         auto snap = std::make_shared<algo::HistoricalActorSnapshot>();
@@ -216,25 +216,24 @@ int main(int argc, char** argv) {
             snap->actor[s].prepareInference();
         }
         std::lock_guard<std::mutex> lock(histPoolMu);
+        auto newPool = std::make_shared<algo::HistoricalPool>(*histPool);
         // 1. Check if snapshot qualifies for long-term geometric/exponential archive
-        // Qualifying rule: first update, or update number is a power-of-two multiple of poolEvery
-        // (e.g. 1*poolEvery, 2*poolEvery, 4*poolEvery, 8*poolEvery, 16*poolEvery...), or every 100 updates
         int k = args.poolEvery > 0 ? (currentUpdate / args.poolEvery) : 0;
         bool isPowerOfTwo = (k > 0) && ((k & (k - 1)) == 0);
         bool isCentennial = (currentUpdate % 100 == 0);
-        if (isPowerOfTwo || isCentennial || histPool.archive.empty()) {
-            if ((int)histPool.archive.size() >= args.archiveSize) {
-                // If archive full, replace the oldest non-milestone or erase index 0
-                histPool.archive.erase(histPool.archive.begin());
+        if (isPowerOfTwo || isCentennial || newPool->archive.empty()) {
+            if ((int)newPool->archive.size() >= args.archiveSize) {
+                newPool->archive.erase(newPool->archive.begin());
             }
-            histPool.archive.push_back(snap);
+            newPool->archive.push_back(snap);
         }
 
         // 2. Add to recent rolling FIFO pool
-        if ((int)histPool.recent.size() >= args.poolSize) {
-            histPool.recent.erase(histPool.recent.begin());
+        if ((int)newPool->recent.size() >= args.poolSize) {
+            newPool->recent.erase(newPool->recent.begin());
         }
-        histPool.recent.push_back(std::move(snap));
+        newPool->recent.push_back(std::move(snap));
+        std::atomic_store(&histPool, std::shared_ptr<const algo::HistoricalPool>(newPool));
     };
 
     if (std::getenv("PD_SINGLE_THREAD")) {
@@ -252,7 +251,8 @@ int main(int argc, char** argv) {
             rc.seed = args.seed + uint64_t(upd) * 7919ULL;
             rc.historicalProb = args.histProb;
             rc.ruleProb = args.ruleProb;
-            rc.historicalPool = &histPool;
+            auto snapPool = std::atomic_load(&histPool);
+            rc.historicalPool = snapPool.get();
             algo::RolloutStats rs;
             auto wall0 = std::chrono::steady_clock::now();
             // collectRollout appends. A fresh Sample in the pipelined path
@@ -484,10 +484,8 @@ int main(int argc, char** argv) {
             rc.seed = args.seed + uint64_t(chunk + 1) * 7919ULL;
             rc.historicalProb = args.histProb;
             rc.ruleProb = args.ruleProb;
-            {
-                std::lock_guard<std::mutex> lock(histPoolMu);
-                rc.historicalPool = &histPool;
-            }
+            auto snapPool = std::atomic_load(&histPool);
+            rc.historicalPool = snapPool.get();
             Sample sample;
             auto t0 = std::chrono::steady_clock::now();
             algo::collectRollout(models, rc, sample.streams, sample.stats);
