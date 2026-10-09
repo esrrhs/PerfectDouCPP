@@ -58,6 +58,10 @@ struct Args {
     float lambda = 0.95f;
     bool lrDecay = true;
     bool entDecay = true;
+    int poolSize = 16;
+    int poolEvery = 20;
+    float histProb = 0.2f;
+    float ruleProb = 0.1f;
     uint64_t seed = 1;
     std::string out = "ckpt";
     std::string resume;
@@ -94,6 +98,10 @@ void parseArgs(int argc, char** argv, Args& a) {
     a.lambda = float(std::atof(argValue(argc, argv, "--lambda", "0.95")));
     if (hasFlag(argc, argv, "--no-lr-decay")) a.lrDecay = false;
     if (hasFlag(argc, argv, "--no-ent-decay")) a.entDecay = false;
+    a.poolSize = std::atoi(argValue(argc, argv, "--pool-size", "16"));
+    a.poolEvery = std::atoi(argValue(argc, argv, "--pool-every", "20"));
+    a.histProb = float(std::atof(argValue(argc, argv, "--historical-prob", "0.2")));
+    a.ruleProb = float(std::atof(argValue(argc, argv, "--rule-prob", "0.1")));
     a.seed = std::atoll(argValue(argc, argv, "--seed", "1"));
     a.out = argValue(argc, argv, "--out", "ckpt");
     a.backend = argValue(argc, argv, "--backend", "auto");
@@ -136,6 +144,8 @@ int main(int argc, char** argv) {
               << " clip=" << args.clip
               << " ent=" << args.ent << (args.entDecay ? " (cosine)" : " (fixed)")
               << " gae(gamma=" << args.gamma << ",lambda=" << args.lambda << ")"
+              << " league(pool=" << args.poolSize << ",every=" << args.poolEvery
+              << ",hist=" << args.histProb << ",rule=" << args.ruleProb << ")"
               << " target=terminal-adp"
               << " seed=" << args.seed << std::endl;
 
@@ -190,6 +200,24 @@ int main(int argc, char** argv) {
                             ES_AWAYMODE_REQUIRED);
 #endif
 
+    std::vector<std::shared_ptr<algo::HistoricalActorSnapshot>> histPool;
+    std::mutex histPoolMu;
+    auto pushHistPool = [&](std::array<nn::Actor, 3>& srcActor) {
+        auto snap = std::make_shared<algo::HistoricalActorSnapshot>();
+        for (int s = 0; s < 3; ++s) {
+            snap->actor[s].init(cfg, 1);
+            auto da = snap->actor[s].params();
+            auto sa = srcActor[s].params();
+            for (size_t i = 0; i < sa.size(); ++i) da[i]->w = sa[i]->w;
+            snap->actor[s].prepareInference();
+        }
+        std::lock_guard<std::mutex> lock(histPoolMu);
+        if ((int)histPool.size() >= args.poolSize) {
+            histPool.erase(histPool.begin());
+        }
+        histPool.push_back(std::move(snap));
+    };
+
     if (std::getenv("PD_SINGLE_THREAD")) {
         std::fprintf(stderr, "single-thread: rollout and learn on this thread\n");
         std::fflush(stderr);
@@ -203,6 +231,9 @@ int main(int argc, char** argv) {
             rc.gamesPerUpdate = args.games;
             rc.threads = 1;
             rc.seed = args.seed + uint64_t(upd) * 7919ULL;
+            rc.historicalProb = args.histProb;
+            rc.ruleProb = args.ruleProb;
+            rc.historicalPool = &histPool;
             algo::RolloutStats rs;
             auto wall0 = std::chrono::steady_clock::now();
             // collectRollout appends. A fresh Sample in the pipelined path
@@ -281,6 +312,9 @@ int main(int argc, char** argv) {
                 ps[1].entropy, ps[2].entropy, rs.transitions[0],
                 rs.transitions[1], rs.transitions[2]);
             std::fflush(stdout);
+            if (args.poolEvery > 0 && upd % args.poolEvery == 0) {
+                pushHistPool(actor);
+            }
         }
         saveAll(args.out);
         std::cout << "models saved to " << args.out << "/\n";
@@ -429,6 +463,12 @@ int main(int argc, char** argv) {
             rc.gamesPerUpdate = args.games;
             rc.threads = args.threads;
             rc.seed = args.seed + uint64_t(chunk + 1) * 7919ULL;
+            rc.historicalProb = args.histProb;
+            rc.ruleProb = args.ruleProb;
+            {
+                std::lock_guard<std::mutex> lock(histPoolMu);
+                rc.historicalPool = &histPool;
+            }
             Sample sample;
             auto t0 = std::chrono::steady_clock::now();
             algo::collectRollout(models, rc, sample.streams, sample.stats);
@@ -572,6 +612,9 @@ int main(int argc, char** argv) {
             rs.transitions[0], rs.transitions[1], rs.transitions[2]);
         std::fflush(stdout);
 
+        if (args.poolEvery > 0 && upd % args.poolEvery == 0) {
+            pushHistPool(actor);
+        }
         if (args.snapshotEvery > 0 &&
             (upd % args.snapshotEvery == 0 || upd == args.updates)) {
             saveAll(args.out);

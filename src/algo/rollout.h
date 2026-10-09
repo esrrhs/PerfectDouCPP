@@ -7,6 +7,7 @@
 
 #include <array>
 #include <cstdint>
+#include <memory>
 #include <utility>
 #include <vector>
 
@@ -48,13 +49,22 @@ struct ModelSet {
     std::array<nn::Critic*, 3> critic{};
 };
 
+struct HistoricalActorSnapshot {
+    std::array<nn::Actor, 3> actor;
+};
+
 struct RolloutConfig {
     int gamesPerUpdate = 256;
     int threads = 4;
     uint64_t seed = 1;
+    // League opponent ratios
+    float historicalProb = 0.2f;  // Probability of facing a historical model snapshot
+    float ruleProb = 0.1f;        // Probability of facing heuristic rule agent
+    // Pointer to read-only historical pool (if available)
+    const std::vector<std::shared_ptr<HistoricalActorSnapshot>>* historicalPool = nullptr;
 };
 
-// Runs self-play games using the current models.
+// Runs self-play / league games using the current models, historical pool, and rule agent.
 void collectRollout(const ModelSet& models, const RolloutConfig& cfg,
                     std::array<std::vector<Transition>, 3>& out,
                     RolloutStats& stats);

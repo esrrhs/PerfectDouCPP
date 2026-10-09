@@ -12,6 +12,7 @@
 #include "ddz/game.h"
 #include "ddz/moves.h"
 #include "ddz/oracle.h"
+#include "ddz/rule_agent.h"
 #include "algo/ppo.h"
 #include "nn/net.h"
 
@@ -392,6 +393,35 @@ static void testFeatures() {
     }
 }
 
+static void testRuleAgent() {
+    Game g;
+    Rng rng(42);
+    g.deal(rng);
+
+    // Play full game where all players are RuleAgents
+    int steps = 0;
+    while (!g.over && steps < 200) {
+        int seat = g.turn;
+        std::vector<CardSet> legal = g.legal();
+        CHECK(!legal.empty());
+        CardSet chosen = RuleAgent::selectMove(g, seat, legal);
+
+        // Verification: chosen move must be within legal moves
+        bool found = false;
+        for (const CardSet& m : legal) {
+            if (m == chosen) {
+                found = true;
+                break;
+            }
+        }
+        CHECK(found);
+        g.step(chosen);
+        ++steps;
+    }
+    CHECK(g.over);
+    CHECK(steps > 0);
+}
+
 int main() {
     std::printf("testDetect...\n"); testDetect();
     std::printf("testActionSpace...\n"); testActionSpace();
@@ -403,6 +433,7 @@ int main() {
     std::printf("testDouzeroFeatures...\n"); testDouzeroFeatures();
     std::printf("testRandomGames...\n"); testRandomGames();
     std::printf("testFeatures...\n"); testFeatures();
+    std::printf("testRuleAgent...\n"); testRuleAgent();
     std::printf("ALL TESTS PASSED\n");
     return 0;
 }

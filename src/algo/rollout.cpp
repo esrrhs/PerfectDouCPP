@@ -7,6 +7,7 @@
 #include <thread>
 
 #include "ddz/oracle.h"
+#include "ddz/rule_agent.h"
 
 namespace algo {
 
@@ -148,7 +149,45 @@ void runWorker(const ModelSet& models, const RolloutConfig& cfg, int nGames,
     ActorInfer actorW[3];
     CriticInfer criticW[3];
 
-    for (int gi = 0; gi < nGames; ++gi) games[gi].deal(dealRng);
+    enum PlayerType : uint8_t {
+        PLAYER_LATEST = 0,
+        PLAYER_HISTORICAL = 1,
+        PLAYER_RULE = 2
+    };
+
+    struct SeatAssignment {
+        PlayerType type = PLAYER_LATEST;
+        int histModelIdx = -1;
+    };
+
+    std::vector<std::array<SeatAssignment, 3>> gameSeats(nGames);
+    bool hasHistPool = cfg.historicalPool && !cfg.historicalPool->empty();
+
+    for (int gi = 0; gi < nGames; ++gi) {
+        games[gi].deal(dealRng);
+        for (int s = 0; s < 3; ++s) {
+            float r = float((dealRng.nextU64() >> 11) / double(1ULL << 53));
+            if (r < cfg.ruleProb) {
+                gameSeats[gi][s].type = PLAYER_RULE;
+            } else if (hasHistPool && r < (cfg.ruleProb + cfg.historicalProb)) {
+                gameSeats[gi][s].type = PLAYER_HISTORICAL;
+                int nPool = static_cast<int>(cfg.historicalPool->size());
+                gameSeats[gi][s].histModelIdx = int(dealRng.nextU64() % uint64_t(nPool));
+            } else {
+                gameSeats[gi][s].type = PLAYER_LATEST;
+            }
+        }
+        // Ensure at least one seat per game is PLAYER_LATEST so games always produce training data
+        bool anyLatest = false;
+        for (int s = 0; s < 3; ++s) {
+            if (gameSeats[gi][s].type == PLAYER_LATEST) anyLatest = true;
+        }
+        if (!anyLatest) {
+            int pick = int(dealRng.nextU64() % 3);
+            gameSeats[gi][pick].type = PLAYER_LATEST;
+            gameSeats[gi][pick].histModelIdx = -1;
+        }
+    }
 
     auto encodeTransition = [&](const Game& g,
                                 const std::vector<LegalOption>& options) {
@@ -165,85 +204,218 @@ void runWorker(const ModelSet& models, const RolloutConfig& cfg, int nGames,
         return t;
     };
 
+    auto chooseAction = [&](const Mat& logits, const std::vector<LegalOption>& opts,
+                            int batchRow) {
+        float mx = -1e30f;
+        for (int a = 0; a < kNumActions; ++a)
+            mx = std::max(mx, logits.row(batchRow)[a]);
+        float probs[kNumActions];
+        float sum = 0.0f;
+        for (int a = 0; a < kNumActions; ++a) {
+            probs[a] = expf(logits.row(batchRow)[a] - mx);
+            sum += probs[a];
+        }
+        float draw = float((sampleRng.nextU64() >> 11) / double(1ULL << 53));
+        int chosenId = opts.front().abstractId;
+        float acc = 0.0f;
+        for (const LegalOption& o : opts) {
+            float p = probs[o.abstractId] / sum;
+            acc += p;
+            chosenId = o.abstractId;
+            if (acc >= draw) break;
+        }
+        float logp = std::log(std::max(probs[chosenId] / sum, 1e-12f));
+        return std::make_pair(chosenId, logp);
+    };
+
     int remaining = nGames;
     while (remaining > 0) {
         for (int seat = 0; seat < 3; ++seat) {
-            std::vector<int> idxs;
-            for (int gi = 0; gi < nGames; ++gi)
-                if (active[gi] && games[gi].turn == seat) idxs.push_back(gi);
-            if (idxs.empty()) continue;
-            int B = static_cast<int>(idxs.size());
+            // Group active games waiting on this seat by player type
+            std::vector<int> latestGis;
+            std::vector<int> ruleGis;
+            // Historical games grouped by their snapshot index
+            std::vector<std::pair<int, int>> histGis;  // (gi, histModelIdx)
 
-            std::vector<Transition> tr(B);
-            std::vector<const LegalOption*> chosen(B, nullptr);
-            std::vector<std::vector<LegalOption>> options(B);
-            for (int i = 0; i < B; ++i) {
-                const Game& g = games[idxs[i]];
-                options[i] = legalOptions(g);
-                if ((int)options[i].size() > kNumActions) {
-                    std::fprintf(stderr, "legal moves %d exceed logit width %d\n",
-                                 (int)options[i].size(), kNumActions);
-                    std::abort();
+            for (int gi = 0; gi < nGames; ++gi) {
+                if (active[gi] && games[gi].turn == seat) {
+                    PlayerType pt = gameSeats[gi][seat].type;
+                    if (pt == PLAYER_LATEST) {
+                        latestGis.push_back(gi);
+                    } else if (pt == PLAYER_RULE) {
+                        ruleGis.push_back(gi);
+                    } else {
+                        histGis.emplace_back(gi, gameSeats[gi][seat].histModelIdx);
+                    }
                 }
-                tr[i] = encodeTransition(g, options[i]);
-                tr[i].gameId = idxs[i];
             }
 
-            std::vector<Transition*> ptrs(B);
-            for (int i = 0; i < B; ++i) ptrs[i] = &tr[i];
-            Mat xImp, seq, actionFeat, actionSample, actionId, actionOffset, extra;
-            buildBatch(ptrs, xImp, seq, actionFeat, actionSample, actionId,
-                       actionOffset, extra);
+            // 1. Process latest players (batched neural forward, transitions recorded)
+            if (!latestGis.empty()) {
+                int B = static_cast<int>(latestGis.size());
+                std::vector<Transition> tr(B);
+                std::vector<const LegalOption*> chosen(B, nullptr);
+                std::vector<std::vector<LegalOption>> options(B);
+                for (int i = 0; i < B; ++i) {
+                    const Game& g = games[latestGis[i]];
+                    options[i] = legalOptions(g);
+                    if ((int)options[i].size() > kNumActions) {
+                        std::fprintf(stderr, "legal moves %d exceed logit width %d\n",
+                                     (int)options[i].size(), kNumActions);
+                        std::abort();
+                    }
+                    tr[i] = encodeTransition(g, options[i]);
+                    tr[i].gameId = latestGis[i];
+                }
 
-            const Mat& logits = actorInferForward(*models.actor[seat],
-                                                  actorW[seat], xImp, seq,
-                                                  actionFeat, actionSample,
-                                                  actionId, actionOffset);
-            const Mat& values = criticInferForward(*models.critic[seat],
-                                                   criticW[seat], xImp, seq,
-                                                   extra);
-            for (int i = 0; i < B; ++i) {
-                if (options[i].empty()) {
-                    std::fprintf(stderr, "empty options B=%d i=%d seat=%d hand=%s\n",
-                                 B, i, seat,
-                                 games[idxs[i]].hand[seat].str().c_str());
-                    std::abort();
+                std::vector<Transition*> ptrs(B);
+                for (int i = 0; i < B; ++i) ptrs[i] = &tr[i];
+                Mat xImp, seq, actionFeat, actionSample, actionId, actionOffset, extra;
+                buildBatch(ptrs, xImp, seq, actionFeat, actionSample, actionId,
+                           actionOffset, extra);
+
+                const Mat& logits = actorInferForward(*models.actor[seat],
+                                                      actorW[seat], xImp, seq,
+                                                      actionFeat, actionSample,
+                                                      actionId, actionOffset);
+                const Mat& values = criticInferForward(*models.critic[seat],
+                                                       criticW[seat], xImp, seq,
+                                                       extra);
+                for (int i = 0; i < B; ++i) {
+                    if (options[i].empty()) {
+                        std::fprintf(stderr, "empty options B=%d i=%d seat=%d hand=%s\n",
+                                     B, i, seat,
+                                     games[latestGis[i]].hand[seat].str().c_str());
+                        std::abort();
+                    }
+                    auto [chosenId, logp] = chooseAction(logits, options[i], i);
+                    tr[i].action = chosenId;
+                    tr[i].logp = logp;
+                    tr[i].value = values.row(i)[0];
+                    for (const LegalOption& o : options[i]) {
+                        if (o.abstractId == chosenId) chosen[i] = &o;
+                    }
                 }
-                // masked softmax + categorical sampling
-                float mx = -1e30f;
-                for (int a = 0; a < kNumActions; ++a)
-                    mx = std::max(mx, logits.row(i)[a]);
-                float probs[kNumActions];
-                float sum = 0.0f;
-                for (int a = 0; a < kNumActions; ++a) {
-                    probs[a] = expf(logits.row(i)[a] - mx);
-                    sum += probs[a];
+
+                for (int i = 0; i < B; ++i) {
+                    int gi = latestGis[i];
+                    Game& g = games[gi];
+                    const CardSet& concrete = chosen[i]->concrete;
+
+                    int storedIndex = static_cast<int>(res.seats[seat].size());
+                    res.seats[seat].push_back(std::move(tr[i]));
+                    lastIdx[seat][gi] = storedIndex;
+
+                    g.step(concrete);
+                    res.stats.moves += 1;
+                    if (isBombLike(concrete)) res.stats.bombs += 1;
+
+                    if (g.over) {
+                        active[gi] = false;
+                        --remaining;
+                        ++res.stats.games;
+                        if (g.winner == 0) ++res.stats.landlordWins;
+                        double mult = std::pow(2.0, g.bombCount);
+                        long long scoreLL = g.winner == 0
+                                               ? llround(2.0 * mult)
+                                               : -llround(2.0 * mult);
+                        res.stats.landlordScore += scoreLL;
+                        for (int s = 0; s < 3; ++s) {
+                            int idx = lastIdx[s][gi];
+                            if (idx >= 0) {
+                                auto& t = res.seats[s][idx];
+                                t.reward += float(g.payoff(s)) + g.shaping(s);
+                                t.terminal = true;
+                            }
+                        }
+                    }
                 }
-                float draw = float((sampleRng.nextU64() >> 11) /
-                                   double(1ULL << 53));
-                int chosenId = options[i].front().abstractId;
-                float acc = 0.0f;
-                for (const LegalOption& o : options[i]) {
-                    float p = probs[o.abstractId] / sum;
-                    acc += p;
-                    chosenId = o.abstractId;
-                    if (acc >= draw) break;
-                }
-                tr[i].action = chosenId;
-                tr[i].logp = std::log(std::max(probs[chosenId] / sum, 1e-12f));
-                tr[i].value = values.row(i)[0];
-                for (const LegalOption& o : options[i])
-                    if (o.abstractId == chosenId) chosen[i] = &o;
             }
 
-            for (int i = 0; i < B; ++i) {
-                int gi = idxs[i];
+            // 2. Process historical model players (inference only, not recorded into training stream)
+            if (!histGis.empty()) {
+                // Group by snapshot index to batch inference per historical model
+                std::sort(histGis.begin(), histGis.end(),
+                          [](const auto& a, const auto& b) {
+                              return a.second < b.second;
+                          });
+
+                size_t start = 0;
+                while (start < histGis.size()) {
+                    size_t end = start + 1;
+                    while (end < histGis.size() && histGis[end].second == histGis[start].second) {
+                        ++end;
+                    }
+                    int mIdx = histGis[start].second;
+                    int subB = static_cast<int>(end - start);
+                    const nn::Actor& histActor = (*cfg.historicalPool)[mIdx]->actor[seat];
+                    ActorInfer histInfer;
+
+                    std::vector<Transition> hTr(subB);
+                    std::vector<std::vector<LegalOption>> hOpts(subB);
+                    for (int i = 0; i < subB; ++i) {
+                        int gi = histGis[start + i].first;
+                        const Game& g = games[gi];
+                        hOpts[i] = legalOptions(g);
+                        hTr[i] = encodeTransition(g, hOpts[i]);
+                    }
+                    std::vector<Transition*> ptrs(subB);
+                    for (int i = 0; i < subB; ++i) ptrs[i] = &hTr[i];
+                    Mat xImp, seq, actionFeat, actionSample, actionId, actionOffset, extra;
+                    buildBatch(ptrs, xImp, seq, actionFeat, actionSample, actionId,
+                               actionOffset, extra);
+
+                    const Mat& logits = actorInferForward(histActor, histInfer,
+                                                          xImp, seq, actionFeat,
+                                                          actionSample, actionId,
+                                                          actionOffset);
+
+                    for (int i = 0; i < subB; ++i) {
+                        int gi = histGis[start + i].first;
+                        Game& g = games[gi];
+                        auto [chosenId, logp] = chooseAction(logits, hOpts[i], i);
+                        (void)logp;
+                        CardSet concrete;
+                        for (const LegalOption& o : hOpts[i]) {
+                            if (o.abstractId == chosenId) {
+                                concrete = o.concrete;
+                                break;
+                            }
+                        }
+
+                        g.step(concrete);
+                        res.stats.moves += 1;
+                        if (isBombLike(concrete)) res.stats.bombs += 1;
+
+                        if (g.over) {
+                            active[gi] = false;
+                            --remaining;
+                            ++res.stats.games;
+                            if (g.winner == 0) ++res.stats.landlordWins;
+                            double mult = std::pow(2.0, g.bombCount);
+                            long long scoreLL = g.winner == 0
+                                                   ? llround(2.0 * mult)
+                                                   : -llround(2.0 * mult);
+                            res.stats.landlordScore += scoreLL;
+                            for (int s = 0; s < 3; ++s) {
+                                int idx = lastIdx[s][gi];
+                                if (idx >= 0) {
+                                    auto& t = res.seats[s][idx];
+                                    t.reward += float(g.payoff(s)) + g.shaping(s);
+                                    t.terminal = true;
+                                }
+                            }
+                        }
+                    }
+                    start = end;
+                }
+            }
+
+            // 3. Process heuristic rule agents (fast C++ heuristic rule evaluation)
+            for (int gi : ruleGis) {
                 Game& g = games[gi];
-                const CardSet& concrete = chosen[i]->concrete;
-
-                int storedIndex = static_cast<int>(res.seats[seat].size());
-                res.seats[seat].push_back(std::move(tr[i]));
-                lastIdx[seat][gi] = storedIndex;
+                std::vector<CardSet> legalMoves = g.legal();
+                CardSet concrete = RuleAgent::selectMove(g, seat, legalMoves);
 
                 g.step(concrete);
                 res.stats.moves += 1;
@@ -253,14 +425,12 @@ void runWorker(const ModelSet& models, const RolloutConfig& cfg, int nGames,
                     active[gi] = false;
                     --remaining;
                     ++res.stats.games;
-                    res.stats.moves += 0;
                     if (g.winner == 0) ++res.stats.landlordWins;
                     double mult = std::pow(2.0, g.bombCount);
                     long long scoreLL = g.winner == 0
                                            ? llround(2.0 * mult)
                                            : -llround(2.0 * mult);
                     res.stats.landlordScore += scoreLL;
-                    // each seat receives the terminal ADP on its last decision
                     for (int s = 0; s < 3; ++s) {
                         int idx = lastIdx[s][gi];
                         if (idx >= 0) {
