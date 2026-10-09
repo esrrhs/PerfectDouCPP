@@ -44,7 +44,13 @@ inline void zeroN(float* c, int n) {
     for (; j < n; ++j) c[j] = 0.0f;
 }
 
-inline void saxpy(float* __restrict__ c, const float* __restrict__ b, float a,
+#if defined(_MSC_VER)
+#define PD_RESTRICT __restrict
+#else
+#define PD_RESTRICT __restrict__
+#endif
+
+inline void saxpy(float* PD_RESTRICT c, const float* PD_RESTRICT b, float a,
                   int n) {
     const __m256 va = _mm256_set1_ps(a);
     int j = 0;

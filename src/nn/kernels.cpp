@@ -54,14 +54,16 @@ bool d3dLstmSeqBwd(const Mat& ghAll, const Mat& gpre, const Mat& statesC,
 #endif
 void PD_BE(Concat)(Mat& z, const Mat& a, int n1, const Mat& b, int n2);
 void PD_BE(Split)(const Mat& z, int n1, Mat& a, Mat& b, int n2);
-void PD_BE(RaggedConcat)(Mat& z, const Mat& node, const Mat& action,
-                         const Mat& sample);
-void PD_BE(RaggedNodeReduce)(Mat& nodeGrad, const Mat& concatGrad,
-                             const Mat& offset, int nodeCols);
-void PD_BE(RaggedScatter)(Mat& logits, const Mat& scores, const Mat& sample,
-                          const Mat& actionId, int batch, int actions);
-void PD_BE(RaggedGather)(Mat& scores, const Mat& logits, const Mat& sample,
-                         const Mat& actionId);
+#if defined(PD_HAVE_D3D)
+void d3dRaggedConcat(Mat& z, const Mat& node, const Mat& action,
+                     const Mat& sample);
+void d3dRaggedNodeReduce(Mat& nodeGrad, const Mat& concatGrad,
+                         const Mat& offset, int nodeCols);
+void d3dRaggedScatter(Mat& logits, const Mat& scores, const Mat& sample,
+                      const Mat& actionId, int batch, int actions);
+void d3dRaggedGather(Mat& scores, const Mat& logits, const Mat& sample,
+                     const Mat& actionId);
+#endif
 void PD_BE(ZeroAndLast)(Mat& all, const Mat& gh, int B, int T, int h);
 void PD_BE(MaskDyn)(Mat& logits, const Mat& ds, const Mat& mask, int N);
 void PD_BE(AddTo)(float* dst, void** gSlot, int dstCols, const Mat& src);
@@ -431,8 +433,8 @@ void kSplit(const Mat& z, int n1, Mat& a, Mat& b, int n2) {
 
 void kRaggedConcat(Mat& z, const Mat& node, const Mat& action,
                    const Mat& sample) {
-#ifdef PD_HAVE_GPU
-    if (gpuActive()) { PD_BE(RaggedConcat)(z, node, action, sample); return; }
+#ifdef PD_HAVE_D3D
+    if (gpuActive()) { d3dRaggedConcat(z, node, action, sample); return; }
 #endif
     for (int r = 0; r < z.r; ++r) {
         int s = int(sample.row(r)[0]);
@@ -444,9 +446,9 @@ void kRaggedConcat(Mat& z, const Mat& node, const Mat& action,
 
 void kRaggedNodeReduce(Mat& nodeGrad, const Mat& concatGrad,
                        const Mat& offset, int nodeCols) {
-#ifdef PD_HAVE_GPU
+#ifdef PD_HAVE_D3D
     if (gpuActive()) {
-        PD_BE(RaggedNodeReduce)(nodeGrad, concatGrad, offset, nodeCols);
+        d3dRaggedNodeReduce(nodeGrad, concatGrad, offset, nodeCols);
         return;
     }
 #endif
@@ -460,9 +462,9 @@ void kRaggedNodeReduce(Mat& nodeGrad, const Mat& concatGrad,
 void kRaggedScatter(Mat& logits, const Mat& scores, const Mat& sample,
                     const Mat& actionId, int batch, int actions) {
     logits.resize(batch, actions);
-#ifdef PD_HAVE_GPU
+#ifdef PD_HAVE_D3D
     if (gpuActive()) {
-        PD_BE(RaggedScatter)(logits, scores, sample, actionId, batch, actions);
+        d3dRaggedScatter(logits, scores, sample, actionId, batch, actions);
         return;
     }
 #endif
@@ -475,9 +477,9 @@ void kRaggedScatter(Mat& logits, const Mat& scores, const Mat& sample,
 void kRaggedGather(Mat& scores, const Mat& logits, const Mat& sample,
                    const Mat& actionId) {
     scores.resize(sample.r, 1);
-#ifdef PD_HAVE_GPU
+#ifdef PD_HAVE_D3D
     if (gpuActive()) {
-        PD_BE(RaggedGather)(scores, logits, sample, actionId);
+        d3dRaggedGather(scores, logits, sample, actionId);
         return;
     }
 #endif
