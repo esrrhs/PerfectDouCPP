@@ -75,6 +75,8 @@ struct RolloutConfig {
     float ruleProb = 0.1f;        // Probability of facing heuristic rule agent
     // Pointer to read-only historical pool (if available)
     const HistoricalPool* historicalPool = nullptr;
+    // Terminal shaping cap (nudge towards fewer opponent cards/clearing hand, small to prevent distorting ADP)
+    float shapingCap = 0.05f;
 };
 
 // Runs self-play / league games using the current models, historical pool, and rule agent.

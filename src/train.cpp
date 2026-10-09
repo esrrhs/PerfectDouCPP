@@ -55,9 +55,11 @@ struct Args {
     float clip = 0.2f;
     float ent = 0.1f;
     float gamma = 1.0f;
-    float lambda = 1.0f;
+    float lambda = 0.95f;
     float targetKL = 0.03f;
-    bool clipVf = false;
+    bool clipVf = true;
+    float vfClip = 1.0f;
+    float shapingCap = 0.05f;
     bool lrDecay = true;
     bool entDecay = true;
     int poolSize = 16;
@@ -98,8 +100,10 @@ void parseArgs(int argc, char** argv, Args& a) {
     a.clip = float(std::atof(argValue(argc, argv, "--clip", "0.2")));
     a.ent = float(std::atof(argValue(argc, argv, "--ent", "0.1")));
     a.gamma = float(std::atof(argValue(argc, argv, "--gamma", "1.0")));
-    a.lambda = float(std::atof(argValue(argc, argv, "--lambda", "1.0")));
+    a.lambda = float(std::atof(argValue(argc, argv, "--lambda", "0.95")));
     a.targetKL = float(std::atof(argValue(argc, argv, "--target-kl", "0.03")));
+    a.vfClip = float(std::atof(argValue(argc, argv, "--vf-clip", "1.0")));
+    a.shapingCap = float(std::atof(argValue(argc, argv, "--shaping-cap", "0.05")));
     if (hasFlag(argc, argv, "--clip-vf")) a.clipVf = true;
     if (hasFlag(argc, argv, "--no-clip-vf")) a.clipVf = false;
     if (hasFlag(argc, argv, "--no-lr-decay")) a.lrDecay = false;
@@ -182,6 +186,7 @@ int main(int argc, char** argv) {
     ppo.lambda = args.lambda;
     ppo.targetKL = args.targetKL;
     ppo.clipVf = args.clipVf;
+    ppo.vfClip = args.vfClip;
 
     auto saveAll = [&](const std::string& dir) {
         std::filesystem::create_directories(dir);
@@ -269,6 +274,7 @@ int main(int argc, char** argv) {
             rc.seed = args.seed + uint64_t(upd) * 7919ULL;
             rc.historicalProb = args.histProb;
             rc.ruleProb = args.ruleProb;
+            rc.shapingCap = args.shapingCap;
             auto snapPool = std::atomic_load(&histPool);
             rc.historicalPool = snapPool.get();
             algo::RolloutStats rs;
@@ -507,6 +513,7 @@ int main(int argc, char** argv) {
             rc.seed = args.seed + uint64_t(chunk + 1) * 7919ULL;
             rc.historicalProb = args.histProb;
             rc.ruleProb = args.ruleProb;
+            rc.shapingCap = args.shapingCap;
             auto snapPool = std::atomic_load(&histPool);
             rc.historicalPool = snapPool.get();
             Sample sample;

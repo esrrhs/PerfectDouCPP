@@ -64,17 +64,16 @@ void Game::step(const CardSet& m) {
     if (!over) turn = (turn + 1) % 3;
 }
 
-float Game::shaping(int seat) const {
-    constexpr float kCap = 0.5f;
+float Game::shaping(int seat, float cap) const {
     bool won = (winner == 0) == (seat == kLandlord);
     if (won) {
         float enemyPlayed =
             seat == kLandlord
                 ? 0.5f * float(played[kDown].total() + played[kUp].total())
                 : float(played[kLandlord].total());
-        return -kCap * enemyPlayed / 20.0f;
+        return -cap * enemyPlayed / 20.0f;
     }
-    return -kCap * float(hand[seat].total()) / 20.0f;
+    return -cap * float(hand[seat].total()) / 20.0f;
 }
 
 double Game::payoff(int seat) const {

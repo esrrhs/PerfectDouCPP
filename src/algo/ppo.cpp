@@ -391,10 +391,10 @@ bool ppoUpdate(nn::Actor& actor, nn::Critic& critic,
                 float err = vPred - vTarget;
                 if (cfg.clipVf) {
                     // PPO Value Clipping: L_vf = max((v - target)^2, (v_clipped - target)^2)
-                    // If the clipped surrogate is larger (l2 > l1), v is outside the [-clip, clip] interval,
+                    // If the clipped surrogate is larger (l2 > l1), v is outside the [-vfClip, vfClip] interval,
                     // so d(v_clipped)/d(v) = 0, meaning the gradient with respect to v is 0.
                     float vOld = mb[i]->value;
-                    float vClipped = vOld + std::clamp(vPred - vOld, -cfg.clip, cfg.clip);
+                    float vClipped = vOld + std::clamp(vPred - vOld, -cfg.vfClip, cfg.vfClip);
                     float errClipped = vClipped - vTarget;
                     float l1 = err * err;
                     float l2 = errClipped * errClipped;

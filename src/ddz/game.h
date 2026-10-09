@@ -51,7 +51,7 @@ struct Game {
     // bomb score still decides the sign. Losing with fewer cards left scores
     // higher; winning while the opposing side has played fewer cards scores
     // higher. A landlord averages the two peasants.
-    float shaping(int seat) const;
+    float shaping(int seat, float cap = 0.5f) const;
 
     // ADP payoff from the seat's perspective (base 2 for landlord, 1 for
     // each peasant, doubled per bomb/rocket).
