@@ -437,7 +437,7 @@ bool ppoUpdate(nn::Actor& actor, nn::Critic& critic,
             // parameter and leaving old-logp clipping mostly ineffective.
             onGpu([&] {
                 actorOpt.applyGradNorm(actor.params(), cfg.maxGradNorm);
-                criticOpt.applyGradNorm(critic.params(), cfg.maxGradNorm);
+                criticOpt.applyGradNorm(critic.params(), cfg.criticMaxGradNorm);
                 if (!nn::gpuDeviceOk()) return;
                 for (nn::Param* p : actor.params())
                     nn::gpuStaleCache(&p->devW);
