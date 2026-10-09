@@ -184,7 +184,7 @@ void releaseMemo() {
 
 uint64_t packKey(const std::array<int8_t, kRanks>& cnt) {
     uint64_t k = 0;
-    for (int r = 0; r < kRanks; ++r) k |= uint64_t(cnt[r]) << (2 * r);
+    for (int r = 0; r < kRanks; ++r) k |= uint64_t(cnt[r]) << (3 * r);
     return k;
 }
 

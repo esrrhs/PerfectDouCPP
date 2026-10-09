@@ -251,7 +251,9 @@ static void testOracle() {
     CHECK(steps("333444555") == 1);             // plane
     CHECK(steps("33344456") == 1);              // plane + two solos
     CHECK(steps("3334445566") == 1);            // plane + two pairs
-    CHECK(steps("33334455") == 1);              // four + two pairs
+    CHECK(steps("3333") == 1);                  // bomb
+    CHECK(steps("33334") == 2);                 // bomb + single (distinguished from 3333)
+    CHECK(steps("4") == 1);                     // single (distinguished from 3333)
     CHECK(steps("333345") == 1);                // four + two solos
     CHECK(steps("BR") == 1);                    // rocket
     CHECK(steps("333555") == 2);                // non-consecutive trios

@@ -548,11 +548,10 @@ int main() {
             actor.prepareInference();
             double num = (lp - lm) / (2 * eps);
             double ana = p.dw[idx];
-            bool ok = std::abs(ana) < 1e-4 ? std::abs(num - ana) < 2e-5
-                                           : std::abs(num - ana) /
-                                                     (std::abs(num) +
-                                                      std::abs(ana) + 1e-9) <
-                                                 2e-2;
+            bool ok = std::abs(num - ana) < 2e-5 ||
+                      std::abs(num - ana) /
+                              (std::abs(num) + std::abs(ana) + 1e-9) <
+                          2e-2;
             if (!ok) {
                 std::printf("  ACTOR %s idx=%zu ana=%f num=%f FAIL\n", name,
                             idx, ana, num);
@@ -595,11 +594,10 @@ int main() {
             p.w[idx] = orig;
             critic.prepareInference();
             double num = (lp - lm) / (2 * eps), ana = p.dw[idx];
-            bool ok = std::abs(ana) < 1e-4 ? std::abs(num - ana) < 2e-5
-                                           : std::abs(num - ana) /
-                                                     (std::abs(num) +
-                                                      std::abs(ana) + 1e-9) <
-                                                 2e-2;
+            bool ok = std::abs(num - ana) < 2e-5 ||
+                      std::abs(num - ana) /
+                              (std::abs(num) + std::abs(ana) + 1e-9) <
+                          2e-2;
             if (!ok) {
                 std::printf("  CRITIC %s idx=%zu ana=%f num=%f FAIL\n",
                             name, idx, ana, num);

@@ -39,11 +39,21 @@ if(APPLE)
     "-framework Metal" "-framework MetalPerformanceShaders" "-framework Foundation")
 endif()
 
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64" OR MSVC)
+  target_sources(perfectdou PRIVATE src/nn/gemm_avx2.cpp)
+  if(MSVC)
+    set_source_files_properties(src/nn/gemm_avx2.cpp PROPERTIES
+      COMPILE_OPTIONS "/arch:AVX2")
+  else()
+    set_source_files_properties(src/nn/gemm_avx2.cpp PROPERTIES
+      COMPILE_OPTIONS "-mavx2;-mfma")
+  endif()
+endif()
+
 if(WIN32)
   target_sources(perfectdou PRIVATE
     src/nn/gemm_d3d.cpp
-    src/nn/gemm_cuda_bridge.cpp
-    src/nn/gemm_avx2.cpp)
+    src/nn/gemm_cuda_bridge.cpp)
   target_compile_definitions(perfectdou PUBLIC PD_HAVE_D3D)
   target_link_libraries(perfectdou PUBLIC d3d12 dxgi d3dcompiler)
   find_path(CUDA_TOOLKIT_INCLUDE cuda.h
@@ -53,13 +63,6 @@ if(WIN32)
     target_include_directories(perfectdou PRIVATE "${CUDA_TOOLKIT_INCLUDE}")
     target_compile_definitions(perfectdou PRIVATE PD_HAVE_CUBLAS)
     message(STATUS "Optional cuBLAS D3D12 bridge enabled")
-  endif()
-  if(MSVC)
-    set_source_files_properties(src/nn/gemm_avx2.cpp PROPERTIES
-      COMPILE_OPTIONS "/arch:AVX2")
-  else()
-    set_source_files_properties(src/nn/gemm_avx2.cpp PROPERTIES
-      COMPILE_OPTIONS "-mavx2;-mfma")
   endif()
 endif()
 

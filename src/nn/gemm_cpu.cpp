@@ -43,7 +43,7 @@ thread_local int g_boundSeat = 0;
 constexpr long long kGpuMacThreshold = 1000000;
 }  // namespace
 
-#if defined(_WIN32) && (defined(_M_X64) || defined(__x86_64__))
+#if defined(_M_X64) || defined(__x86_64__)
 bool pdAvx2Available();
 void pdAvx2SgemmPanel(int M, int N, int K, const float* A, int lda,
                       const float* B, int ldb, float* C, int ldc,
@@ -97,7 +97,7 @@ inline void zeroN(float* c, int n) {
 // the panel. aAt(i,k) reads A in either NN (row i) or TN (column i) layout.
 void sgemmPanel(int M, int N, int K, const float* A, int lda, const float* B,
                 int ldb, float* C, int ldc, bool transA) {
-#if defined(_WIN32) && (defined(_M_X64) || defined(__x86_64__))
+#if defined(_M_X64) || defined(__x86_64__)
     static const bool haveAvx2 = pdAvx2Available();
     if (haveAvx2) {
         pdAvx2SgemmPanel(M, N, K, A, lda, B, ldb, C, ldc, transA);
