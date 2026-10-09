@@ -223,23 +223,26 @@ int main(int argc, char** argv) {
             snap->actor[s].prepareInference();
         }
         std::lock_guard<std::mutex> lock(histPoolMu);
-        auto newPool = std::make_shared<algo::HistoricalPool>(*histPool);
+        auto oldPool = std::atomic_load(&histPool);
+        auto newPool = std::make_shared<algo::HistoricalPool>(oldPool ? *oldPool : algo::HistoricalPool{});
         // 1. Check if snapshot qualifies for long-term geometric/exponential archive
         int k = args.poolEvery > 0 ? (currentUpdate / args.poolEvery) : 0;
         bool isPowerOfTwo = (k > 0) && ((k & (k - 1)) == 0);
         bool isCentennial = (currentUpdate % 100 == 0);
-        if (isPowerOfTwo || isCentennial || newPool->archive.empty()) {
-            if ((int)newPool->archive.size() >= args.archiveSize) {
+        if (args.archiveSize > 0 && (isPowerOfTwo || isCentennial || newPool->archive.empty())) {
+            while ((int)newPool->archive.size() >= args.archiveSize && !newPool->archive.empty()) {
                 newPool->archive.erase(newPool->archive.begin());
             }
             newPool->archive.push_back(snap);
         }
 
         // 2. Add to recent rolling FIFO pool
-        if ((int)newPool->recent.size() >= args.poolSize) {
-            newPool->recent.erase(newPool->recent.begin());
+        if (args.poolSize > 0) {
+            while ((int)newPool->recent.size() >= args.poolSize && !newPool->recent.empty()) {
+                newPool->recent.erase(newPool->recent.begin());
+            }
+            newPool->recent.push_back(std::move(snap));
         }
-        newPool->recent.push_back(std::move(snap));
         std::atomic_store(&histPool, std::shared_ptr<const algo::HistoricalPool>(newPool));
     };
 
@@ -331,11 +334,12 @@ int main(int argc, char** argv) {
                                   .count();
             double wp = double(rs.landlordWins) / std::max(1, rs.games);
             double adp = double(rs.landlordScore) / std::max(1, rs.games);
+            int actualEpochs = std::max({ps[0].epochsCompleted, ps[1].epochsCompleted, ps[2].epochsCompleted});
             std::printf(
-                "upd %4d | wall %.1fs rollout %.1fs learn %.1fs threads 1 | "
+                "upd %4d | wall %.1fs rollout %.1fs learn %.1fs ep %d/%d threads 1 | "
                 "WP %.3f ADP %7.2f | lr %.2e ent %5.3f/%5.3f/%5.3f | "
                 "kl %.4f/%.4f/%.4f cf %.2f/%.2f/%.2f | n %lld/%lld/%lld\n",
-                upd, wallSecs, rollSecs, learnSecs, wp, adp, currentLr, ps[0].entropy,
+                upd, wallSecs, rollSecs, learnSecs, actualEpochs, args.epochs, wp, adp, currentLr, ps[0].entropy,
                 ps[1].entropy, ps[2].entropy,
                 ps[0].approxKL, ps[1].approxKL, ps[2].approxKL,
                 ps[0].clipFraction, ps[1].clipFraction, ps[2].clipFraction,
@@ -626,13 +630,14 @@ int main(int argc, char** argv) {
         double adp = double(rs.landlordScore) / std::max(1, rs.games);
         double bpg = double(rs.bombs) / std::max(1, rs.games);
         double mpg = double(rs.moves) / std::max(1, rs.games);
+        int actualEpochs = std::max({ps[0].epochsCompleted, ps[1].epochsCompleted, ps[2].epochsCompleted});
         std::printf(
             "upd %4d | q %d/%d left %d end %d | wall %.1fs rollout %.1fs learn %.1fs "
-            "games %d mb %d epochs %d threads %d | WP %.3f ADP %7.2f bomb/g %.2f "
+            "games %d mb %d ep %d/%d threads %d | WP %.3f ADP %7.2f bomb/g %.2f "
             "moves/g %.1f | lr %.2e ent %5.3f/%5.3f/%5.3f vL %7.2f/%7.2f/%7.2f "
             "kl %.4f/%.4f/%.4f cf %.2f/%.2f/%.2f | ret %7.1f/%7.1f/%7.1f | n %lld/%lld/%lld\n",
             upd, qReady, buf.cap, qLeft, qEnd, wallSecs, rollSecs, learnSecs,
-            rs.games, args.minibatch, args.epochs, args.threads, wp, adp, bpg, mpg,
+            rs.games, args.minibatch, actualEpochs, args.epochs, args.threads, wp, adp, bpg, mpg,
             currentLr, ps[0].entropy, ps[1].entropy, ps[2].entropy,
             ps[0].vLoss, ps[1].vLoss, ps[2].vLoss,
             ps[0].approxKL, ps[1].approxKL, ps[2].approxKL,

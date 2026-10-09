@@ -267,6 +267,8 @@ bool ppoUpdate(nn::Actor& actor, nn::Critic& critic,
 
     double pgLossSum = 0, vLossSum = 0, entSum = 0;
     double klSum = 0, clipCountSum = 0;
+    double epochKLSum = 0;
+    int epochSamples = 0;
     int mbCount = 0;
     int totalSamplesProcessed = 0;
     bool deviceOk = true;
@@ -387,7 +389,9 @@ bool ppoUpdate(nn::Actor& actor, nn::Critic& critic,
                 float vTarget = mb[i]->ret;
                 float err = vPred - vTarget;
                 if (cfg.clipVf) {
-                    // PPO Value Clipping: max((v - target)^2, (v_clipped - target)^2)
+                    // PPO Value Clipping: L_vf = max((v - target)^2, (v_clipped - target)^2)
+                    // If the clipped surrogate is larger (l2 > l1), v is outside the [-clip, clip] interval,
+                    // so d(v_clipped)/d(v) = 0, meaning the gradient with respect to v is 0.
                     float vOld = mb[i]->value;
                     float vClipped = vOld + std::clamp(vPred - vOld, -cfg.clip, cfg.clip);
                     float errClipped = vClipped - vTarget;
@@ -395,7 +399,7 @@ bool ppoUpdate(nn::Actor& actor, nn::Critic& critic,
                     float l2 = errClipped * errClipped;
                     if (l2 > l1) {
                         vLossSum += 0.5 * l2;
-                        dValue.row(i)[0] = cfg.vfCoef * errClipped / float(B);
+                        dValue.row(i)[0] = 0.0f;
                     } else {
                         vLossSum += 0.5 * l1;
                         dValue.row(i)[0] = cfg.vfCoef * err / float(B);
@@ -452,9 +456,13 @@ bool ppoUpdate(nn::Actor& actor, nn::Critic& critic,
             ++mbCount;
 
             // Early stopping check at the end of each epoch
+            epochKLSum += mbKLSum;
+            epochSamples += B;
             if ((batchNo + 1) % batchesPerEpoch == 0) {
-                double currentAvgKL = (totalSamplesProcessed > 0) ? (klSum / totalSamplesProcessed) : 0.0;
-                if (cfg.targetKL > 0.0f && currentAvgKL > 1.5 * cfg.targetKL) {
+                double currentEpochKL = (epochSamples > 0) ? (epochKLSum / epochSamples) : 0.0;
+                epochKLSum = 0.0;
+                epochSamples = 0;
+                if (cfg.targetKL > 0.0f && currentEpochKL > 1.5 * cfg.targetKL) {
                     earlyStopped = true;
                     break;
                 }

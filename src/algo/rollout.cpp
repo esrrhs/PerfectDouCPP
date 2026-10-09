@@ -180,29 +180,35 @@ void runWorker(const ModelSet& models, const RolloutConfig& cfg, int nGames,
 
     for (int gi = 0; gi < nGames; ++gi) {
         games[gi].deal(dealRng);
+        // Pre-sample a single historical snapshot for this game so that if both peasants
+        // are historical players, they come from the exact same version and cooperate consistently.
+        HistModelRef gameHistRef;
+        if (hasHistPool) {
+            bool pickArchive = false;
+            if (hasRecent && hasArchive) {
+                float subR = float((dealRng.nextU64() >> 11) / double(1ULL << 53));
+                pickArchive = (subR < 0.3f);
+            } else if (hasArchive) {
+                pickArchive = true;
+            }
+            if (pickArchive) {
+                int nArchive = static_cast<int>(cfg.historicalPool->archive.size());
+                int idx = int(dealRng.nextU64() % uint64_t(nArchive));
+                gameHistRef = HistModelRef{true, idx};
+            } else {
+                int nRecent = static_cast<int>(cfg.historicalPool->recent.size());
+                int idx = int(dealRng.nextU64() % uint64_t(nRecent));
+                gameHistRef = HistModelRef{false, idx};
+            }
+        }
+
         for (int s = 0; s < 3; ++s) {
             float r = float((dealRng.nextU64() >> 11) / double(1ULL << 53));
             if (r < cfg.ruleProb) {
                 gameSeats[gi][s].type = PLAYER_RULE;
             } else if (hasHistPool && r < (cfg.ruleProb + cfg.historicalProb)) {
                 gameSeats[gi][s].type = PLAYER_HISTORICAL;
-                // Weighted sampling: 70% from recent rolling pool, 30% from long-term archive pool
-                bool pickArchive = false;
-                if (hasRecent && hasArchive) {
-                    float subR = float((dealRng.nextU64() >> 11) / double(1ULL << 53));
-                    pickArchive = (subR < 0.3f);
-                } else if (hasArchive) {
-                    pickArchive = true;
-                }
-                if (pickArchive) {
-                    int nArchive = static_cast<int>(cfg.historicalPool->archive.size());
-                    int idx = int(dealRng.nextU64() % uint64_t(nArchive));
-                    gameSeats[gi][s].histRef = HistModelRef{true, idx};
-                } else {
-                    int nRecent = static_cast<int>(cfg.historicalPool->recent.size());
-                    int idx = int(dealRng.nextU64() % uint64_t(nRecent));
-                    gameSeats[gi][s].histRef = HistModelRef{false, idx};
-                }
+                gameSeats[gi][s].histRef = gameHistRef;
             } else {
                 gameSeats[gi][s].type = PLAYER_LATEST;
             }

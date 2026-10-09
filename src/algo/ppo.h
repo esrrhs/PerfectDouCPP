@@ -1,5 +1,5 @@
-// PPO update. The critic target of every decision is that seat's final ADP,
-// the same quantity DouZero regresses onto and the quantity we evaluate.
+// PPO update. Supports GAE bootstrapped value targets (default lambda=0.95),
+// reducing to the seat's final Monte Carlo ADP when lambda=1.0.
 #pragma once
 
 #include <vector>
