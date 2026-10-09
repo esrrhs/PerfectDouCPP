@@ -161,7 +161,9 @@ void runWorker(const ModelSet& models, const RolloutConfig& cfg, int nGames,
     CriticInfer criticW[3];
 
     std::vector<std::array<SeatAssignment, 3>> gameSeats(nGames);
-    bool hasHistPool = cfg.historicalPool && !cfg.historicalPool->empty();
+    bool hasRecent = cfg.historicalPool && !cfg.historicalPool->recent.empty();
+    bool hasArchive = cfg.historicalPool && !cfg.historicalPool->archive.empty();
+    bool hasHistPool = hasRecent || hasArchive;
 
     for (int gi = 0; gi < nGames; ++gi) {
         games[gi].deal(dealRng);
@@ -171,8 +173,23 @@ void runWorker(const ModelSet& models, const RolloutConfig& cfg, int nGames,
                 gameSeats[gi][s].type = PLAYER_RULE;
             } else if (hasHistPool && r < (cfg.ruleProb + cfg.historicalProb)) {
                 gameSeats[gi][s].type = PLAYER_HISTORICAL;
-                int nPool = static_cast<int>(cfg.historicalPool->size());
-                gameSeats[gi][s].histModelIdx = int(dealRng.nextU64() % uint64_t(nPool));
+                // Weighted sampling: 70% from recent rolling pool, 30% from long-term archive pool
+                bool pickArchive = false;
+                if (hasRecent && hasArchive) {
+                    float subR = float((dealRng.nextU64() >> 11) / double(1ULL << 53));
+                    pickArchive = (subR < 0.3f);
+                } else if (!hasRecent) {
+                    pickArchive = true;
+                }
+                if (pickArchive) {
+                    int nArchive = static_cast<int>(cfg.historicalPool->archive.size());
+                    int idx = int(dealRng.nextU64() % uint64_t(nArchive));
+                    gameSeats[gi][s].histModelIdx = idx + 1000000;  // encoded as archive
+                } else {
+                    int nRecent = static_cast<int>(cfg.historicalPool->recent.size());
+                    int idx = int(dealRng.nextU64() % uint64_t(nRecent));
+                    gameSeats[gi][s].histModelIdx = idx;           // encoded as recent
+                }
             } else {
                 gameSeats[gi][s].type = PLAYER_LATEST;
             }
@@ -348,7 +365,9 @@ void runWorker(const ModelSet& models, const RolloutConfig& cfg, int nGames,
                     }
                     int mIdx = histGis[start].second;
                     int subB = static_cast<int>(end - start);
-                    const nn::Actor& histActor = (*cfg.historicalPool)[mIdx]->actor[seat];
+                    const nn::Actor& histActor = (mIdx >= 1000000)
+                                                    ? cfg.historicalPool->archive[mIdx - 1000000]->actor[seat]
+                                                    : cfg.historicalPool->recent[mIdx]->actor[seat];
                     ActorInfer histInfer;
 
                     std::vector<Transition> hTr(subB);

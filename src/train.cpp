@@ -59,6 +59,7 @@ struct Args {
     bool lrDecay = true;
     bool entDecay = true;
     int poolSize = 16;
+    int archiveSize = 16;
     int poolEvery = 20;
     float histProb = 0.2f;
     float ruleProb = 0.1f;
@@ -99,6 +100,7 @@ void parseArgs(int argc, char** argv, Args& a) {
     if (hasFlag(argc, argv, "--no-lr-decay")) a.lrDecay = false;
     if (hasFlag(argc, argv, "--no-ent-decay")) a.entDecay = false;
     a.poolSize = std::atoi(argValue(argc, argv, "--pool-size", "16"));
+    a.archiveSize = std::atoi(argValue(argc, argv, "--archive-size", "16"));
     a.poolEvery = std::atoi(argValue(argc, argv, "--pool-every", "20"));
     a.histProb = float(std::atof(argValue(argc, argv, "--historical-prob", "0.2")));
     a.ruleProb = float(std::atof(argValue(argc, argv, "--rule-prob", "0.1")));
@@ -144,7 +146,8 @@ int main(int argc, char** argv) {
               << " clip=" << args.clip
               << " ent=" << args.ent << (args.entDecay ? " (cosine)" : " (fixed)")
               << " gae(gamma=" << args.gamma << ",lambda=" << args.lambda << ")"
-              << " league(pool=" << args.poolSize << ",every=" << args.poolEvery
+              << " league(recent=" << args.poolSize << ",archive=" << args.archiveSize
+              << ",every=" << args.poolEvery
               << ",hist=" << args.histProb << ",rule=" << args.ruleProb << ")"
               << " target=terminal-adp"
               << " seed=" << args.seed << std::endl;
@@ -200,10 +203,11 @@ int main(int argc, char** argv) {
                             ES_AWAYMODE_REQUIRED);
 #endif
 
-    std::vector<std::shared_ptr<algo::HistoricalActorSnapshot>> histPool;
+    algo::HistoricalPool histPool;
     std::mutex histPoolMu;
-    auto pushHistPool = [&](std::array<nn::Actor, 3>& srcActor) {
+    auto pushHistPool = [&](std::array<nn::Actor, 3>& srcActor, int currentUpdate) {
         auto snap = std::make_shared<algo::HistoricalActorSnapshot>();
+        snap->update = currentUpdate;
         for (int s = 0; s < 3; ++s) {
             snap->actor[s].init(cfg, 1);
             auto da = snap->actor[s].params();
@@ -212,10 +216,25 @@ int main(int argc, char** argv) {
             snap->actor[s].prepareInference();
         }
         std::lock_guard<std::mutex> lock(histPoolMu);
-        if ((int)histPool.size() >= args.poolSize) {
-            histPool.erase(histPool.begin());
+        // 1. Check if snapshot qualifies for long-term geometric/exponential archive
+        // Qualifying rule: first update, or update number is a power-of-two multiple of poolEvery
+        // (e.g. 1*poolEvery, 2*poolEvery, 4*poolEvery, 8*poolEvery, 16*poolEvery...), or every 100 updates
+        int k = args.poolEvery > 0 ? (currentUpdate / args.poolEvery) : 0;
+        bool isPowerOfTwo = (k > 0) && ((k & (k - 1)) == 0);
+        bool isCentennial = (currentUpdate % 100 == 0);
+        if (isPowerOfTwo || isCentennial || histPool.archive.empty()) {
+            if ((int)histPool.archive.size() >= args.archiveSize) {
+                // If archive full, replace the oldest non-milestone or erase index 0
+                histPool.archive.erase(histPool.archive.begin());
+            }
+            histPool.archive.push_back(snap);
         }
-        histPool.push_back(std::move(snap));
+
+        // 2. Add to recent rolling FIFO pool
+        if ((int)histPool.recent.size() >= args.poolSize) {
+            histPool.recent.erase(histPool.recent.begin());
+        }
+        histPool.recent.push_back(std::move(snap));
     };
 
     if (std::getenv("PD_SINGLE_THREAD")) {
@@ -313,7 +332,7 @@ int main(int argc, char** argv) {
                 rs.transitions[1], rs.transitions[2]);
             std::fflush(stdout);
             if (args.poolEvery > 0 && upd % args.poolEvery == 0) {
-                pushHistPool(actor);
+                pushHistPool(actor, upd);
             }
         }
         saveAll(args.out);
@@ -613,7 +632,7 @@ int main(int argc, char** argv) {
         std::fflush(stdout);
 
         if (args.poolEvery > 0 && upd % args.poolEvery == 0) {
-            pushHistPool(actor);
+            pushHistPool(actor, upd);
         }
         if (args.snapshotEvery > 0 &&
             (upd % args.snapshotEvery == 0 || upd == args.updates)) {

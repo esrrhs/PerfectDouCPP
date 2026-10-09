@@ -51,6 +51,19 @@ struct ModelSet {
 
 struct HistoricalActorSnapshot {
     std::array<nn::Actor, 3> actor;
+    int update = 0;  // Update index at which this snapshot was created
+};
+
+// Hierarchical League Pool for long-term (multi-billion sample) training.
+// Maintains both recent high-frequency rolling snapshots (recent tactical evolution)
+// and exponentially/geometrically spaced archive snapshots (preventing catastrophic forgetting).
+struct HistoricalPool {
+    std::vector<std::shared_ptr<HistoricalActorSnapshot>> recent;
+    std::vector<std::shared_ptr<HistoricalActorSnapshot>> archive;
+
+    bool empty() const {
+        return recent.empty() && archive.empty();
+    }
 };
 
 struct RolloutConfig {
@@ -61,7 +74,7 @@ struct RolloutConfig {
     float historicalProb = 0.2f;  // Probability of facing a historical model snapshot
     float ruleProb = 0.1f;        // Probability of facing heuristic rule agent
     // Pointer to read-only historical pool (if available)
-    const std::vector<std::shared_ptr<HistoricalActorSnapshot>>* historicalPool = nullptr;
+    const HistoricalPool* historicalPool = nullptr;
 };
 
 // Runs self-play / league games using the current models, historical pool, and rule agent.
