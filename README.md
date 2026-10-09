@@ -19,7 +19,7 @@ pthread），包含超高速牌局引擎、特征工程、神经网络反向传�
 | 完美信息特征 +2 手牌 +2 步数（critic） | 同上 |
 | 动作特征为实际打出的牌（含带牌）+6 | `legalOptions()` 动态计算 |
 | 最小出牌步数 oracle（附录 E.1） | `src/ddz/oracle.cpp`（DP + 记忆化 DFS，线程私有缓存，线程安全） |
-| LSTM(5×540，即每步拼接 3 次出牌) + 对每个合法动作共享 MLP[256,256,256,512,1] | `src/nn/net.cpp`（支持 CPU AMX/AVX2、Direct3D 12 Shader、CUDA cuBLAS） |
+| LSTM(5×540，即每步拼接 3 次出牌) + 对每个合法动作共享 MLP[256,256,256,512,1] | `src/nn/net.cpp`（支持 CPU AMX/AVX2；Windows 训练 GPU 为 CUDA cuBLAS + D3D12 其余核） |
 | 完美信息价值网络 MLP[256×4] | `src/nn/net.cpp`（PTIE：完美 critic 通过优势蒸馏给不完美 actor） |
 | 终局 ADP 收益目标与微量 Shaping | 终局收益为地主 $\pm 2 \times 2^{\text{bomb}}$，农民 $\pm 1 \times 2^{\text{bomb}}$；默认启用 GAE（$\lambda=0.95$）降低多步决策方差（可通过 `--lambda 1.0` 退化为纯蒙特卡洛 ADP），辅以微量残局 Shaping（`--shaping-cap 0.05`，引导清牌且不扰动胜负格局） |
 | PPO 工业级策略裁剪与价值裁剪 | `src/algo/ppo.cpp`，实现策略裁剪 $L_{\text{CLIP}}$ 与优势值标准化（Advantage Normalization）；价值网络默认启用价值裁剪 $L_{\text{VF}}$（默认 `--vf-clip 5.0`，与斗地主 ADP 回报尺度相匹配，严格偏导饱和截断，可通过 `--no-clip-vf` 禁用） |
@@ -46,9 +46,9 @@ ctest --test-dir build          # 规则测试 + 神经网络数值梯度检查
 ## 训练
 
 ```bash
-# macOS 默认走 Accelerate/AMX（比当前 Metal GEMM 更快）。
-# Windows 默认走本机显卡（Direct3D 12）。采样在 CPU，PPO 学习在 GPU。
-# --backend cpu / --backend gpu / --backend cuda 可强制切换
+# macOS 默认走 Accelerate/AMX。
+# Windows：--backend auto 优先 CUDA（cuBLAS GEMM + D3D12 其余核），否则 CPU。
+# --backend cuda / --backend cpu 可强制切换（已移除会挂驱动的纯 D3D12 gpu 路径）
 ./build/perfectdou_train --updates 1000 --games 256 --threads 10 --out ckpt
 
 # 快速/低配机器
@@ -74,7 +74,7 @@ ctest --test-dir build          # 规则测试 + 神经网络数值梯度检查
 --clip N            PPO clip（默认 0.2）
 --target-kl N       动态 KL 散度早停阈值（默认 0.03，0 禁用）
 --no-clip-vf        禁用 PPO 价值函数裁剪损失（默认启用 clipVf）
---vf-clip N         PPO 价值函数裁剪阈值（默认 5.0，与斗地主 ADP 单位尺度相匹配）
+--vf-clip N         PPO 价值函数裁剪阈值（默认 5.0，与斗地主 ADP 回报尺度相匹配）
 --shaping-cap N     残局微量奖励塑造上限（默认 0.05，平局打破与出牌紧凑度引导）
 --pool-size N       联赛最近滚动快照池大小（默认 16）
 --archive-size N    联赛长期几何稀疏归档池大小（默认 16）
@@ -83,24 +83,22 @@ ctest --test-dir build          # 规则测试 + 神经网络数值梯度检查
 --rule-prob P       自对弈中抽样经典规则智能体的概率（默认 0.1）
 --snapshot-every K  每 K 轮落盘，最后一轮必存
 --resume DIR        从 actor{0,1,2}.bin / critic{0,1,2}.bin 继续
---backend auto|gpu|cuda|cpu   GEMM 后端（Windows 的 cuda 用 cuBLAS GEMM + D3D12 其余核）
+--backend auto|cuda|cpu   GEMM 后端（Windows：cuda = cuBLAS GEMM + D3D12 其余核）
 ```
 
 后端说明：
 
 - Apple Silicon：默认 PPO 与自对弈都走 CPU。大矩阵乘法用 Accelerate（AMX），LSTM 的
-  sigmoid/tanh 用 vForce。`--backend gpu` 使用 Metal GEMM。参考实测（M1 Pro，
-  hidden=256 / 256 局 / epochs=4）：约 **5 秒/轮**（采样 0.5 秒 + 学习 4.6 秒）。
-  同配置 Metal 学习阶段大约慢一倍。
-- Windows：默认使用 Direct3D 12 计算着色器，和 Metal 同一套分块 GEMM、LSTM、Adam。
-  多显卡时选择专用显存最大的一块（笔记本上的独显会优先于核显）。`--backend cpu`
-  退回 CPU GEMM。x86-64 Windows 使用运行时检测的 AVX2/FMA 推理内核；自对弈采样
-  固定走该 CPU 路径，只有 PPO 学习上 GPU。
-- 安装 CUDA Toolkit 后可用 `--backend cuda`，以 cuBLAS 替换 PPO 的 GEMM，其余核
-  仍使用 D3D12。当前 CUDA 输出经上传堆回到 D3D12，主要用于稳定性诊断，速度会比
-  纯 D3D12 慢。
+  sigmoid/tanh 用 vForce。参考实测（M1 Pro，hidden=256 / 256 局 / epochs=4）：约
+  **5 秒/轮**（采样 0.5 秒 + 学习 4.6 秒）。
+- Windows：仅支持 `cuda` 与 `cpu`。`--backend auto` 在检测到 CUDA Toolkit / cuBLAS
+  时启用 GPU，否则回退 CPU。手写 D3D12 `gemm_block` 路径已移除（部分 NVIDIA 驱动上
+  会 TDR）。`--backend cuda` 要求编译时找到 CUDA headers，且运行时能加载
+  `cublas`/`nvrtc`；其余 elementwise / LSTM 核仍走 D3D12。GTX 10xx（Pascal）请用
+  **CUDA Toolkit 12.x**（13+ 已移除 sm_61）；Turing 及以上可用 12 或 13。x86-64
+  自对弈采样固定走 AVX2/FMA CPU 路径，只有 PPO 学习上 GPU。
 - 数值为 FP32。`tests/test_gemm` 校验 CPU/GPU GEMM，`tests/test_grad` 校验整网梯度。
-- 没有 GPU 时使用 CPU GEMM（Apple 为 Accelerate，ARM 为 NEON，其余为标量）。
+- 没有 CUDA 时使用 CPU GEMM（Apple 为 Accelerate，ARM 为 NEON，其余为标量）。
 
 输出文件：`ckpt/actor{0,1,2}.bin`、`ckpt/critic{0,1,2}.bin`
 （座位 0=landlord，1=landlord_down，2=landlord_up），供后续推理程序加载。

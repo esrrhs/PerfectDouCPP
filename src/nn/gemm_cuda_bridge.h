@@ -34,4 +34,7 @@ void cudaBridgeReset();
 
 const char* cudaBridgeError();
 
+// True when the process was built with cuBLAS and the CUDA runtime loads.
+bool cudaBridgeAvailable();
+
 }  // namespace nn

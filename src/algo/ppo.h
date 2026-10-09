@@ -17,7 +17,7 @@ struct PPOConfig {
     int epochs = 4;
     int minibatch = 1024;
     float maxGradNorm = 0.5f;
-    float criticMaxGradNorm = 5.0f;  // Critic gradients are on ADP scale, so allow a larger norm
+    float criticMaxGradNorm = 5.0f; // Critic gradients are on ADP scale, so allow a larger norm
     float gamma = 1.0f;
     float lambda = 0.95f;    // GAE lambda (0.95 for variance reduction, 1.0 for pure Monte Carlo)
     float targetKL = 0.03f;  // Early stopping threshold (0 to disable)

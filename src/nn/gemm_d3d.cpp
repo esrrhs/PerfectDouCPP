@@ -2246,33 +2246,12 @@ void d3dCustomGemm(const GemmOp& g, const void* biasV, size_t biasBytes, int epi
         }
         return;
     }
-    int variant = 2;
-    if (std::getenv("PD_GEMM_OLD")) variant = 2;
-    else if (const char* f = std::getenv("PD_GEMM_FORCE")) variant = std::atoi(f);
-    else if (g.M >= 192) variant = 0;
-    else if (g.N >= 512) variant = 1;
-    // gemm_db (force=3) matches gemm_block's FMA order; the double-buffered
-    // variant is not ported.
-    if (variant == 3) variant = 0;
-    if (variant < 0 || variant > 2) variant = 0;
-    // gemm_block's K-loop barrier hangs this driver when K is shorter than the
-    // 16-wide tile and the dispatch is the last command in the packet. The
-    // value head backward is exactly that shape (K=1). The barrier-free kernel
-    // covers it; one product has the same rounding either way.
-    if (variant != 2 && g.K < 16) variant = 2;
-    const char* name = variant == 0 ? "gemm_block" : variant == 1 ? "gemm_blockn"
-                                                                  : "gemm_tiled";
-    UINT gx, gy;
-    if (variant == 0) {
-        gx = (UINT)((g.N + 31) / 32);
-        gy = (UINT)((g.M + 31) / 32);
-    } else if (variant == 1) {
-        gx = (UINT)((g.N + 31) / 32);
-        gy = (UINT)((g.M + 15) / 16);
-    } else {
-        gx = (UINT)((g.N + 15) / 16);
-        gy = (UINT)((g.M + 15) / 16);
-    }
+    // Pure D3D GEMM (gemm_block / gemm_blockn) is retired: it TDRs on some
+    // NVIDIA drivers. Training must use --backend cuda; keep a barrier-free
+    // tiled fallback only for tiny diagnostic dispatches.
+    const char* name = "gemm_tiled";
+    UINT gx = (UINT)((g.N + 15) / 16);
+    UINT gy = (UINT)((g.M + 15) / 16);
     dispatch(name, bufs, 4, &p, sizeof(p), gx, gy);
     auto floats = [](int rows, int stride, int cols) -> size_t {
         if (rows <= 0 || cols <= 0 || stride <= 0) return 0;
