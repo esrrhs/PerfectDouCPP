@@ -1861,7 +1861,7 @@ bool d3dInit() {
         if (factory->EnumAdapters1(i, &ad) == DXGI_ERROR_NOT_FOUND) break;
         DXGI_ADAPTER_DESC1 desc = {};
         ad->GetDesc1(&desc);
-        if (desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) {
+        if ((desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) || desc.DedicatedVideoMemory == 0) {
             ad->Release();
             continue;
         }
