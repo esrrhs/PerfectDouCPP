@@ -11,12 +11,13 @@ namespace algo {
 
 struct PPOConfig {
     float clip = 0.2f;       // Policy ratio clipping
-    float vfClip = 1.0f;     // Value function clipping range (aligned with DouDizhu ADP unit scale)
-    float entCoef = 0.1f;
+    float vfClip = 5.0f;     // Value clipping range (ADP returns span roughly +-2..48)
+    float entCoef = 0.03f;
     float vfCoef = 0.5f;
     int epochs = 4;
     int minibatch = 1024;
     float maxGradNorm = 0.5f;
+    float criticMaxGradNorm = 5.0f;  // Critic gradients are on ADP scale, so allow a larger norm
     float gamma = 1.0f;
     float lambda = 0.95f;    // GAE lambda (0.95 for variance reduction, 1.0 for pure Monte Carlo)
     float targetKL = 0.03f;  // Early stopping threshold (0 to disable)
