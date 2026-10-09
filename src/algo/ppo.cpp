@@ -268,6 +268,7 @@ bool ppoUpdate(nn::Actor& actor, nn::Critic& critic,
     double pgLossSum = 0, vLossSum = 0, entSum = 0;
     double klSum = 0, clipCountSum = 0;
     double epochKLSum = 0;
+    double lastEpochKL = 0;
     int epochSamples = 0;
     int mbCount = 0;
     int totalSamplesProcessed = 0;
@@ -459,10 +460,10 @@ bool ppoUpdate(nn::Actor& actor, nn::Critic& critic,
             epochKLSum += mbKLSum;
             epochSamples += B;
             if ((batchNo + 1) % batchesPerEpoch == 0) {
-                double currentEpochKL = (epochSamples > 0) ? (epochKLSum / epochSamples) : 0.0;
+                lastEpochKL = (epochSamples > 0) ? (epochKLSum / epochSamples) : 0.0;
                 epochKLSum = 0.0;
                 epochSamples = 0;
-                if (cfg.targetKL > 0.0f && currentEpochKL > 1.5 * cfg.targetKL) {
+                if (cfg.targetKL > 0.0f && lastEpochKL > 1.5 * cfg.targetKL) {
                     earlyStopped = true;
                     break;
                 }
@@ -481,6 +482,7 @@ bool ppoUpdate(nn::Actor& actor, nn::Critic& critic,
     stats.vLoss = vLossSum / samples;
     stats.entropy = entSum / samples;
     stats.approxKL = klSum / samples;
+    stats.lastEpochKL = (lastEpochKL > 0.0) ? lastEpochKL : stats.approxKL;
     stats.clipFraction = clipCountSum / samples;
     stats.epochsCompleted = (mbCount + batchesPerEpoch - 1) / std::max(1, batchesPerEpoch);
     (void)earlyStopped;

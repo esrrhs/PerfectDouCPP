@@ -29,6 +29,7 @@ struct PPOStats {
     double meanRet = 0;
     double meanAdv = 0;
     double approxKL = 0;
+    double lastEpochKL = 0;
     double clipFraction = 0;
     int epochsCompleted = 0;
 };

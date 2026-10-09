@@ -230,8 +230,15 @@ int main(int argc, char** argv) {
         bool isPowerOfTwo = (k > 0) && ((k & (k - 1)) == 0);
         bool isCentennial = (currentUpdate % 100 == 0);
         if (args.archiveSize > 0 && (isPowerOfTwo || isCentennial || newPool->archive.empty())) {
+            // When full, protect the earliest foundational anchor models (e.g. index 0/1)
+            // and thin out the intermediate models rather than dropping the oldest.
             while ((int)newPool->archive.size() >= args.archiveSize && !newPool->archive.empty()) {
-                newPool->archive.erase(newPool->archive.begin());
+                if (newPool->archive.size() > 2) {
+                    // Thin out from the middle
+                    newPool->archive.erase(newPool->archive.begin() + 1);
+                } else {
+                    newPool->archive.erase(newPool->archive.begin());
+                }
             }
             newPool->archive.push_back(snap);
         }
@@ -334,14 +341,15 @@ int main(int argc, char** argv) {
                                   .count();
             double wp = double(rs.landlordWins) / std::max(1, rs.games);
             double adp = double(rs.landlordScore) / std::max(1, rs.games);
-            int actualEpochs = std::max({ps[0].epochsCompleted, ps[1].epochsCompleted, ps[2].epochsCompleted});
             std::printf(
-                "upd %4d | wall %.1fs rollout %.1fs learn %.1fs ep %d/%d threads 1 | "
+                "upd %4d | wall %.1fs rollout %.1fs learn %.1fs ep %d,%d,%d/%d threads 1 | "
                 "WP %.3f ADP %7.2f | lr %.2e ent %5.3f/%5.3f/%5.3f | "
                 "kl %.4f/%.4f/%.4f cf %.2f/%.2f/%.2f | n %lld/%lld/%lld\n",
-                upd, wallSecs, rollSecs, learnSecs, actualEpochs, args.epochs, wp, adp, currentLr, ps[0].entropy,
+                upd, wallSecs, rollSecs, learnSecs,
+                ps[0].epochsCompleted, ps[1].epochsCompleted, ps[2].epochsCompleted,
+                args.epochs, wp, adp, currentLr, ps[0].entropy,
                 ps[1].entropy, ps[2].entropy,
-                ps[0].approxKL, ps[1].approxKL, ps[2].approxKL,
+                ps[0].lastEpochKL, ps[1].lastEpochKL, ps[2].lastEpochKL,
                 ps[0].clipFraction, ps[1].clipFraction, ps[2].clipFraction,
                 rs.transitions[0], rs.transitions[1], rs.transitions[2]);
             std::fflush(stdout);
@@ -630,17 +638,18 @@ int main(int argc, char** argv) {
         double adp = double(rs.landlordScore) / std::max(1, rs.games);
         double bpg = double(rs.bombs) / std::max(1, rs.games);
         double mpg = double(rs.moves) / std::max(1, rs.games);
-        int actualEpochs = std::max({ps[0].epochsCompleted, ps[1].epochsCompleted, ps[2].epochsCompleted});
         std::printf(
             "upd %4d | q %d/%d left %d end %d | wall %.1fs rollout %.1fs learn %.1fs "
-            "games %d mb %d ep %d/%d threads %d | WP %.3f ADP %7.2f bomb/g %.2f "
+            "games %d mb %d ep %d,%d,%d/%d threads %d | WP %.3f ADP %7.2f bomb/g %.2f "
             "moves/g %.1f | lr %.2e ent %5.3f/%5.3f/%5.3f vL %7.2f/%7.2f/%7.2f "
             "kl %.4f/%.4f/%.4f cf %.2f/%.2f/%.2f | ret %7.1f/%7.1f/%7.1f | n %lld/%lld/%lld\n",
             upd, qReady, buf.cap, qLeft, qEnd, wallSecs, rollSecs, learnSecs,
-            rs.games, args.minibatch, actualEpochs, args.epochs, args.threads, wp, adp, bpg, mpg,
+            rs.games, args.minibatch,
+            ps[0].epochsCompleted, ps[1].epochsCompleted, ps[2].epochsCompleted,
+            args.epochs, args.threads, wp, adp, bpg, mpg,
             currentLr, ps[0].entropy, ps[1].entropy, ps[2].entropy,
             ps[0].vLoss, ps[1].vLoss, ps[2].vLoss,
-            ps[0].approxKL, ps[1].approxKL, ps[2].approxKL,
+            ps[0].lastEpochKL, ps[1].lastEpochKL, ps[2].lastEpochKL,
             ps[0].clipFraction, ps[1].clipFraction, ps[2].clipFraction,
             ps[0].meanRet, ps[1].meanRet, ps[2].meanRet,
             rs.transitions[0], rs.transitions[1], rs.transitions[2]);
