@@ -50,6 +50,12 @@ void pdAvx2SgemmPanel(int M, int N, int K, const float* A, int lda,
                       bool transA);
 #endif
 
+#if defined(PD_HAVE_D3D)
+void d3dUseSeat(int seat);
+void d3dSubmit();
+void d3dSyncSeat();
+#endif
+
 // K-sequential FMA, matching the GPU kernels. A row of B is applied to a
 // panel of output rows while it is still in L1/registers, and zero entries
 // of A (binary card features) are skipped.
@@ -178,9 +184,6 @@ void gemmInit() {
 #endif
 #if defined(PD_HAVE_D3D)
     extern bool d3dInit();
-    void d3dUseSeat(int);
-    void d3dSubmit();
-    void d3dSyncSeat();
     g_enabled = d3dInit();
 #elif defined(PD_HAVE_GPU)
     extern bool PD_BE(Init)();
