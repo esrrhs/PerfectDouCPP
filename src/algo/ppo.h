@@ -1,5 +1,5 @@
-// PPO update. Supports GAE bootstrapped value targets (default lambda=0.95),
-// reducing to the seat's final Monte Carlo ADP when lambda=1.0.
+// PPO update. Every decision targets that seat's terminal ADP (default lambda=1.0,
+// pure Monte Carlo return as in the PerfectDou paper). Supports GAE when lambda < 1.0.
 #pragma once
 
 #include <vector>
@@ -17,9 +17,9 @@ struct PPOConfig {
     int minibatch = 1024;
     float maxGradNorm = 0.5f;
     float gamma = 1.0f;
-    float lambda = 0.95f;
+    float lambda = 1.0f;     // Default 1.0: pure terminal ADP (paper aligned)
     float targetKL = 0.03f;  // Early stopping threshold (0 to disable)
-    bool clipVf = true;      // Value loss clipping
+    bool clipVf = false;     // Value loss clipping (disabled by default to avoid zeroing gradients on large ADP targets)
 };
 
 struct PPOStats {

@@ -21,8 +21,8 @@ pthread），包含超高速牌局引擎、特征工程、神经网络反向传�
 | 最小出牌步数 oracle（附录 E.1） | `src/ddz/oracle.cpp`（DP + 记忆化 DFS，线程私有缓存，线程安全） |
 | LSTM(5×540，即每步拼接 3 次出牌) + 对每个合法动作共享 MLP[256,256,256,512,1] | `src/nn/net.cpp`（支持 CPU AMX/AVX2、Direct3D 12 Shader、CUDA cuBLAS） |
 | 完美信息价值网络 MLP[256×4] | `src/nn/net.cpp`（PTIE：完美 critic 通过优势蒸馏给不完美 actor） |
-| 终局 ADP 收益目标 | 终局收益为地主 $\pm 2 \times 2^{\text{bomb}}$，农民 $\pm 1 \times 2^{\text{bomb}}$；默认启用 GAE（$\lambda=0.95$）降低方差，可通过 `--lambda 1.0` 退化为纯蒙特卡洛终局 ADP |
-| PPO 工业级策略裁剪与价值裁剪 | `src/algo/ppo.cpp`，实现双重裁剪 $L_{\text{CLIP}}$ 与 $L_{\text{VF}}$（严格偏导饱和截断）以及优势值标准化（Advantage Normalization） |
+| 终局 ADP 收益目标 | 终局收益为地主 $\pm 2 \times 2^{\text{bomb}}$，农民 $\pm 1 \times 2^{\text{bomb}}$（纯终局 ADP，无额外 shaping 偏差）；默认 $\lambda=1.0$ 对齐论文纯蒙特卡洛 ADP，可通过 `--lambda 0.95` 开启 GAE 自举 |
+| PPO 工业级策略裁剪与价值网络 | `src/algo/ppo.cpp`，实现策略裁剪 $L_{\text{CLIP}}$ 与优势值标准化（Advantage Normalization）；价值网络默认采用论文标准均方误差（MSE），可选 `--clip-vf` 启用截断饱和保护 |
 | 动态 KL 散度与自适应早停 | $\text{approxKL} = (r - 1) - \ln r$，每个 Epoch 独立评估均值，超过 $1.5 \times \text{targetKL}$ 触发早停，防止策略崩溃 |
 | 分层联赛训练池（League Training） | `src/algo/rollout.cpp`，混合最近快照（Rolling Pool）、几何稀疏长期归档（Long-term Archive，锚定最早基线）与规则智能体（Heuristic RuleAgent），单局保证农民策略一致性 |
 | 三个座位独立模型、批量自对弈 | `src/algo/rollout.cpp`（多线程无锁快照推进，原子安全） |
@@ -70,10 +70,10 @@ ctest --test-dir build          # 规则测试 + 神经网络数值梯度检查
 --lr/--ent           初始学习率（默认 3e-4）和熵系数（默认 0.1），默认按余弦曲线退火
 --no-lr-decay       禁用学习率余弦退火（保持固定学习率）
 --gamma N           GAE 折扣因子 gamma（默认 1.0）
---lambda N          GAE 权衡参数 lambda（默认 0.95，1.0 退化为纯蒙特卡洛 ADP）
+--lambda N          GAE 权衡参数 lambda（默认 1.0 纯蒙特卡洛终局 ADP，对齐论文；0.95 为 GAE 自举）
 --clip N            PPO clip（默认 0.2）
 --target-kl N       动态 KL 散度早停阈值（默认 0.03，0 禁用）
---no-clip-vf        禁用 PPO 价值函数裁剪损失（默认启用 clipVf）
+--clip-vf           启用 PPO 价值函数裁剪损失（默认禁用，使用论文标准 MSE，避免大收益尺度下梯度被裁为 0）
 --pool-size N       联赛最近滚动快照池大小（默认 16）
 --archive-size N    联赛长期几何稀疏归档池大小（默认 16）
 --pool-every K      每 K 轮向联赛历史池增加一次当前模型快照（默认 20）

@@ -360,7 +360,7 @@ void runWorker(const ModelSet& models, const RolloutConfig& cfg, int nGames,
                             int idx = lastIdx[s][gi];
                             if (idx >= 0) {
                                 auto& t = res.seats[s][idx];
-                                t.reward += float(g.payoff(s)) + g.shaping(s);
+                                t.reward += float(g.payoff(s));
                                 t.terminal = true;
                             }
                         }
@@ -439,7 +439,7 @@ void runWorker(const ModelSet& models, const RolloutConfig& cfg, int nGames,
                                 int idx = lastIdx[s][gi];
                                 if (idx >= 0) {
                                     auto& t = res.seats[s][idx];
-                                    t.reward += float(g.payoff(s)) + g.shaping(s);
+                                    t.reward += float(g.payoff(s));
                                     t.terminal = true;
                                 }
                             }
@@ -473,7 +473,7 @@ void runWorker(const ModelSet& models, const RolloutConfig& cfg, int nGames,
                         int idx = lastIdx[s][gi];
                         if (idx >= 0) {
                             auto& t = res.seats[s][idx];
-                            t.reward += float(g.payoff(s)) + g.shaping(s);
+                            t.reward += float(g.payoff(s));
                             t.terminal = true;
                         }
                     }

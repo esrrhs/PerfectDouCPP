@@ -5,7 +5,7 @@
 //   * imperfect-information actor over concrete legal plays
 //   * perfect-information critic (sees all hands, PTIE / perfect information
 //     distillation through the advantage)
-//   * PPO + GAE, oracle distance-to-win shaping plus terminal ADP reward
+//   * PPO, pure terminal ADP reward (paper aligned)
 //
 // Example:
 //   perfectdou_train --updates 200 --games 256 --threads 8 --out ckpt
@@ -55,9 +55,9 @@ struct Args {
     float clip = 0.2f;
     float ent = 0.1f;
     float gamma = 1.0f;
-    float lambda = 0.95f;
+    float lambda = 1.0f;
     float targetKL = 0.03f;
-    bool clipVf = true;
+    bool clipVf = false;
     bool lrDecay = true;
     bool entDecay = true;
     int poolSize = 16;
@@ -98,8 +98,9 @@ void parseArgs(int argc, char** argv, Args& a) {
     a.clip = float(std::atof(argValue(argc, argv, "--clip", "0.2")));
     a.ent = float(std::atof(argValue(argc, argv, "--ent", "0.1")));
     a.gamma = float(std::atof(argValue(argc, argv, "--gamma", "1.0")));
-    a.lambda = float(std::atof(argValue(argc, argv, "--lambda", "0.95")));
+    a.lambda = float(std::atof(argValue(argc, argv, "--lambda", "1.0")));
     a.targetKL = float(std::atof(argValue(argc, argv, "--target-kl", "0.03")));
+    if (hasFlag(argc, argv, "--clip-vf")) a.clipVf = true;
     if (hasFlag(argc, argv, "--no-clip-vf")) a.clipVf = false;
     if (hasFlag(argc, argv, "--no-lr-decay")) a.lrDecay = false;
     if (hasFlag(argc, argv, "--no-ent-decay")) a.entDecay = false;
