@@ -56,6 +56,8 @@ struct Args {
     float ent = 0.1f;
     float gamma = 1.0f;
     float lambda = 0.95f;
+    float targetKL = 0.03f;
+    bool clipVf = true;
     bool lrDecay = true;
     bool entDecay = true;
     int poolSize = 16;
@@ -97,6 +99,8 @@ void parseArgs(int argc, char** argv, Args& a) {
     a.ent = float(std::atof(argValue(argc, argv, "--ent", "0.1")));
     a.gamma = float(std::atof(argValue(argc, argv, "--gamma", "1.0")));
     a.lambda = float(std::atof(argValue(argc, argv, "--lambda", "0.95")));
+    a.targetKL = float(std::atof(argValue(argc, argv, "--target-kl", "0.03")));
+    if (hasFlag(argc, argv, "--no-clip-vf")) a.clipVf = false;
     if (hasFlag(argc, argv, "--no-lr-decay")) a.lrDecay = false;
     if (hasFlag(argc, argv, "--no-ent-decay")) a.entDecay = false;
     a.poolSize = std::atoi(argValue(argc, argv, "--pool-size", "16"));
@@ -146,6 +150,7 @@ int main(int argc, char** argv) {
               << " clip=" << args.clip
               << " ent=" << args.ent << (args.entDecay ? " (cosine)" : " (fixed)")
               << " gae(gamma=" << args.gamma << ",lambda=" << args.lambda << ")"
+              << " targetKL=" << args.targetKL << (args.clipVf ? " clipVf" : "")
               << " league(recent=" << args.poolSize << ",archive=" << args.archiveSize
               << ",every=" << args.poolEvery
               << ",hist=" << args.histProb << ",rule=" << args.ruleProb << ")"
@@ -174,6 +179,8 @@ int main(int argc, char** argv) {
     ppo.minibatch = args.minibatch;
     ppo.gamma = args.gamma;
     ppo.lambda = args.lambda;
+    ppo.targetKL = args.targetKL;
+    ppo.clipVf = args.clipVf;
 
     auto saveAll = [&](const std::string& dir) {
         std::filesystem::create_directories(dir);
@@ -326,10 +333,13 @@ int main(int argc, char** argv) {
             double adp = double(rs.landlordScore) / std::max(1, rs.games);
             std::printf(
                 "upd %4d | wall %.1fs rollout %.1fs learn %.1fs threads 1 | "
-                "WP %.3f ADP %7.2f | lr %.2e ent %5.3f/%5.3f/%5.3f | n %lld/%lld/%lld\n",
+                "WP %.3f ADP %7.2f | lr %.2e ent %5.3f/%5.3f/%5.3f | "
+                "kl %.4f/%.4f/%.4f cf %.2f/%.2f/%.2f | n %lld/%lld/%lld\n",
                 upd, wallSecs, rollSecs, learnSecs, wp, adp, currentLr, ps[0].entropy,
-                ps[1].entropy, ps[2].entropy, rs.transitions[0],
-                rs.transitions[1], rs.transitions[2]);
+                ps[1].entropy, ps[2].entropy,
+                ps[0].approxKL, ps[1].approxKL, ps[2].approxKL,
+                ps[0].clipFraction, ps[1].clipFraction, ps[2].clipFraction,
+                rs.transitions[0], rs.transitions[1], rs.transitions[2]);
             std::fflush(stdout);
             if (args.poolEvery > 0 && upd % args.poolEvery == 0) {
                 pushHistPool(actor, upd);
@@ -620,11 +630,13 @@ int main(int argc, char** argv) {
             "upd %4d | q %d/%d left %d end %d | wall %.1fs rollout %.1fs learn %.1fs "
             "games %d mb %d epochs %d threads %d | WP %.3f ADP %7.2f bomb/g %.2f "
             "moves/g %.1f | lr %.2e ent %5.3f/%5.3f/%5.3f vL %7.2f/%7.2f/%7.2f "
-            "ret %7.1f/%7.1f/%7.1f | n %lld/%lld/%lld\n",
+            "kl %.4f/%.4f/%.4f cf %.2f/%.2f/%.2f | ret %7.1f/%7.1f/%7.1f | n %lld/%lld/%lld\n",
             upd, qReady, buf.cap, qLeft, qEnd, wallSecs, rollSecs, learnSecs,
             rs.games, args.minibatch, args.epochs, args.threads, wp, adp, bpg, mpg,
             currentLr, ps[0].entropy, ps[1].entropy, ps[2].entropy,
             ps[0].vLoss, ps[1].vLoss, ps[2].vLoss,
+            ps[0].approxKL, ps[1].approxKL, ps[2].approxKL,
+            ps[0].clipFraction, ps[1].clipFraction, ps[2].clipFraction,
             ps[0].meanRet, ps[1].meanRet, ps[2].meanRet,
             rs.transitions[0], rs.transitions[1], rs.transitions[2]);
         std::fflush(stdout);

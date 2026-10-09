@@ -266,8 +266,11 @@ bool ppoUpdate(nn::Actor& actor, nn::Critic& critic,
     });
 
     double pgLossSum = 0, vLossSum = 0, entSum = 0;
+    double klSum = 0, clipCountSum = 0;
     int mbCount = 0;
+    int totalSamplesProcessed = 0;
     bool deviceOk = true;
+    bool earlyStopped = false;
     if (reproDump()) dumpWeights(actor, critic);
 
     for (int batchNo = 0; batchNo < totalBatches; ++batchNo) {
@@ -324,14 +327,24 @@ bool ppoUpdate(nn::Actor& actor, nn::Critic& critic,
             // ---- loss gradients on host ----
             dLogits.resize(B, nn::kNumActions);
             std::fill(dLogits.d.begin(), dLogits.d.end(), 0.0f);
+            float mbKLSum = 0.0f;
+            float mbClipSum = 0.0f;
             for (int i = 0; i < B; ++i) {
                 float probs[nn::kNumActions];
                 maskedSoftmax(logits.row(i), nn::kNumActions, probs);
                 int act = mb[i]->action;
                 float newLogp = std::log(std::max(probs[act], 1e-12f));
-                float ratio = std::exp(newLogp - mb[i]->logp);
+                float logRatio = newLogp - mb[i]->logp;
+                float ratio = std::exp(logRatio);
+                // Approx KL divergence: (ratio - 1) - log(ratio) (k3 approximation, non-negative)
+                float approxKL = (ratio - 1.0f) - logRatio;
+                mbKLSum += approxKL;
+
                 float s = mb[i]->adv;
                 float rc = std::clamp(ratio, 1.0f - cfg.clip, 1.0f + cfg.clip);
+                if (std::abs(ratio - 1.0f) > cfg.clip) {
+                    mbClipSum += 1.0f;
+                }
                 float l1 = ratio * s, l2 = rc * s;
                 float surrogate = std::min(l1, l2);
                 pgLossSum += surrogate;
@@ -364,12 +377,33 @@ bool ppoUpdate(nn::Actor& actor, nn::Critic& critic,
                     dLogits.row(i)[a] = probs[a] * (W - sumW);
                 }
             }
+            klSum += mbKLSum;
+            clipCountSum += mbClipSum;
+            totalSamplesProcessed += B;
 
             dValue.resize(B, 1);
             for (int i = 0; i < B; ++i) {
-                float err = values.row(i)[0] - mb[i]->ret;
-                vLossSum += 0.5 * err * err;
-                dValue.row(i)[0] = cfg.vfCoef * err / float(B);
+                float vPred = values.row(i)[0];
+                float vTarget = mb[i]->ret;
+                float err = vPred - vTarget;
+                if (cfg.clipVf) {
+                    // PPO Value Clipping: max((v - target)^2, (v_clipped - target)^2)
+                    float vOld = mb[i]->value;
+                    float vClipped = vOld + std::clamp(vPred - vOld, -cfg.clip, cfg.clip);
+                    float errClipped = vClipped - vTarget;
+                    float l1 = err * err;
+                    float l2 = errClipped * errClipped;
+                    if (l2 > l1) {
+                        vLossSum += 0.5 * l2;
+                        dValue.row(i)[0] = cfg.vfCoef * errClipped / float(B);
+                    } else {
+                        vLossSum += 0.5 * l1;
+                        dValue.row(i)[0] = cfg.vfCoef * err / float(B);
+                    }
+                } else {
+                    vLossSum += 0.5 * err * err;
+                    dValue.row(i)[0] = cfg.vfCoef * err / float(B);
+                }
             }
 
             onGpu([&] {
@@ -416,6 +450,15 @@ bool ppoUpdate(nn::Actor& actor, nn::Critic& critic,
                 critic.zeroGrad();
             });
             ++mbCount;
+
+            // Early stopping check at the end of each epoch
+            if ((batchNo + 1) % batchesPerEpoch == 0) {
+                double currentAvgKL = (totalSamplesProcessed > 0) ? (klSum / totalSamplesProcessed) : 0.0;
+                if (cfg.targetKL > 0.0f && currentAvgKL > 1.5 * cfg.targetKL) {
+                    earlyStopped = true;
+                    break;
+                }
+            }
     }
     stopProducer.store(true, std::memory_order_release);
     slotCv.notify_all();
@@ -425,12 +468,14 @@ bool ppoUpdate(nn::Actor& actor, nn::Critic& critic,
     onGpu([&] { nn::gpuPrintStats("ppo-update"); });
     if (!nn::gpuDeviceOk()) return false;
 
-    double samples = double(N) * cfg.epochs;
+    double samples = std::max(1, totalSamplesProcessed);
     stats.pgLoss = -pgLossSum / samples;
     stats.vLoss = vLossSum / samples;
     stats.entropy = entSum / samples;
-    stats.meanAbsOldLogp = 0;
-    (void)mbCount;
+    stats.approxKL = klSum / samples;
+    stats.clipFraction = clipCountSum / samples;
+    stats.epochsCompleted = (mbCount + batchesPerEpoch - 1) / std::max(1, batchesPerEpoch);
+    (void)earlyStopped;
     return true;
 }
 
