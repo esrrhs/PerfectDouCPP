@@ -136,17 +136,35 @@ static void testShaping() {
 }
 
 static void testEpisodeReturn() {
-    std::vector<algo::Transition> tr(4);
-    for (int i = 0; i < 4; ++i) {
-        tr[i].gameId = 3;
-        tr[i].value = 0.5f;
+    // 1. Monte Carlo test (lambda = 1.0)
+    {
+        std::vector<algo::Transition> tr(4);
+        for (int i = 0; i < 4; ++i) {
+            tr[i].gameId = 3;
+            tr[i].value = 0.5f;
+        }
+        tr.back().reward = 4.0f;
+        tr.back().terminal = true;
+        algo::assignEpisodeReturns(tr, 1.0f, 1.0f);
+        for (int i = 0; i < 4; ++i) {
+            CHECK(std::abs(tr[i].ret - 4.0f) < 1e-6f);
+            CHECK(std::abs(tr[i].adv - 3.5f) < 1e-6f);
+        }
     }
-    tr.back().reward = 4.0f;
-    tr.back().terminal = true;
-    algo::assignEpisodeReturns(tr);
-    for (int i = 0; i < 4; ++i) {
-        CHECK(std::abs(tr[i].ret - 4.0f) < 1e-6f);
-        CHECK(std::abs(tr[i].adv - 3.5f) < 1e-6f);
+    // 2. GAE test (gamma = 1.0, lambda = 0.95)
+    {
+        std::vector<algo::Transition> tr(4);
+        for (int i = 0; i < 4; ++i) {
+            tr[i].gameId = 3;
+            tr[i].value = 0.5f;
+        }
+        tr.back().reward = 4.0f;
+        tr.back().terminal = true;
+        algo::assignEpisodeReturns(tr, 1.0f, 0.95f);
+        CHECK(std::abs(tr[3].adv - 3.5f) < 1e-5f);
+        CHECK(std::abs(tr[2].adv - (3.5f * 0.95f)) < 1e-5f);
+        CHECK(std::abs(tr[1].adv - (3.5f * 0.95f * 0.95f)) < 1e-5f);
+        CHECK(std::abs(tr[0].adv - (3.5f * 0.95f * 0.95f * 0.95f)) < 1e-5f);
     }
 }
 

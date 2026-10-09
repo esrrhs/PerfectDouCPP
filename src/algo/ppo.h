@@ -16,6 +16,8 @@ struct PPOConfig {
     int epochs = 4;
     int minibatch = 1024;
     float maxGradNorm = 0.5f;
+    float gamma = 1.0f;
+    float lambda = 0.95f;
 };
 
 struct PPOStats {
@@ -27,9 +29,10 @@ struct PPOStats {
     double meanAbsOldLogp = 0;
 };
 
-// Sets every decision in a game to that seat's total reward. After rollout
-// the only reward is the terminal ADP, so each return equals the final score.
-void assignEpisodeReturns(std::vector<Transition>& tr);
+// Computes GAE advantages and returns for each transition in the trajectory stream.
+// When lambda == 1.0f and gamma == 1.0f, this smoothly matches the full Monte Carlo ADP return.
+void assignEpisodeReturns(std::vector<Transition>& tr, float gamma = 1.0f,
+                          float lambda = 0.95f);
 
 // One PPO update of one seat's actor + critic over its rollout stream.
 // False means the GPU device was removed before Adam wrote host weights, so

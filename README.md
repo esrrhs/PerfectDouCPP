@@ -62,7 +62,8 @@ ctest --test-dir build          # 规则测试 + 神经网络数值梯度检查
 --buffer N          rollout 队列深度（默认 1，对齐论文最大模型延迟 1）
 --lr/--ent           初始学习率（默认 3e-4）和熵系数（默认 0.1），默认按余弦曲线退火
 --no-lr-decay       禁用学习率余弦退火（保持固定学习率）
---no-ent-decay      禁用熵系数余弦退火（保持固定熵系数）
+--gamma N           GAE 折扣因子 gamma（默认 1.0）
+--lambda N          GAE 权衡参数 lambda（默认 0.95，1.0 退化为纯蒙特卡洛 ADP）
 --clip N            PPO clip（默认 0.2）
 --snapshot-every K  每 K 轮落盘，最后一轮必存
 --resume DIR        从 actor{0,1,2}.bin / critic{0,1,2}.bin 继续

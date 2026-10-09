@@ -54,6 +54,8 @@ struct Args {
     float lr = 3e-4f;
     float clip = 0.2f;
     float ent = 0.1f;
+    float gamma = 1.0f;
+    float lambda = 0.95f;
     bool lrDecay = true;
     bool entDecay = true;
     uint64_t seed = 1;
@@ -88,6 +90,8 @@ void parseArgs(int argc, char** argv, Args& a) {
     a.lr = float(std::atof(argValue(argc, argv, "--lr", "3e-4")));
     a.clip = float(std::atof(argValue(argc, argv, "--clip", "0.2")));
     a.ent = float(std::atof(argValue(argc, argv, "--ent", "0.1")));
+    a.gamma = float(std::atof(argValue(argc, argv, "--gamma", "1.0")));
+    a.lambda = float(std::atof(argValue(argc, argv, "--lambda", "0.95")));
     if (hasFlag(argc, argv, "--no-lr-decay")) a.lrDecay = false;
     if (hasFlag(argc, argv, "--no-ent-decay")) a.entDecay = false;
     a.seed = std::atoll(argValue(argc, argv, "--seed", "1"));
@@ -131,6 +135,7 @@ int main(int argc, char** argv) {
               << " lr=" << args.lr << (args.lrDecay ? " (cosine)" : " (fixed)")
               << " clip=" << args.clip
               << " ent=" << args.ent << (args.entDecay ? " (cosine)" : " (fixed)")
+              << " gae(gamma=" << args.gamma << ",lambda=" << args.lambda << ")"
               << " target=terminal-adp"
               << " seed=" << args.seed << std::endl;
 
@@ -154,6 +159,8 @@ int main(int argc, char** argv) {
     ppo.entCoef = args.ent;
     ppo.epochs = args.epochs;
     ppo.minibatch = args.minibatch;
+    ppo.gamma = args.gamma;
+    ppo.lambda = args.lambda;
 
     auto saveAll = [&](const std::string& dir) {
         std::filesystem::create_directories(dir);

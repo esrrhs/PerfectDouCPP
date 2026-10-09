@@ -17,17 +17,27 @@
 
 namespace algo {
 
-void assignEpisodeReturns(std::vector<Transition>& tr) {
+void assignEpisodeReturns(std::vector<Transition>& tr, float gamma,
+                          float lambda) {
     std::unordered_map<int, std::vector<size_t>> groups;
     for (size_t i = 0; i < tr.size(); ++i) groups[tr[i].gameId].push_back(i);
 
+    const float gaeFactor = gamma * lambda;
     for (auto& [id, is] : groups) {
         (void)id;
-        float total = 0.0f;
-        for (size_t k : is) total += tr[k].reward;
-        for (size_t k : is) {
-            tr[k].ret = total;
-            tr[k].adv = total - tr[k].value;
+        if (is.empty()) continue;
+        float gae = 0.0f;
+        // Backward pass through the trajectory to compute GAE advantages
+        for (int step = static_cast<int>(is.size()) - 1; step >= 0; --step) {
+            size_t k = is[step];
+            float nextValue = 0.0f;
+            if (step + 1 < static_cast<int>(is.size())) {
+                nextValue = tr[is[step + 1]].value;
+            }
+            float delta = tr[k].reward + gamma * nextValue - tr[k].value;
+            gae = delta + gaeFactor * gae;
+            tr[k].adv = gae;
+            tr[k].ret = tr[k].adv + tr[k].value;
         }
     }
 }
@@ -118,7 +128,7 @@ bool ppoUpdate(nn::Actor& actor, nn::Critic& critic,
     int N = static_cast<int>(tr.size());
     if (N == 0) return true;
 
-    assignEpisodeReturns(tr);
+    assignEpisodeReturns(tr, cfg.gamma, cfg.lambda);
 
     double mean = 0.0, var = 0.0;
     for (const Transition& t : tr) mean += t.adv;
