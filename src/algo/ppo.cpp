@@ -31,11 +31,11 @@ void assignEpisodeReturns(std::vector<Transition>& tr, float gamma,
         for (int step = static_cast<int>(is.size()) - 1; step >= 0; --step) {
             size_t k = is[step];
             float nextValue = 0.0f;
-            if (step + 1 < static_cast<int>(is.size())) {
+            if (!tr[k].terminal && step + 1 < static_cast<int>(is.size())) {
                 nextValue = tr[is[step + 1]].value;
             }
             float delta = tr[k].reward + gamma * nextValue - tr[k].value;
-            gae = delta + gaeFactor * gae;
+            gae = delta + (tr[k].terminal ? 0.0f : gaeFactor * gae);
             tr[k].adv = gae;
             tr[k].ret = tr[k].adv + tr[k].value;
         }

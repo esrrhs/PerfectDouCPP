@@ -129,9 +129,22 @@ enum PlayerType : uint8_t {
     PLAYER_RULE = 2
 };
 
+struct HistModelRef {
+    bool isArchive = false;
+    int index = -1;
+
+    bool operator<(const HistModelRef& o) const {
+        if (isArchive != o.isArchive) return isArchive < o.isArchive;
+        return index < o.index;
+    }
+    bool operator==(const HistModelRef& o) const {
+        return isArchive == o.isArchive && index == o.index;
+    }
+};
+
 struct SeatAssignment {
     PlayerType type = PLAYER_LATEST;
-    int histModelIdx = -1;
+    HistModelRef histRef;
 };
 
 void runWorker(const ModelSet& models, const RolloutConfig& cfg, int nGames,
@@ -184,11 +197,11 @@ void runWorker(const ModelSet& models, const RolloutConfig& cfg, int nGames,
                 if (pickArchive) {
                     int nArchive = static_cast<int>(cfg.historicalPool->archive.size());
                     int idx = int(dealRng.nextU64() % uint64_t(nArchive));
-                    gameSeats[gi][s].histModelIdx = idx + 1000000;  // encoded as archive
+                    gameSeats[gi][s].histRef = HistModelRef{true, idx};
                 } else {
                     int nRecent = static_cast<int>(cfg.historicalPool->recent.size());
                     int idx = int(dealRng.nextU64() % uint64_t(nRecent));
-                    gameSeats[gi][s].histModelIdx = idx;           // encoded as recent
+                    gameSeats[gi][s].histRef = HistModelRef{false, idx};
                 }
             } else {
                 gameSeats[gi][s].type = PLAYER_LATEST;
@@ -202,7 +215,7 @@ void runWorker(const ModelSet& models, const RolloutConfig& cfg, int nGames,
         if (!anyLatest) {
             int pick = int(dealRng.nextU64() % 3);
             gameSeats[gi][pick].type = PLAYER_LATEST;
-            gameSeats[gi][pick].histModelIdx = -1;
+            gameSeats[gi][pick].histRef = HistModelRef{};
         }
     }
 
@@ -251,8 +264,8 @@ void runWorker(const ModelSet& models, const RolloutConfig& cfg, int nGames,
             // Group active games waiting on this seat by player type
             std::vector<int> latestGis;
             std::vector<int> ruleGis;
-            // Historical games grouped by their snapshot index
-            std::vector<std::pair<int, int>> histGis;  // (gi, histModelIdx)
+            // Historical games grouped by their snapshot reference
+            std::vector<std::pair<int, HistModelRef>> histGis;  // (gi, histRef)
 
             for (int gi = 0; gi < nGames; ++gi) {
                 if (active[gi] && games[gi].turn == seat) {
@@ -262,7 +275,7 @@ void runWorker(const ModelSet& models, const RolloutConfig& cfg, int nGames,
                     } else if (pt == PLAYER_RULE) {
                         ruleGis.push_back(gi);
                     } else {
-                        histGis.emplace_back(gi, gameSeats[gi][seat].histModelIdx);
+                        histGis.emplace_back(gi, gameSeats[gi][seat].histRef);
                     }
                 }
             }
@@ -351,7 +364,7 @@ void runWorker(const ModelSet& models, const RolloutConfig& cfg, int nGames,
 
             // 2. Process historical model players (inference only, not recorded into training stream)
             if (!histGis.empty()) {
-                // Group by snapshot index to batch inference per historical model
+                // Group by snapshot reference to batch inference per historical model
                 std::sort(histGis.begin(), histGis.end(),
                           [](const auto& a, const auto& b) {
                               return a.second < b.second;
@@ -363,11 +376,11 @@ void runWorker(const ModelSet& models, const RolloutConfig& cfg, int nGames,
                     while (end < histGis.size() && histGis[end].second == histGis[start].second) {
                         ++end;
                     }
-                    int mIdx = histGis[start].second;
+                    const HistModelRef& mRef = histGis[start].second;
                     int subB = static_cast<int>(end - start);
-                    const nn::Actor& histActor = (mIdx >= 1000000)
-                                                    ? cfg.historicalPool->archive[mIdx - 1000000]->actor[seat]
-                                                    : cfg.historicalPool->recent[mIdx]->actor[seat];
+                    const nn::Actor& histActor = mRef.isArchive
+                                                    ? cfg.historicalPool->archive[mRef.index]->actor[seat]
+                                                    : cfg.historicalPool->recent[mRef.index]->actor[seat];
                     ActorInfer histInfer;
 
                     std::vector<Transition> hTr(subB);

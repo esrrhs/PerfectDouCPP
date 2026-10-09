@@ -21,10 +21,7 @@ public:
         if (legal.empty()) return CardSet();
         if (legal.size() == 1) return legal.front();
 
-        const CardSet& toBeat = g.lastMove[(g.turn + 2) % 3].total() > 0
-                                    ? g.lastMove[(g.turn + 2) % 3]
-                                    : g.lastMove[(g.turn + 1) % 3];
-
+        CardSet toBeat = g.toBeat();
         bool isLeading = toBeat.empty() || g.lastPlayer == seat;
 
         // If leading freely:
