@@ -177,9 +177,10 @@ void gemmInit() {
     setenv("VECLIB_MAXIMUM_THREADS", "1", /*overwrite=*/0);
 #endif
 #if defined(PD_HAVE_D3D)
-    // Scalar CPU GEMM is far slower than a local D3D12 GPU, so auto uses it.
-    // Apple stays on Accelerate unless --backend gpu.
     extern bool d3dInit();
+    void d3dUseSeat(int);
+    void d3dSubmit();
+    void d3dSyncSeat();
     g_enabled = d3dInit();
 #elif defined(PD_HAVE_GPU)
     extern bool PD_BE(Init)();
@@ -293,7 +294,6 @@ void gpuBindSeat(int seat) {
 #endif
 #if defined(PD_HAVE_D3D)
     if (std::getenv("PD_CUBLAS")) {
-        extern void d3dUseSeat(int);
         d3dUseSeat(seat);
     }
 #endif
@@ -301,7 +301,6 @@ void gpuBindSeat(int seat) {
 
 void gpuSubmit() {
 #if defined(PD_HAVE_D3D)
-    extern void d3dSubmit();
     if (gemmGpuEnabled()) d3dSubmit();
 #endif
 }
@@ -309,7 +308,6 @@ void gpuSubmit() {
 void gpuSync() {
 #if defined(PD_HAVE_D3D)
     extern void cudaBridgeSetStream(int);
-    extern void d3dSyncSeat();
     cudaBridgeSetStream(g_boundSeat);
     if (gemmGpuEnabled()) d3dSyncSeat();
 #endif
@@ -350,7 +348,6 @@ void gpuInvoke(const std::function<void()>& fn) {
             explicit Guard(int s) : prev(g_boundSeat) { g_boundSeat = s; }
             ~Guard() { g_boundSeat = prev; }
         } guard(seat);
-        extern void d3dUseSeat(int);
         d3dUseSeat(seat);
         fn();
     };

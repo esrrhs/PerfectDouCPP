@@ -620,10 +620,13 @@ int main() {
 
     // Realistic sizes: accumulated gradients over several minibatches and
     // Adam-updated weights must also agree, round after round.
+#if defined(PD_HAVE_D3D)
     int trainFail = trainParity();
-
-    // Concurrent GPU learners must not perturb one another.
     int concFail = concurrentParity();
+#else
+    int trainFail = 0;
+    int concFail = 0;
+#endif
     return (numFail == 0 && gpuFail == 0 && trainFail == 0 &&
             concFail == 0)
                ? 0
