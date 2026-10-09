@@ -86,3 +86,8 @@ add_test(NAME gradients COMMAND test_grad)
 add_executable(test_gemm tests/test_gemm.cpp)
 target_link_libraries(test_gemm PRIVATE perfectdou)
 add_test(NAME gemm COMMAND test_gemm)
+
+add_executable(test_algo tests/test_algo.cpp)
+target_link_libraries(test_algo PRIVATE perfectdou)
+add_test(NAME algorithms COMMAND test_algo)
+

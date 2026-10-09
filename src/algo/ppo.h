@@ -36,9 +36,9 @@ struct PPOStats {
 
 // Running mean and variance normalizer with Welford algorithm
 struct RunningNormalizer {
-    double count = 1e-4;
+    double count = 0.0;
     double mean = 0.0;
-    double M2 = 1.0;
+    double M2 = 0.0;
 
     void update(float val) {
         count += 1.0;
