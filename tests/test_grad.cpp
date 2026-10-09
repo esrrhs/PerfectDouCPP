@@ -120,7 +120,7 @@ static void makeActions(int B, int perSample, std::mt19937& rng,
         for (int j = 0; j < perSample; ++j) {
             int r = i * perSample + j;
             sample.row(r)[0] = float(i);
-            id.row(r)[0] = float(j == perSample - 1 ? 620 : j * 7 + 5);
+            id.row(r)[0] = float(j);
         }
         acts[i] = int(id.row(i * perSample + (i % perSample))[0]);
     }

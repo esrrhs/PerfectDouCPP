@@ -13,6 +13,7 @@
 #include "ddz/moves.h"
 #include "ddz/oracle.h"
 #include "algo/ppo.h"
+#include "nn/net.h"
 
 using namespace ddz;
 
@@ -117,6 +118,21 @@ static void testBottomCards() {
     game.step(move);
     CHECK(game.bottom.total() == before - 1);
     CHECK(game.bottom.c[rank] == rankBefore - 1);
+}
+
+static void testShaping() {
+    Game g;
+    g.winner = 0;
+    g.hand[1].add(0, 5);
+    g.played[1].add(2, 12);
+    g.played[2].add(3, 14);
+    CHECK(std::abs(g.shaping(0) - (-0.5f * 13.0f / 20.0f)) < 1e-5f);
+    CHECK(std::abs(g.shaping(1) - (-0.5f * 5.0f / 20.0f)) < 1e-5f);
+    g.winner = 1;
+    g.hand[0].add(5, 2);
+    g.played[0].add(4, 8);
+    CHECK(std::abs(g.shaping(1) - (-0.5f * 8.0f / 20.0f)) < 1e-5f);
+    CHECK(std::abs(g.shaping(0) - (-0.5f * 2.0f / 20.0f)) < 1e-5f);
 }
 
 static void testEpisodeReturn() {
@@ -320,24 +336,28 @@ static void testFeatures() {
             EncodedState e = encodeState(game);
             std::vector<LegalOption> opts = legalOptions(game);
             CHECK(!opts.empty());
-            for (const LegalOption& o : opts) {
-                CHECK(o.abstractId >= 0 && o.abstractId < 621);
+            std::vector<CardSet> legal = game.legal();
+            int valid = 0;
+            for (const CardSet& m : legal)
+                if (detectMove(m).type != MT_WRONG) ++valid;
+            CHECK((int)opts.size() == valid);
+            for (int i = 0; i < (int)opts.size(); ++i) {
+                const LegalOption& o = opts[i];
+                CHECK(o.abstractId == i);
+                CHECK(o.abstractId < nn::kNumActions);
                 CHECK(game.hand[game.turn].contains(o.concrete));
                 if (!o.concrete.empty())
                     CHECK(detectMove(o.concrete).type != MT_WRONG);
-                std::array<uint8_t, kCardMat> mm;
-                actionCardMatrix(o.abstractId, mm);
+                std::array<uint8_t, kCardMat> mm{};
+                cardMatrix(o.concrete, mm.data());
+                for (int j = 0; j < kCardMat; ++j)
+                    CHECK(o.feature[j] == float(mm[j]));
             }
-            std::vector<CardSet> legal = game.legal();
-            // every valid concrete legal move maps to one of the abstract options
             for (const CardSet& m : legal) {
-                MoveInfo mi = detectMove(m);
-                if (mi.type == MT_WRONG) continue;  // filtered degenerate combos
-                int id = concreteToAbstract(m, mi);
-                CHECK(id >= 0);
+                if (detectMove(m).type == MT_WRONG) continue;
                 bool found = false;
                 for (const LegalOption& o : opts)
-                    if (o.abstractId == id) found = true;
+                    if (o.concrete == m) found = true;
                 CHECK(found);
             }
             // play decoded concrete of first option
@@ -358,6 +378,7 @@ int main() {
     std::printf("testGenerator...\n"); testGenerator();
     std::printf("testOracle...\n"); testOracle();
     std::printf("testBottomCards...\n"); testBottomCards();
+    std::printf("testShaping...\n"); testShaping();
     std::printf("testEpisodeReturn...\n"); testEpisodeReturn();
     std::printf("testDouzeroFeatures...\n"); testDouzeroFeatures();
     std::printf("testRandomGames...\n"); testRandomGames();

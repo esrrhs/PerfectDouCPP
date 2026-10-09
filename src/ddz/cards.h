@@ -57,10 +57,12 @@ struct CardSet {
     std::string str() const;             // e.g. "33344BR" (ascending rank order)
     static CardSet parse(std::string_view s);
 
-    // Stable 64-bit key (2 bits per rank, counts are in 0..4).
+    // Stable 64-bit key. Counts are 0..4, so each rank needs 3 bits
+    // (15 * 3 = 45). Two bits overflow a count of 4 into the next rank
+    // and dedupe then drops bombs.
     uint64_t key() const {
         uint64_t k = 0;
-        for (int r = 0; r < kRanks; ++r) k |= uint64_t(c[r]) << (2 * r);
+        for (int r = 0; r < kRanks; ++r) k |= uint64_t(c[r]) << (3 * r);
         return k;
     }
 };

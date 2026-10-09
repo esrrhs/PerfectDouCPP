@@ -2,7 +2,7 @@
 //
 // Faithful re-implementation of the PerfectDou card-play training:
 //   * three seat models (landlord / landlord_down / landlord_up), self-play
-//   * imperfect-information actor over the 621 abstract actions
+//   * imperfect-information actor over concrete legal plays
 //   * perfect-information critic (sees all hands, PTIE / perfect information
 //     distillation through the advantage)
 //   * PPO + GAE, oracle distance-to-win shaping plus terminal ADP reward

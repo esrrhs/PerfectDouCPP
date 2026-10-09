@@ -47,6 +47,12 @@ struct Game {
     int prevSeat() const { return (turn + 2) % 3; }
     int nextSeat() const { return (turn + 1) % 3; }
 
+    // Small end-of-game term added to ADP. Magnitude is at most 0.5, so the
+    // bomb score still decides the sign. Losing with fewer cards left scores
+    // higher; winning while the opposing side has played fewer cards scores
+    // higher. A landlord averages the two peasants.
+    float shaping(int seat) const;
+
     // ADP payoff from the seat's perspective (base 2 for landlord, 1 for
     // each peasant, doubled per bomb/rocket).
     double payoff(int seat) const;

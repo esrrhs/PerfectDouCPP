@@ -15,9 +15,11 @@ namespace nn {
 
 constexpr int kImpInput = 1676;  // 9*180 current-state binaries + 56 one-hots
 constexpr int kExtraInput = 362;
-constexpr int kLstmSteps = 5;
+constexpr int kLstmSteps = 10;
 constexpr int kLstmIn = 540;     // three consecutive moves per LSTM step
-constexpr int kNumActions = 621;
+// Logit width for one decision. Concrete legal moves are scored in slots
+// 0..n-1. Random 20-card hands peaked at 316 moves, so 512 leaves room.
+constexpr int kNumActions = 512;
 constexpr int kActionInput = 186; // 12*15 action matrix + 6 properties
 
 struct Param {
@@ -135,9 +137,9 @@ struct NetConfig {
 
 // Imperfect-information policy network.
 // Released-model architecture:
-//   LSTM(540 -> 128) over five groups of three historical moves
+//   LSTM(540 -> 128) over ten groups of three historical moves
 //   concat node embedding with every legal 186-D action representation
-//   shared MLP [256,256,256,512,1], scattered into 621 logits
+//   shared MLP [256,256,256,512,1], scattered into concrete-action logits
 struct Actor {
     NetConfig cfg;
     Lstm lstm;

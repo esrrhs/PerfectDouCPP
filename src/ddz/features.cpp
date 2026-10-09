@@ -1,7 +1,6 @@
 #include "ddz/features.h"
 
 #include <algorithm>
-#include <unordered_set>
 
 #include "ddz/oracle.h"
 
@@ -113,8 +112,8 @@ EncodedState encodeState(const Game& g) {
 
 namespace {
 
-bool isLargest(const AbstractAction& a) {
-    switch (a.kind) {
+bool isLargest(const MoveInfo& a) {
+    switch (a.type) {
         case MT_ROCKET: return true;
         case MT_SINGLE: return a.rank == 14;  // red joker
         case MT_BOMB:
@@ -144,38 +143,25 @@ std::vector<LegalOption> legalOptions(const Game& g) {
     int prev = g.prevSeat();
     int nxt = g.nextSeat();
 
+    // One option per concrete legal play, including each distinct set of
+    // plane or four-with-two kickers. abstractId is the local slot.
     std::vector<LegalOption> out;
-    std::unordered_set<int> seen;
-    for (const CardSet& m : concrete) {
-        MoveInfo info = detectMove(m);
-        int id = concreteToAbstract(m, info);
-        // The DouZero generator can produce a few degenerate combinations that
-        // its own detector labels WRONG (not legal under Tencent rules); skip.
-        if (id >= 0) seen.insert(id);
-        // The official 27,472 -> 621 mapping is one-to-many for ambiguous
-        // planes (e.g. four consecutive trios can also be a shorter plane
-        // with trio kickers). Preserve all official abstract choices.
-        for (const AbstractAction& a : abstractTable())
-            if (a.hasKicker && abstractMatches(a, m)) seen.insert(a.id);
-    }
-    std::vector<int> ids(seen.begin(), seen.end());
-    std::sort(ids.begin(), ids.end());
-    for (int id : ids) {
-        CardSet chosen = decodeConcrete(id, concrete, g.hand[seat]);
+    out.reserve(concrete.size());
+    for (const CardSet& chosen : concrete) {
+        MoveInfo info = detectMove(chosen);
+        if (info.type == MT_WRONG) continue;
         LegalOption o;
-        o.abstractId = id;
+        o.abstractId = static_cast<int>(out.size());
         o.concrete = chosen;
-        const AbstractAction& a = abstractTable()[id];
         int size = chosen.total();
-        // The network has to see the kickers that will actually be played.
         std::array<uint8_t, kCardMat> card{};
         cardMatrix(chosen, card.data());
         for (int j = 0; j < kCardMat; ++j) o.feature[j] = float(card[j]);
         float* ex = o.feature.data() + kCardMat;
-        ex[0] = (a.kind == MT_BOMB || a.kind == MT_ROCKET) ? 1.0f : 0.0f;
-        ex[1] = isLargest(a) ? 1.0f : 0.0f;
-        ex[2] = (size == g.hand[nxt].total()) ? 1.0f : 0.0f;
-        ex[3] = (size == g.hand[prev].total()) ? 1.0f : 0.0f;
+        ex[0] = (info.type == MT_BOMB || info.type == MT_ROCKET) ? 1.0f : 0.0f;
+        ex[1] = isLargest(info) ? 1.0f : 0.0f;
+        ex[2] = (size > 0 && size == g.hand[nxt].total()) ? 1.0f : 0.0f;
+        ex[3] = (size > 0 && size == g.hand[prev].total()) ? 1.0f : 0.0f;
         CardSet after = g.hand[seat];
         after.sub(chosen);
         ex[4] = float(minSteps(after)) / 20.0f;

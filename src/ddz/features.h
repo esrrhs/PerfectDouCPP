@@ -1,9 +1,9 @@
 // Node / action feature engineering, following PerfectDou paper Tables 1, 5, 6.
 //
 // Imperfect node features (observable by the acting player):
-//   24 card matrices of 12 x 15
+//   39 card matrices of 12 x 15
 //     own hand, the other two players' cards, my/prev/next played cards,
-//     the 3 bottom cards, own/prev/next last move, last 15 moves
+//     the 3 bottom cards, own/prev/next last move, last 30 moves
 //   + one-hot hand counts (20+20), one-hot bomb count (15), control flag
 // Additional perfect features (critic only):
 //   2 card matrices (prev hand, next hand) + 2 min-step scalars = 362
@@ -24,14 +24,13 @@
 namespace ddz {
 
 constexpr int kCardMat = 12 * kRanks;  // 180
-constexpr int kHistoryLen = 15;
-constexpr int kHistoryGroups = 5;  // official model: 5 LSTM steps x 3 moves
+constexpr int kHistoryLen = 30;
+constexpr int kHistoryGroups = 10;  // 10 LSTM steps x 3 moves
 constexpr int kStaticMatrices = 9;
-// The released model has 24 imperfect matrices: nine current-state matrices
-// and the last 15 moves.  The ninth static matrix is the current player's
-// own last move (the paper's table only lists the two opponents' last moves).
+// Nine current-state matrices plus the last 30 moves. The ninth static
+// matrix is the current player's own last move.
 constexpr int kImpMatrices = kStaticMatrices + kHistoryLen;
-constexpr int kImpBin = kImpMatrices * kCardMat;  // 4320
+constexpr int kImpBin = kImpMatrices * kCardMat;  // 7020
 constexpr int kHandHot = 20;   // DouZero: one-hot of cards left, index = count-1
 constexpr int kBombHot = 15;   // DouZero: one-hot of bombs shown, including zero
 constexpr int kImpScalars = kHandHot + kHandHot + kBombHot + 1;
@@ -60,8 +59,7 @@ struct LegalOption {
 // Encodes the node for the player whose turn it currently is.
 EncodedState encodeState(const Game& g);
 
-// Builds legal abstract options for the player whose turn it is, decoding
-// each abstract action to the concrete move that will actually be played.
+// One option per concrete legal play. abstractId is the local slot 0..n-1.
 std::vector<LegalOption> legalOptions(const Game& g);
 
 // Writes the static 12x15 matrix of an abstract action into `out`.

@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <thread>
 
 #include "ddz/oracle.h"
@@ -10,6 +11,8 @@
 namespace algo {
 
 static_assert(nn::kImpInput == ddz::kNodeSize, "actor input must match node features");
+static_assert(ddz::kHistoryGroups * 3 == ddz::kHistoryLen, "history grouping");
+static_assert(nn::kLstmSteps == ddz::kHistoryGroups, "LSTM steps follow history");
 
 namespace {
 
@@ -177,6 +180,11 @@ void runWorker(const ModelSet& models, const RolloutConfig& cfg, int nGames,
             for (int i = 0; i < B; ++i) {
                 const Game& g = games[idxs[i]];
                 options[i] = legalOptions(g);
+                if ((int)options[i].size() > kNumActions) {
+                    std::fprintf(stderr, "legal moves %d exceed logit width %d\n",
+                                 (int)options[i].size(), kNumActions);
+                    std::abort();
+                }
                 tr[i] = encodeTransition(g, options[i]);
                 tr[i].gameId = idxs[i];
             }
@@ -203,11 +211,11 @@ void runWorker(const ModelSet& models, const RolloutConfig& cfg, int nGames,
                 }
                 // masked softmax + categorical sampling
                 float mx = -1e30f;
-                for (int a = 0; a < kAbstractActions; ++a)
+                for (int a = 0; a < kNumActions; ++a)
                     mx = std::max(mx, logits.row(i)[a]);
-                float probs[kAbstractActions];
+                float probs[kNumActions];
                 float sum = 0.0f;
-                for (int a = 0; a < kAbstractActions; ++a) {
+                for (int a = 0; a < kNumActions; ++a) {
                     probs[a] = expf(logits.row(i)[a] - mx);
                     sum += probs[a];
                 }
@@ -257,7 +265,7 @@ void runWorker(const ModelSet& models, const RolloutConfig& cfg, int nGames,
                         int idx = lastIdx[s][gi];
                         if (idx >= 0) {
                             auto& t = res.seats[s][idx];
-                            t.reward += float(g.payoff(s));
+                            t.reward += float(g.payoff(s)) + g.shaping(s);
                             t.terminal = true;
                         }
                     }
