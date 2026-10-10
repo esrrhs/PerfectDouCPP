@@ -33,6 +33,7 @@ using PFN_cuCtxGetCurrent = CUresult(CUDAAPI*)(CUcontext*);
 using PFN_cuImportExternalMemory = CUresult(CUDAAPI*)(CUexternalMemory*, const CUDA_EXTERNAL_MEMORY_HANDLE_DESC*);
 using PFN_cuExternalMemoryGetMappedBuffer = CUresult(CUDAAPI*)(CUdeviceptr*, CUexternalMemory, const CUDA_EXTERNAL_MEMORY_BUFFER_DESC*);
 using PFN_cuDestroyExternalMemory = CUresult(CUDAAPI*)(CUexternalMemory);
+using PFN_cuMemFree_v2 = CUresult(CUDAAPI*)(CUdeviceptr);
 using PFN_cuMemcpyDtoH_v2 = CUresult(CUDAAPI*)(void*, CUdeviceptr, size_t);
 using PFN_cuStreamCreate = CUresult(CUDAAPI*)(CUstream*, unsigned int);
 using PFN_cuStreamSynchronize = CUresult(CUDAAPI*)(CUstream);
@@ -75,6 +76,7 @@ struct Api {
     PFN_cuImportExternalMemory cuImportExternalMemory = nullptr;
     PFN_cuExternalMemoryGetMappedBuffer cuExternalMemoryGetMappedBuffer = nullptr;
     PFN_cuDestroyExternalMemory cuDestroyExternalMemory = nullptr;
+    PFN_cuMemFree_v2 cuMemFree = nullptr;
     PFN_cuMemcpyDtoH_v2 cuMemcpyDtoH = nullptr;
     PFN_cuStreamCreate cuStreamCreate = nullptr;
     PFN_cuStreamSynchronize cuStreamSynchronize = nullptr;
@@ -207,6 +209,7 @@ bool loadApi() {
            loadOne(g_api.nvcuda, "cuImportExternalMemory", g_api.cuImportExternalMemory) &&
            loadOne(g_api.nvcuda, "cuExternalMemoryGetMappedBuffer", g_api.cuExternalMemoryGetMappedBuffer) &&
            loadOne(g_api.nvcuda, "cuDestroyExternalMemory", g_api.cuDestroyExternalMemory) &&
+           loadOne(g_api.nvcuda, "cuMemFree_v2", g_api.cuMemFree) &&
            loadOne(g_api.nvcuda, "cuMemcpyDtoH_v2", g_api.cuMemcpyDtoH) &&
            loadOne(g_api.nvcuda, "cuStreamCreate", g_api.cuStreamCreate) &&
            loadOne(g_api.nvcuda, "cuStreamSynchronize", g_api.cuStreamSynchronize) &&
@@ -249,6 +252,7 @@ void dropAll() {
         ln.busy = false;
     }
     for (auto& kv : g_maps) {
+        if (kv.second.ptr && g_api.cuMemFree) g_api.cuMemFree(kv.second.ptr);
         if (kv.second.mem) g_api.cuDestroyExternalMemory(kv.second.mem);
     }
     g_maps.clear();
@@ -936,6 +940,8 @@ void cudaBridgeDrop(ID3D12Resource* resource) {
     if (!g_ready) return;
     auto it = g_maps.find(resource);
     if (it == g_maps.end()) return;
+    if (g_ctx) g_api.cuCtxSetCurrent(g_ctx);
+    if (it->second.ptr && g_api.cuMemFree) g_api.cuMemFree(it->second.ptr);
     if (it->second.mem) g_api.cuDestroyExternalMemory(it->second.mem);
     g_maps.erase(it);
 }

@@ -766,15 +766,25 @@ void transition(Res* r, D3D12_RESOURCE_STATES to) {
 UpAlloc allocUpload(size_t bytes) {
     Ctx& c = ctx();
     size_t need = align256(std::max(bytes, size_t(1)));
+    Upload* best = nullptr;
+    size_t minWaste = SIZE_MAX;
     for (Upload& u : c.uploads) {
         if (u.used + need <= u.cap) {
-            size_t off = u.used;
-            u.used += need;
-            return {u.p, off, u.map + off};
+            size_t waste = u.cap - (u.used + need);
+            if (waste < minWaste) {
+                minWaste = waste;
+                best = &u;
+            }
         }
     }
+    if (best) {
+        size_t off = best->used;
+        best->used += need;
+        return {best->p, off, best->map + off};
+    }
     Upload u;
-    u.cap = std::max(need, size_t(32u << 20));
+    constexpr size_t kUpBase = 32u << 20;
+    u.cap = ((need + kUpBase - 1) / kUpBase) * kUpBase;
     u.p = createBuffer(u.cap, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_FLAG_NONE,
                        D3D12_RESOURCE_STATE_GENERIC_READ);
     if (!u.p) {
@@ -800,16 +810,21 @@ View allocScratch(size_t bytes, const void* seed) {
     Ctx& c = ctx();
     size_t need = align256(bytes);
     Chunk* ch = nullptr;
+    size_t minWaste = SIZE_MAX;
     for (Chunk& cand : c.chunks) {
         if (cand.used + need <= cand.res.cap) {
-            ch = &cand;
-            break;
+            size_t waste = cand.res.cap - (cand.used + need);
+            if (waste < minWaste) {
+                minWaste = waste;
+                ch = &cand;
+            }
         }
     }
     if (!ch) {
         c.chunks.emplace_back();
         ch = &c.chunks.back();
-        ch->res.cap = std::max(need, size_t(32u << 20));
+        constexpr size_t kChunkBase = 64u << 20;
+        ch->res.cap = ((need + kChunkBase - 1) / kChunkBase) * kChunkBase;
         ch->res.state = D3D12_RESOURCE_STATE_COMMON;
         ch->res.p = createBuffer(ch->res.cap, D3D12_HEAP_TYPE_DEFAULT,
                                  D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
@@ -1947,13 +1962,53 @@ bool d3dRecreate() {
     return d3dInit();
 }
 
+void resetAndTrimScratch(Ctx& c, bool keepWindow) {
+    if (!keepWindow) {
+        c.window.clear();
+        for (Chunk& ch : c.chunks) ch.used = 0;
+        constexpr size_t kMaxScratchCap = 384u << 20;
+        size_t totalCap = 0;
+        for (const auto& ch : c.chunks) totalCap += ch.res.cap;
+        while (c.chunks.size() > 2 && totalCap > kMaxScratchCap) {
+            Chunk& ch = c.chunks.back();
+            totalCap -= ch.res.cap;
+            if (ch.res.p) {
+                cudaBridgeDrop(ch.res.p);
+                ch.res.p->Release();
+            }
+            c.chunks.pop_back();
+        }
+    }
+    for (Upload& u : c.uploads) u.used = 0;
+    constexpr size_t kMaxUploadCap = 96u << 20;
+    size_t totalUpCap = 0;
+    for (const auto& u : c.uploads) totalUpCap += u.cap;
+    while (c.uploads.size() > 2 && totalUpCap > kMaxUploadCap) {
+        Upload& u = c.uploads.back();
+        totalUpCap -= u.cap;
+        if (u.p) {
+            u.p->Unmap(0, nullptr);
+            u.p->Release();
+        }
+        c.uploads.pop_back();
+    }
+    for (Slot* s : c.graveyard) releaseSlot(s);
+    c.graveyard.clear();
+}
+
 void d3dPrintStats(const char* tag) {
     Ctx& c = ctx();
+    size_t chunkMB = 0;
+    for (const auto& ch : c.chunks) chunkMB += ch.res.cap;
+    chunkMB /= (1024 * 1024);
+    size_t upMB = 0;
+    for (const auto& u : c.uploads) upMB += u.cap;
+    upMB /= (1024 * 1024);
     std::fprintf(stderr,
                  "[d3d %s] seat=%d CB=%lld enc=%lld waitMs=%.1f encMs=%.1f "
-                 "stageMB=%.1f flushMB=%.1f\n",
+                 "stageMB=%.1f flushMB=%.1f scratchMB=%zu (%zu chunks) upMB=%zu\n",
                  tag, c.seat, c.nWait, c.nCommit, c.waitSec * 1e3, c.encSec * 1e3,
-                 c.stageBytes / 1e6, c.flushBytes / 1e6);
+                 c.stageBytes / 1e6, c.flushBytes / 1e6, chunkMB, c.chunks.size(), upMB);
     c.nWait = c.nCommit = 0;
     c.stageBytes = c.flushBytes = 0;
     c.waitSec = c.encSec = 0;
@@ -1979,8 +2034,10 @@ void cudaReadback(bool keepWindow) {
     // Dirty gradients stay on the device until d3dFlushGrad. Copying them on
     // every minibatch fence was more than a gigabyte per seat.
     if (c.cudaOps.empty() && !c.recording && c.pending.empty() && !hostRead &&
-        !cudaBridgeHasWork())
+        !cudaBridgeHasWork()) {
+        resetAndTrimScratch(c, keepWindow);
         return;
+    }
     auto t0 = std::chrono::steady_clock::now();
     if (!replayCuda() || !cudaBridgeSync()) {
         if (cudaBridgeHasWork() || !c.cudaOps.empty()) {
@@ -2012,14 +2069,9 @@ void cudaReadback(bool keepWindow) {
             c.dirtyGrads.clear();
             return;
         }
+        b.toHost = false;
     }
-    if (!keepWindow) {
-        c.window.clear();
-        for (Chunk& ch : c.chunks) ch.used = 0;
-    }
-    for (Upload& u : c.uploads) u.used = 0;
-    for (Slot* s : c.graveyard) releaseSlot(s);
-    c.graveyard.clear();
+    resetAndTrimScratch(c, keepWindow);
     ++c.nWait;
     c.waitSec += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
 }
@@ -2048,7 +2100,10 @@ void d3dWait(bool keepWindow) {
         cudaReadback(keepWindow);
         return;
     }
-    if (!c.recording && c.pending.empty() && c.dirtyGrads.empty()) return;
+    if (!c.recording && c.pending.empty() && c.dirtyGrads.empty()) {
+        resetAndTrimScratch(c, keepWindow);
+        return;
+    }
     auto t0 = std::chrono::steady_clock::now();
     flushPending();
     if (!ensureRecording() && !c.recording) return;
@@ -2092,8 +2147,7 @@ void d3dWait(bool keepWindow) {
         c.pending.clear();
         c.window.clear();
         c.dirtyGrads.clear();
-        for (Chunk& ch : c.chunks) ch.used = 0;
-        for (Upload& u : c.uploads) u.used = 0;
+        resetAndTrimScratch(c, false);
         return;
     }
     if (c.fence && c.fenceValue != 0 &&
@@ -2107,8 +2161,7 @@ void d3dWait(bool keepWindow) {
         c.pending.clear();
         c.window.clear();
         c.dirtyGrads.clear();
-        for (Chunk& ch : c.chunks) ch.used = 0;
-        for (Upload& u : c.uploads) u.used = 0;
+        resetAndTrimScratch(c, false);
         return;
     }
     for (Job& j : jobs) {
@@ -2120,13 +2173,7 @@ void d3dWait(bool keepWindow) {
         }
     }
     c.dirtyGrads.clear();
-    if (!keepWindow) {
-        c.window.clear();
-        for (Chunk& ch : c.chunks) ch.used = 0;
-    }
-    for (Upload& u : c.uploads) u.used = 0;
-    for (Slot* s : c.graveyard) releaseSlot(s);
-    c.graveyard.clear();
+    resetAndTrimScratch(c, keepWindow);
     c.waitSec += std::chrono::duration<double>(
                      std::chrono::steady_clock::now() - t0)
                      .count();
