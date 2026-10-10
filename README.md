@@ -244,7 +244,7 @@ src/ddz/      出牌规则、15 种牌型判定/生成、621 维抽象动作空�
 src/nn/       基础矩阵算子、GEMM 加速、Linear/ReLU/LSTM、Actor/Critic 神经网络、Adam 优化器
 src/algo/     自对弈 Rollout 采集器、GAE 优势估计、PPO 策略更新、内置 DouZero 对战评测驱动与快照
 src/          训练主入口 train.cpp、独立评测入口 eval_douzero.cpp
-tools/        DouZero TCP 服务端 douzero_serve.py、胜率曲线绘制 plot_eval.py、评测轮询脚本
+tools/        DouZero TCP 服务端 douzero_serve.py、胜率曲线绘制 plot_eval.py
 tests/        Google Test 单元测试套件（规则、自对弈、反向传播梯度、PPO 算法、防爆熔断、Mock 评测）
 ```
 
