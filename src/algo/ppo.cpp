@@ -46,14 +46,21 @@ namespace {
 
 void maskedSoftmax(const float* logits, int n, float* probs) {
     float mx = -1e30f;
-    for (int a = 0; a < n; ++a) mx = std::max(mx, logits[a]);
+    for (int a = 0; a < n; ++a) {
+        if (logits[a] > mx) mx = logits[a];
+    }
     float sum = 0.0f;
     for (int a = 0; a < n; ++a) {
-        probs[a] = logits[a] < -1e8f ? 0.0f : std::exp(logits[a] - mx);
+        probs[a] = (logits[a] < -1e8f || !std::isfinite(logits[a])) ? 0.0f : std::exp(logits[a] - mx);
         sum += probs[a];
     }
-    float inv = 1.0f / sum;
-    for (int a = 0; a < n; ++a) probs[a] *= inv;
+    if (sum > 0.0f && std::isfinite(sum)) {
+        float inv = 1.0f / sum;
+        for (int a = 0; a < n; ++a) probs[a] *= inv;
+    } else {
+        float uni = 1.0f / float(n);
+        for (int a = 0; a < n; ++a) probs[a] = uni;
+    }
 }
 
 }  // namespace
@@ -341,6 +348,7 @@ bool ppoUpdate(nn::Actor& actor, nn::Critic& critic,
                 float ratio = std::exp(logRatio);
                 // Approx KL divergence: (ratio - 1) - log(ratio) (k3 approximation, non-negative)
                 float approxKL = (ratio - 1.0f) - logRatio;
+                if (!std::isfinite(approxKL) || approxKL < 0.0f) approxKL = 0.0f;
                 mbKLSum += approxKL;
 
                 float s = mb[i]->adv;

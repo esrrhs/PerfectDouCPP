@@ -115,7 +115,8 @@ constexpr int kLanes = 8;
 struct Lane {
     CUstream stream = nullptr;
     cublasHandle_t blas = nullptr;
-    bool busy = false;
+    uint64_t submitted = 0;
+    uint64_t completed = 0;
 };
 Lane g_lanes[kLanes];
 std::mutex g_laneMus[kLanes];
@@ -243,8 +244,9 @@ bool enter() {
 void dropAll() {
     if (g_ctx) g_api.cuCtxSetCurrent(g_ctx);
     for (Lane& ln : g_lanes) {
-        if (ln.busy && ln.stream) g_api.cuStreamSynchronize(ln.stream);
-        ln.busy = false;
+        if (ln.submitted > ln.completed && ln.stream) g_api.cuStreamSynchronize(ln.stream);
+        ln.submitted = 0;
+        ln.completed = 0;
     }
     for (auto& kv : g_maps) {
         if (kv.second.ptr && g_api.cuMemFree) g_api.cuMemFree(kv.second.ptr);
@@ -736,6 +738,9 @@ bool cudaBridgeGemm(ID3D12Device* device,
     std::snprintf(line, sizeof(line), "gemm %c%c %d %d %d ld %d %d %d",
                   transA, transB, M, N, K, lda, ldb, ldc);
     crumb(line);
+    int idx = laneIndex();
+    if (idx < 0 || idx >= kLanes) return false;
+    std::lock_guard<std::mutex> laneLock(g_laneMus[idx]);
     std::lock_guard<std::mutex> lock(g_mu);
     if (!ensureInit()) return false;
     CUdeviceptr pa = 0, pb = 0, pc = 0;
@@ -753,7 +758,7 @@ bool cudaBridgeGemm(ID3D12Device* device,
     const float* A = reinterpret_cast<const float*>(pa + aOff);
     const float* B = reinterpret_cast<const float*>(pb + bOff);
     float* C = reinterpret_cast<float*>(pc + cOff);
-    Lane& ln = g_lanes[laneIndex()];
+    Lane& ln = g_lanes[idx];
     cublasStatus_t bs = g_api.cublasSgemm(ln.blas, opB, opA, N, M, K, &alpha, B, ldb, A, lda, &beta, C, ldc);
     std::snprintf(line, sizeof(line), "gemm done %d", (int)bs);
     crumb(line);
@@ -761,7 +766,7 @@ bool cudaBridgeGemm(ID3D12Device* device,
         std::snprintf(g_err, sizeof(g_err), "cublasSgemm failed (%d)", (int)bs);
         return false;
     }
-    ln.busy = true;
+    ++ln.submitted;
     return true;
 }
 
@@ -773,6 +778,9 @@ bool cudaBridgeKernel(ID3D12Device* device, const char* name,
     std::snprintf(line, sizeof(line), "kern %s %u %u nbuf %d cbytes %zu",
                   name, gridX, gridY, nbuf, cbytes);
     crumb(line);
+    int idx = laneIndex();
+    if (idx < 0 || idx >= kLanes) return false;
+    std::lock_guard<std::mutex> laneLock(g_laneMus[idx]);
     std::lock_guard<std::mutex> lock(g_mu);
     if (!ensureInit() || !ensureModule()) {
         crumb("kern init fail");
@@ -841,13 +849,13 @@ bool cudaBridgeKernel(ID3D12Device* device, const char* name,
         for (int i = 0; i < nint; ++i) args[na++] = &ints[i];
     }
     crumb("kern launch");
-    Lane& ln = g_lanes[laneIndex()];
+    Lane& ln = g_lanes[idx];
     CUresult st = g_api.cuLaunchKernel(fn, gridX, gridY, 1, bx, by, 1, shmem, ln.stream, args, nullptr);
     if (st != CUDA_SUCCESS) {
         setCu(st, name);
         return false;
     }
-    ln.busy = true;
+    ++ln.submitted;
     return true;
 }
 
@@ -860,11 +868,13 @@ bool syncLane(int idx) {
     if (idx < 0 || idx >= kLanes) return false;
     std::lock_guard<std::mutex> laneLock(g_laneMus[idx]);
     CUstream s = nullptr;
+    uint64_t target = 0;
     {
         std::lock_guard<std::mutex> lock(g_mu);
         if (!ensureInit()) return false;
-        if (!g_lanes[idx].busy) return true;
+        if (g_lanes[idx].submitted <= g_lanes[idx].completed) return true;
         s = g_lanes[idx].stream;
+        target = g_lanes[idx].submitted;
     }
     CUresult st = g_api.cuStreamSynchronize(s);
     std::lock_guard<std::mutex> lock(g_mu);
@@ -872,14 +882,16 @@ bool syncLane(int idx) {
         setCu(st, "cuStreamSynchronize");
         return false;
     }
-    g_lanes[idx].busy = false;
+    if (target > g_lanes[idx].completed) {
+        g_lanes[idx].completed = target;
+    }
     return true;
 }
 
 bool cudaBridgeHasWork() {
     std::lock_guard<std::mutex> lock(g_mu);
     int idx = t_lane < 0 ? 0 : t_lane;
-    return g_lanes[idx].busy;
+    return g_lanes[idx].submitted > g_lanes[idx].completed;
 }
 
 bool cudaBridgeSync() {
