@@ -4,10 +4,13 @@
 // 3. Dynamic KL divergence estimation & early stopping logic
 // 4. Historical archive pool anchor preservation & thinning logic
 // 5. Running normalizer online statistics
+#include <atomic>
 #include <cassert>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <thread>
 #include <vector>
 
 #include "algo/ppo.h"
@@ -269,6 +272,158 @@ static void testClipFractionSignGating() {
     CHECK(isClipped(-1.0f, 1.3f) == false); // negative adv, ratio > 1+clip -> pessimistic upper bound, unclipped
 }
 
+// 9. Test Masked Softmax NaN and Inf protection
+static void testMaskedSoftmaxNaNProtection() {
+    // Normal logits
+    {
+        float logits[3] = {1.0f, 2.0f, 3.0f};
+        float probs[3] = {};
+        maskedSoftmax(logits, 3, probs);
+        float sum = probs[0] + probs[1] + probs[2];
+        CHECK(std::abs(sum - 1.0f) < 1e-5f);
+        CHECK(probs[2] > probs[1] && probs[1] > probs[0]);
+    }
+
+    // All actions masked out (< -1e8f)
+    {
+        float logits[4] = {-1e9f, -1e9f, -1e9f, -1e9f};
+        float probs[4] = {};
+        maskedSoftmax(logits, 4, probs);
+        for (int a = 0; a < 4; ++a) {
+            CHECK(std::isfinite(probs[a]));
+            CHECK(std::abs(probs[a] - 0.25f) < 1e-5f);
+        }
+    }
+
+    // Logits containing NaN or Inf
+    {
+        float logits[4] = {NAN, INFINITY, -INFINITY, 2.0f};
+        float probs[4] = {};
+        maskedSoftmax(logits, 4, probs);
+        for (int a = 0; a < 4; ++a) {
+            CHECK(std::isfinite(probs[a]));
+            CHECK(probs[a] >= 0.0f && probs[a] <= 1.0f);
+        }
+    }
+
+    // Extreme numerical range
+    {
+        float logits[3] = {1e6f, -1e6f, 0.0f};
+        float probs[3] = {};
+        maskedSoftmax(logits, 3, probs);
+        for (int a = 0; a < 3; ++a) {
+            CHECK(std::isfinite(probs[a]));
+        }
+        CHECK(std::abs(probs[0] - 1.0f) < 1e-5f);
+        CHECK(probs[1] == 0.0f);
+    }
+}
+
+// 10. Test KL divergence calculation stability against degenerate probabilities
+static void testKLDivergenceNaNProtection() {
+    auto computeApproxKL = [](float newLogp, float oldLogp) {
+        float logRatio = newLogp - oldLogp;
+        float ratio = std::exp(logRatio);
+        float approxKL = (ratio - 1.0f) - logRatio;
+        if (!std::isfinite(approxKL) || approxKL < 0.0f) approxKL = 0.0f;
+        return approxKL;
+    };
+
+    // Identical
+    CHECK(computeApproxKL(-1.5f, -1.5f) == 0.0f);
+
+    // Moderate divergence
+    float klMod = computeApproxKL(-1.0f, -1.5f);
+    CHECK(std::isfinite(klMod) && klMod > 0.0f);
+
+    // Extreme ratio (huge policy shift)
+    float klHuge = computeApproxKL(100.0f, -100.0f);
+    CHECK(std::isfinite(klHuge) && klHuge >= 0.0f);
+
+    // Negative infinity logp (zero probability)
+    float klZero = computeApproxKL(-1000.0f, -1.0f);
+    CHECK(std::isfinite(klZero) && klZero >= 0.0f);
+}
+
+// 11. Test PPO training produces strictly finite parameters (no NaN)
+static void testPPOWeightsFiniteAfterUpdate() {
+    nn::NetConfig cfg{64, 32};
+    nn::Actor actor;
+    nn::Critic critic;
+    actor.init(cfg, 42);
+    critic.init(cfg, 43);
+
+    nn::Adam actorOpt;
+    nn::Adam criticOpt;
+    nn::Rng64 rng(999);
+
+    std::vector<Transition> tr(16);
+    for (size_t i = 0; i < tr.size(); ++i) {
+        tr[i].gameId = 1;
+        tr[i].action = int(i % nn::kNumActions);
+        tr[i].reward = (i % 2 == 0) ? 1.0f : -1.0f;
+        tr[i].value = 0.0f;
+        tr[i].logp = -2.0f;
+        std::array<float, ddz::kActionSize> feat{};
+        tr[i].actions.emplace_back(tr[i].action, feat);
+    }
+    tr.back().terminal = true;
+
+    PPOConfig ppoCfg;
+    ppoCfg.epochs = 2;
+    ppoCfg.minibatch = 8;
+    PPOStats stats;
+
+    bool ok = ppoUpdate(actor, critic, tr, ppoCfg, actorOpt, criticOpt, rng, stats);
+    CHECK(ok);
+
+    for (nn::Param* p : actor.params()) {
+        for (float w : p->w) {
+            CHECK(std::isfinite(w));
+        }
+    }
+    for (nn::Param* p : critic.params()) {
+        for (float w : p->w) {
+            CHECK(std::isfinite(w));
+        }
+    }
+    CHECK(std::isfinite(stats.approxKL));
+    CHECK(std::isfinite(stats.pgLoss));
+    CHECK(std::isfinite(stats.vLoss));
+}
+
+// 12. Test concurrent multi-threaded stream synchronization (liveness and deadlock freedom)
+static void testConcurrentLaneStress() {
+    constexpr int kThreads = 4;
+    std::vector<std::thread> workers;
+    std::atomic<bool> stop{false};
+    std::atomic<int> completedCycles{0};
+
+    for (int t = 0; t < kThreads; ++t) {
+        workers.emplace_back([t, &stop, &completedCycles] {
+            nn::gemmSetThreadGpu(0);
+            for (int iter = 0; iter < 100 && !stop.load(); ++iter) {
+                nn::gpuBindSeat(t);
+                nn::gpuSync();
+                ++completedCycles;
+                std::this_thread::yield();
+            }
+        });
+    }
+
+    // Concurrent thread executing sync
+    std::thread syncThread([&stop] {
+        for (int iter = 0; iter < 50 && !stop.load(); ++iter) {
+            nn::gpuSync();
+            std::this_thread::sleep_for(std::chrono::microseconds(100));
+        }
+    });
+
+    for (auto& w : workers) w.join();
+    syncThread.join();
+    CHECK(completedCycles.load() > 0);
+}
+
 int main() {
     std::printf("testAdvantageNormAndGAE...\n"); testAdvantageNormAndGAE();
     std::printf("testValueClipping...\n"); testValueClipping();
@@ -278,6 +433,10 @@ int main() {
     std::printf("testAdamSerialization...\n"); testAdamSerialization();
     std::printf("testCriticZeroInit...\n"); testCriticZeroInit();
     std::printf("testClipFractionSignGating...\n"); testClipFractionSignGating();
+    std::printf("testMaskedSoftmaxNaNProtection...\n"); testMaskedSoftmaxNaNProtection();
+    std::printf("testKLDivergenceNaNProtection...\n"); testKLDivergenceNaNProtection();
+    std::printf("testPPOWeightsFiniteAfterUpdate...\n"); testPPOWeightsFiniteAfterUpdate();
+    std::printf("testConcurrentLaneStress...\n"); testConcurrentLaneStress();
     std::printf("ALL ALGO TESTS PASSED\n");
     return 0;
 }

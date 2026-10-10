@@ -68,6 +68,9 @@ struct RunningNormalizer {
 void assignEpisodeReturns(std::vector<Transition>& tr, float gamma = 1.0f,
                           float lambda = 0.95f);
 
+// Computes masked softmax over action logits, producing valid probabilities.
+void maskedSoftmax(const float* logits, int n, float* probs);
+
 // One PPO update of one seat's actor + critic over its rollout stream.
 // False means the GPU device was removed before Adam wrote host weights, so
 // the update can be repeated after the device is recreated.

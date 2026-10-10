@@ -42,8 +42,6 @@ void assignEpisodeReturns(std::vector<Transition>& tr, float gamma,
     }
 }
 
-namespace {
-
 void maskedSoftmax(const float* logits, int n, float* probs) {
     float mx = -1e30f;
     for (int a = 0; a < n; ++a) {
@@ -62,6 +60,8 @@ void maskedSoftmax(const float* logits, int n, float* probs) {
         for (int a = 0; a < n; ++a) probs[a] = uni;
     }
 }
+
+namespace {
 
 }  // namespace
 
@@ -495,6 +495,28 @@ bool ppoUpdate(nn::Actor& actor, nn::Critic& critic,
     stats.clipFraction = clipCountSum / samples;
     stats.epochsCompleted = (mbCount + batchesPerEpoch - 1) / std::max(1, batchesPerEpoch);
     (void)earlyStopped;
+
+    for (nn::Param* p : actor.params()) {
+        for (float w : p->w) {
+            if (!std::isfinite(w)) {
+                std::fprintf(stderr, "FATAL: Actor parameter contains NaN/Inf after ppoUpdate!\n");
+                return false;
+            }
+        }
+    }
+    for (nn::Param* p : critic.params()) {
+        for (float w : p->w) {
+            if (!std::isfinite(w)) {
+                std::fprintf(stderr, "FATAL: Critic parameter contains NaN/Inf after ppoUpdate!\n");
+                return false;
+            }
+        }
+    }
+    if (!std::isfinite(stats.approxKL) || !std::isfinite(stats.pgLoss) || !std::isfinite(stats.vLoss)) {
+        std::fprintf(stderr, "FATAL: PPOStats contains NaN/Inf (approxKL=%f, pgLoss=%f, vLoss=%f)!\n",
+                     stats.approxKL, stats.pgLoss, stats.vLoss);
+        return false;
+    }
     return true;
 }
 

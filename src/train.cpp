@@ -515,7 +515,16 @@ int main(int argc, char** argv) {
 
     auto waitLearners = [&] {
         std::unique_lock<std::mutex> lock(job.mu);
-        job.cv.wait(lock, [&] { return job.done == job.generation * nLearn; });
+        if (!job.cv.wait_for(lock, std::chrono::seconds(180), [&] {
+                return job.done == job.generation * nLearn;
+            })) {
+            std::fprintf(stderr,
+                         "FATAL: Timeout (180s) in waitLearners! done=%d expected=%d "
+                         "generation=%d (deadlock/hang detected)\n",
+                         job.done, job.generation * nLearn, job.generation);
+            std::fflush(stderr);
+            std::abort();
+        }
     };
     auto runLearn = [&](unsigned mask) {
         {
