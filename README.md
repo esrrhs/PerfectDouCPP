@@ -5,192 +5,216 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20Windows-lightgrey.svg)](https://github.com/esrrhs/PerfectDouCPP)
 
-斗地主 AI **PerfectDou**（NeurIPS 2022, *Dominating DouDizhu with Perfect
-Information Distillation*）的纯 C++17 工业级强化学习完整实现：零第三方依赖（仅
-pthread），包含超高速牌局引擎、特征工程、神经网络反向传播、PPO 自对弈与分层联赛（League Training）。
+**PerfectDouCPP** 是一套高性能、工业级的纯 C++17 斗地主强化学习端到端自对弈训练与评测系统。
 
-## 与论文的对应关系与工业级增强
+本项目借鉴了非完全信息博弈中**完美信息价值蒸馏（Perfect Information Distillation）**的核心理念，并进行了深度重构与工业级工程实现：**零重量级外部依赖**（仅使用标准 C++17、操作系统原生多线程与 socket），纯手写实现了超高速斗地主牌局规则引擎、特征工程、神经网络正反向传播算子、分层联赛对手池（League Training）以及鲁棒的 PPO 训练管线。单机多线程即可跑出极高的采样吞吐与稳定的收敛效果。
 
-| 论文 / 算法组件 | 本实现细节与工业级增强 |
-| --- | --- |
-| 牌局规则（附录 B，腾讯规则） | `src/ddz/moves.cpp`（15 种牌型，移植 DouZero 的生成/识别/压牌逻辑） |
-| 621 抽象动作 + 解码（附录 E.2） | `src/ddz/action_space.{h,cpp}`，Algo 2 kicker 打分 |
-| 不完美信息特征 24 个牌矩阵 + 手牌张数/炸弹 one-hot | `src/ddz/features.cpp`（包含公共底牌变化追踪） |
-| 完美信息特征 +2 手牌 +2 步数（critic） | 同上 |
-| 动作特征为实际打出的牌（含带牌）+6 | `legalOptions()` 动态计算 |
-| 最小出牌步数 oracle（附录 E.1） | `src/ddz/oracle.cpp`（DP + 记忆化 DFS，线程私有缓存，线程安全） |
-| LSTM(5×540，即每步拼接 3 次出牌) + 对每个合法动作共享 MLP[256,256,256,512,1] | `src/nn/net.cpp`（支持 CPU AMX/AVX2；Windows 训练 GPU 为 CUDA cuBLAS + D3D12 其余核） |
-| 完美信息价值网络 MLP[256×4] | `src/nn/net.cpp`（PTIE：完美 critic 通过优势蒸馏给不完美 actor） |
-| 终局 ADP 收益目标与微量 Shaping | 终局收益为地主 $\pm 2 \times 2^{\text{bomb}}$，农民 $\pm 1 \times 2^{\text{bomb}}$；默认启用 GAE（$\lambda=0.95$）降低多步决策方差（可通过 `--lambda 1.0` 退化为纯蒙特卡洛 ADP），辅以微量残局 Shaping（`--shaping-cap 0.05`，引导清牌且不扰动胜负格局） |
-| PPO 工业级策略裁剪与价值估计 | `src/algo/ppo.cpp`，实现策略裁剪 $L_{\text{CLIP}}$ 与优势值标准化（Advantage Normalization）；价值网络支持价值裁剪 $L_{\text{VF}}$（默认禁用 `--no-clip-vf`，避免绝对截断抑制炸弹翻倍大样本回归；可通过 `--clip-vf` 开启，阈值 `--vf-clip 32.0`） |
-| 动态 KL 散度与自适应早停 | $\text{approxKL} = (r - 1) - \ln r$，每个 Epoch 独立评估均值，超过 $1.5 \times \text{targetKL}$ 触发早停，防止策略崩溃 |
-| 分层联赛训练池（League Training） | `src/algo/rollout.cpp`，混合最近快照（Rolling Pool）、几何稀疏长期归档（Long-term Archive，锚定最早基线）与规则智能体（Heuristic RuleAgent），阵营级采样（地主独立抽样，两农民座位严格同步绑定同策略快照），保证农民合作一致性 |
-| 三个座位独立模型、批量自对弈 | `src/algo/rollout.cpp`（多线程无锁快照推进，原子安全） |
+---
 
-论文的叫牌阶段与分布式集群（880 CPU + 8 GPU、25 亿帧）未实现：本项目只训练
-出牌阶段（landlord 固定 20 张并先手，与 DouZero/PerfectDou 评估协议一致），
-单机多线程即可跑出工业级吞吐与稳定收敛。
+## 训练架构与从头到尾的流程
 
-官方仓库没有公开训练代码，只提供评测代码、二进制特征编码器和最终 ONNX。
-本实现对可验证部分同时对照论文和官方 ONNX；PPO epoch/clip/max-grad-norm 等论文
-未披露的值采用常见 PPO2 默认值。
+整个强化学习自对弈训练流程为一个高内聚、流水线化的闭环：
+
+```
+┌────────────────────────────────────────────────────────────────────────┐
+│                        1. 牌局引擎与特征工程                             │
+│   腾讯规则 (15种牌型)  ──►  621动作空间解码  ──►  最小步数 Oracle 记忆化缓存 │
+└───────────────────────────────────┬────────────────────────────────────┘
+                                    │
+                                    ▼
+┌────────────────────────────────────────────────────────────────────────┐
+│                   2. 多线程自对弈数据采集 (Rollout)                      │
+│  三个座位独立决策 (地主/下家/上家) ◄── 阵营协同保障 (双农民绑定同策略快照)     │
+│  对手池混合采样: 当前最新策略 + 滚动快照池 + 几何稀疏归档池 + 规则智能体基线     │
+└───────────────────────────────────┬────────────────────────────────────┘
+                                    │
+                                    ▼
+┌────────────────────────────────────────────────────────────────────────┐
+│                   3. 终局收益结算与优势估计 (GAE)                         │
+│  终局 ADP 奖励 (炸弹翻倍结算) ──► GAE (γ=1.0, λ=0.95) ──► 全局优势标准化  │
+└───────────────────────────────────┬────────────────────────────────────┘
+                                    │
+                                    ▼
+┌────────────────────────────────────────────────────────────────────────┐
+│                 4. 完美信息蒸馏与并行 PPO 优化 (Learn)                  │
+│  Critic 全知价值蒸馏 ──► 策略裁剪 L_CLIP ──► 余弦退火 (lr & 熵) ──► Adam   │
+│  数值防爆熔断: Masked Softmax 防 NaN ──► 动态 KL 散度自适应早停         │
+└───────────────────────────────────┬────────────────────────────────────┘
+                                    │
+                                    ▼
+┌────────────────────────────────────────────────────────────────────────┐
+│                 5. 策略热更新、模型落盘与断点续接                        │
+│  原子更新当前策略 ──► 周期性落盘完整 Checkpoint (权重 + Adam 动量)       │
+└───────────────────────────────────┬────────────────────────────────────┘
+                                    │
+                                    ▼
+┌────────────────────────────────────────────────────────────────────────┐
+│            6. 内置后台异步 DouZero 评测与趋势监控 (Eval Loop)            │
+│  零开销深拷贝模型 ──► 独立后台线程对弈 (正反手 200 局) ──► 写入 CSV/快照  │
+│  自动滚动淘汰旧快照 (硬防爆盘) ──► plot_eval.py 实时渲染胜率/ADP 曲线    │
+└────────────────────────────────────────────────────────────────────────┘
+```
+
+### 1. 牌局引擎与特征工程
+- **规则与合法动作**：严格实现腾讯斗地主 15 种合法牌型（单张、对子、三带、顺子、连对、飞机、炸弹、王炸等），动作空间映射为 621 维抽象动作，并通过算法快速解码最优实际出牌。
+- **最小出牌步数 Oracle**：内置动态规划与记忆化深度优先搜索（DFS）的求解器，工作线程配备私有缓存，能够毫秒级评估任意手牌清牌所需的最少手数。
+- **双重特征视角**：
+  - **不完美信息观察（用于 Actor）**：各家打牌历史序列矩阵（送入 LSTM 捕捉时序动态）+ 手牌与公开底牌特征矩阵。
+  - **完美信息观察（用于 Critic）**：包含所有玩家手牌的全知特征，赋予评论家全局评估能力。
+
+### 2. 多线程自对弈采集（Rollout）
+- **独立三座位决策**：地主（Landlord）、地主下家农民（Landlord Down）、地主上家农民（Landlord Up）拥有独立的神经网络。
+- **阵营合作一致性（Team Consistency）**：在自对弈采样中，地主独立抽样对手，而两个农民座位严格绑定相同的历史策略快照，防止因不同版本农民混搭导致策略自相矛盾。
+- **分层联赛机制（League Training）**：为防止自对弈陷入单一策略自转（Policy Cyclicality），对手由多层池子按概率混合组成：
+  - 当前最新策略快照；
+  - 滚动历史快照池（Rolling Pool，追踪近期迭代）；
+  - 几何稀疏长期归档池（Long-term Archive，保留最早和各关键阶段的锚点基线）；
+  - 经典启发式规则智能体（RuleAgent，维持基本人类牌理底线）。
+
+### 3. 终局收益结算与优势估计（Credit Assignment）
+- **ADP 终局奖励结算**：对局结束时，根据输赢及全局炸弹数量结算真实差分分值：地主为 $\pm 2 \times 2^{\text{bomb}}$，农民为 $\pm 1 \times 2^{\text{bomb}}$。
+- **广义优势估计（GAE）**：默认采用 $\gamma=1.0, \lambda=0.95$ 计算广义优势，有效降低长程轨迹多步决策的方差，辅以微量残局清牌引导 Shaping。
+- **优势标准化（Advantage Normalization）**：对整批轨迹的优势值做均值与方差归一化，稳定不同局况下的梯度更新尺度。
+
+### 4. 完美信息蒸馏与并行 PPO 优化（Learn）
+- **完美信息价值蒸馏（PTIE）**：Critic 接收包含三家手牌的全知特征，评估出的无偏状态价值通过优势函数指导仅能看到不完全信息的 Actor，完成隐式蒸馏。
+- **多座位并行更新**：三个座位的训练批次完全解耦，可在多线程下并行计算反向传播与梯度更新。
+- **自适应早停与余弦退火**：每个 Epoch 评估真实均值 KL 散度，超出 $1.5 \times \text{targetKL}$ 立即提前终止，防止策略突变崩溃；学习率与策略熵均沿余弦曲线平滑退火。
+- **工业级防爆与数值熔断**：
+  - **Masked Softmax 防 NaN**：当所有合法动作分数为极小值或溢出时，自动兜底均匀分布；
+  - **KL 散度边界保护**：防除零、防对数无穷大与非法概率裁剪；
+  - **训练样本清洗**：自动跳过包含非有限浮点数的脏样本；
+  - **原子动量存取**：Adam 优化器一阶/二阶动量安全序列化。
+
+### 5. 策略热更新与模型落盘
+- 训练完成后，最新权重无锁推进至自对弈池；
+- 按照 `--snapshot-every` 定期向输出目录保存完整检查点（包含 3 个座位的 Actor 权重、Critic 权重以及对应的 Adam 动量文件），支持随时通过 `--resume` 续训。
+
+### 6. 内置后台 DouZero 评测与胜率趋势监控
+- **原生内嵌对战评测**：每达一定步数（推荐 200~500 轮），训练进程自动将当前三个 Actor 深拷贝，扔进独立后台线程，并通过跨平台 Socket 直连开源 DouZero 服务展开 200 局（100 副牌正反手互换）对抗评测。
+- **快照存档与自动防爆盘**：评测触发时自动将模型备份到快照目录；提供 `--eval-max-snapshots` 参数自动滚动淘汰最旧快照，彻底杜绝超长周期训练爆满磁盘。
+- **可视化趋势呈现**：评测结果自动追加到 CSV，可使用轻量绘图工具 `plot_eval.py` 生成包含平滑拟合线的 WP（胜率）与 ADP 趋势图。
+
+---
 
 ## 构建与测试
 
-项目使用 CMake 构建，内置 Google Test 单元测试套件（34 项高覆盖度测试），跨平台支持 Linux (GCC/Clang)、macOS (Apple Clang/Accelerate) 与 Windows (MSVC/CUDA)。
+项目使用 CMake 构建，内置 Google Test 单元测试套件（34 项高覆盖度测试），跨平台原生支持 Linux (GCC/Clang)、macOS (Apple Clang/Accelerate) 与 Windows (MSVC/CUDA)。
 
 ```bash
+# 配置并编译
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j
-ctest --test-dir build --output-on-failure   # 运行全部 34 项 Google Test 单元测试
+
+# 运行完整 Google Test 单元测试套件（34 项全部通过）
+ctest --test-dir build --output-on-failure
 ```
 
-测试套件涵盖：
-- **`RulesTest`**：出牌规则合法性、15 种牌型解析生成、621 维抽象动作空间、最小步数 Oracle 记忆化、随机自对弈状态机及特征编码；
-- **`GradTest`**：反向传播数值与解析梯度校验（包含多层 MLP 与 LSTM 96 项核验）；
-- **`AlgoTest`**：GAE/优势值归一化、PPO 策略/价值裁剪、自适应 KL 早停、Adam 动量原子序列化；
-- **健壮性与防爆测试**：Masked Softmax 防 NaN 熔断防护、KL 散度防除零与无穷、训练样本非法值过滤跳过、PPO 并发多车道无死锁压力测试；
-- **评测系统单测**：Actor 线程安全深拷贝、Mock DouZero 评测通信、CSV 写入与磁盘快照回溯验证。
+测试套件覆盖出牌规则合法性、15 种牌型解析、621 维动作解码、Oracle 状态机、多层神经网络手写数值与解析梯度核验（96 项）、PPO 优化稳定性、防 NaN 熔断机制、并发多车道无死锁压力测试以及 DouZero 对弈快照回溯。
 
-## 训练
+---
+
+## 训练指南
+
+### 1. 启动对弈基准服务端（可选但推荐）
+如需在训练过程中定期与官方 DouZero-ADP 进行基准对抗评测，先启动基于 TCP 的 DouZero 推理服务（纯 CPU 即可运行，不占用训练 GPU）：
 
 ```bash
-# macOS 默认走 Accelerate/AMX。
-# Windows：--backend auto 优先 CUDA（cuBLAS GEMM + D3D12 其余核），否则 CPU。
-# --backend cuda / --backend cpu 可强制切换（已移除会挂驱动的纯 D3D12 gpu 路径）
-./build/perfectdou_train --updates 1000 --games 256 --threads 10 --out ckpt
-
-# 开启内置定期 DouZero 评测与模型快照落盘（推荐间隔 200~500 步）
-./build/perfectdou_train --updates 100000 --games 256 --threads 10 --out ckpt \
-    --eval-every 500 --eval-decks 100 --eval-port 18765 --eval-save-dir eval_snapshots
-
-# 快速/低配机器
-./build/perfectdou_train --updates 300 --games 128 --threads 8 \
-    --hidden 128 --epochs 2 --out ckpt
-```
-
-主要参数：
-
-```
---games N           每次更新自对弈牌局数（默认 256）
---updates N         更新轮数
---threads N         自对弈线程数（三个座位的 PPO 更新也会并行）
---hidden H          MLP 宽度（论文 256；128 可显著提速）
---lstm-hidden H     LSTM 隐层（论文 128）
---epochs N          每批数据 PPO epoch 数（论文未披露；默认采用 PPO2 常见值 4）
---mb N              minibatch（论文 batch size 1024，8 卡时每卡 128；单机默认 1024）
---buffer N          rollout 队列深度（默认 1，对齐论文最大模型延迟 1）
---lr/--ent           初始学习率（默认 3e-4）和熵系数（默认 0.03），均默认按余弦曲线退火；`--no-ent-decay` 可固定熵系数
---no-lr-decay       禁用学习率余弦退火（保持固定学习率）
---gamma N           GAE 折扣因子 gamma（默认 1.0）
---lambda N          GAE 权衡参数 lambda（默认 0.95 降低多步决策方差；1.0 为纯蒙特卡洛终局 ADP）
---clip N            PPO clip（默认 0.2）
---target-kl N       动态 KL 散度早停阈值（默认 0.03，0 禁用）
---clip-vf           启用 PPO 价值函数裁剪损失（默认禁用 clipVf，避免炸弹高回报饱和）
---no-clip-vf        禁用 PPO 价值函数裁剪损失（默认）
---vf-clip N         PPO 价值函数裁剪阈值（默认 32.0，与斗地主 ADP 炸弹翻倍尺度相匹配）
---shaping-cap N     残局微量奖励塑造上限（默认 0.05，平局打破与出牌紧凑度引导）
---pool-size N       联赛最近滚动快照池大小（默认 16）
---archive-size N    联赛长期几何稀疏归档池大小（默认 16）
---pool-every K      每 K 轮向联赛历史池增加一次当前模型快照（默认 20）
---historical-prob P       自对弈中抽样历史对手的概率（默认 0.2）
---rule-prob P       自对弈中抽样经典规则智能体的概率（默认 0.1）
---snapshot-every K  每 K 轮落盘，最后一轮必存
---start-update U    指定起始更新轮数（默认 1，若从带有 meta.txt 的断点 resume 则自动续接）
---resume DIR        从 actor/critic 权重与 Adam 动量继续（支持自动续接进度与学习率）
---backend auto|cuda|cpu   GEMM 后端（Windows：cuda = cuBLAS GEMM + D3D12 其余核）
-
-[内置对 DouZero 定期评测参数]
---eval-every N      每 N 轮更新触发一次与 DouZero 的对弈评测（默认 0 不开启；推荐 200~500）
---eval              快捷开启内置评测（默认每 500 轮评测一次）
---eval-decks D      每次评测副数（默认 100，正反手对换即 200 局）
---eval-host H       DouZero 服务 IP 地址（默认 127.0.0.1）
---eval-port P       DouZero 服务端口（默认 18765）
---eval-csv PATH     评测结果追加写入的 CSV 路径（默认 eval_vs_douzero.csv）
---eval-save-dir DIR 评测时自动归档模型权重的目录（默认 eval_snapshots，存放 u{step} 快照）
---eval-max-snapshots N 磁盘上保留的最大快照文件夹数量（默认 0 保存全部；>0 时自动滚动清理最老快照硬防爆盘）
---eval-sync         使用同步阻塞模式评测（默认异步后台线程评测，不阻塞主训练）
-```
-
-后端说明：
-
-- Apple Silicon：默认 PPO 与自对弈都走 CPU。大矩阵乘法用 Accelerate（AMX），LSTM 的
-  sigmoid/tanh 用 vForce。参考实测（M1 Pro，hidden=256 / 256 局 / epochs=4）：约
-  **5 秒/轮**（采样 0.5 秒 + 学习 4.6 秒）。
-- Windows：仅支持 `cuda` 与 `cpu`。`--backend auto` 在检测到 CUDA Toolkit / cuBLAS
-  时启用 GPU，否则回退 CPU。手写 D3D12 `gemm_block` 路径已移除（部分 NVIDIA 驱动上
-  会 TDR）。`--backend cuda` 要求编译时找到 CUDA headers，且运行时能加载
-  `cublas`/`nvrtc`；其余 elementwise / LSTM 核仍走 D3D12。GTX 10xx（Pascal）请用
-  **CUDA Toolkit 12.x**（13+ 已移除 sm_61）；Turing 及以上可用 12 或 13。x86-64
-  自对弈采样固定走 AVX2/FMA CPU 路径，只有 PPO 学习上 GPU。
-- 数值为 FP32。`tests/test_gemm` 校验 CPU/GPU GEMM，`tests/test_grad` 校验整网梯度。
-- 没有 CUDA 时使用 CPU GEMM（Apple 为 Accelerate，ARM 为 NEON，其余为标量）。
-
-输出文件：`ckpt/actor{0,1,2}.bin`、`ckpt/critic{0,1,2}.bin`、`ckpt/opt_actor{0,1,2}.bin`、`ckpt/opt_critic{0,1,2}.bin`、`ckpt/meta.txt`
-（座位 0=landlord，1=landlord_down，2=landlord_up），供后续推理程序加载或断点续训。
-
-每轮打印：
-- **牌局统计**：WP（地主胜率）、ADP（均差分）、pure WP/ADP（两阵营纯最新自对弈指标）、炸弹率（bomb/g）、平均步数（moves/g）；
-- **优化监控**：lr（当前学习率）、ent（三座位策略熵）、vL（三座位价值网络损失）；
-- **稳定指标**：ep（三座位实际完成的 Epoch 数，显示早停状态）、kl（末轮近似 KL 散度）、cf（PPO Clip 触发比例）；
-- **收益规模**：ret（三座位平均累积回报）、n（三座位样本数量）。
-
-## 对 DouZero-ADP 周期性评测与胜率趋势图
-
-### 1. 启动 DouZero 评测服务端
-评测需要先启动官方开源 DouZero 模型的对弈服务（基于 TCP 通信，CPU 推理，默认端口 18765）：
-```bash
-# 准备 third_party/DouZero 与 baselines/douzero_ADP/*.ckpt
+# 需准备 third_party/DouZero 与 baselines/douzero_ADP/*.ckpt
 export PYTHONPATH=third_party/DouZero   # Windows: set PYTHONPATH=...
 python tools/douzero_serve.py --port 18765 --ckpt-dir baselines/douzero_ADP
 ```
 
-### 2. 训练内置评测与模型快照落盘（推荐）
-在训练命令中直接加上 `--eval-every`（或快捷开关 `--eval`），训练进程会在达到指定步数时：
-1. **自动克隆与落盘**：对当前 Actor 模型执行线程安全深拷贝，并立即保存权重到 `eval_snapshots/u<step>/actor{0,1,2}.bin` 与初始 `meta.txt`，供随时复盘回溯；
-2. **异步后台对战**：在独立后台线程与 DouZero 服务进行每副牌正反手互换对打（默认 100 副牌共 200 局）；
-3. **记录与回写**：评测结束后自动将最终 WP、ADP、分角色胜率等追加至 `eval_vs_douzero.csv`，并回写快照目录下的 `meta.txt`。
+### 2. 启动从头到尾训练
 
 ```bash
-./build/perfectdou_train --updates 100000 --games 256 --threads 10 \
-    --eval-every 500 --eval-decks 100 --eval-port 18765 \
-    --eval-save-dir eval_snapshots --eval-csv eval_vs_douzero.csv
+# 标准自对弈训练（开启内置后台定期评测与快照归档）
+./build/perfectdou_train --updates 100000 --games 256 --threads 10 --out ckpt \
+    --eval-every 500 --eval-decks 100 --eval-port 18765 --eval-save-dir eval_snapshots
+
+# 快速验证 / 低配机器调试
+./build/perfectdou_train --updates 300 --games 128 --threads 8 \
+    --hidden 128 --epochs 2 --out ckpt
 ```
 
-> **大规模训练（如论文 25 亿帧）磁盘容量与间隔建议**：
-> - 25 亿帧折合约 160,000 次 Update（按每次 256 局算）。单次快照（3 个 Actor）约 **12.8 MB**；
-> - 推荐设置 `--eval-every 500`（或 200~500）：整个训练周期产生约 320 个高解析度数据点，磁盘总快照仅占用 **~4 GB**，后台对弈每 15~30 分钟打一次（耗时 ~20 秒），对主训练吞吐 **0 影响**；
-> - 若磁盘空间紧张，可加 `--eval-max-snapshots 100`（仅保留最新 100 份快照，硬防爆盘）。
+> **硬件加速后端说明**：
+> - **Apple Silicon (macOS)**：默认走 Accelerate / AMX 硬件加速矩阵乘，LSTM 走 vForce；
+> - **Windows / Linux**：`--backend auto` 优先检测并使用 CUDA（cuBLAS GEMM），无 GPU 时自动回退至高优化 CPU 向量化路径；
+> - 自对弈采样在 x86-64 上固定走 AVX2/FMA 指令集，兼顾高吞吐与多核并发。
 
-### 3. 渲染胜率/ADP 趋势曲线
-使用 `tools/plot_eval.py` 读取评测 CSV，自动绘制地主/农民双阵营与整体胜率及 ADP 趋势曲线（含平滑拟合线）：
+### 3. 训练日志与监控指标
+
+训练过程中每轮输出结构化监控日志：
+
+```
+upd   500 | q 1/1 left 0 end 1 | wall 4.2s rollout 0.5s learn 3.7s games 256 mb 1024 ep 4,4,4/4 threads 10 | WP 0.532 ADP   0.15 (pure WP 0.548 ADP   0.21 [180 g]) bomb/g 0.32 moves/g 53.4 | lr 2.95e-04 ent 1.082/0.892/0.890 vL    1.21/   0.38/   0.39 kl 0.0021/0.0018/0.0019 cf 0.05/0.04/0.04 | ret     0.1/   -0.0/   -0.0 | n 4820/3610/3590
+[eval u500] done games 200 | WP 0.545 ADP 0.230 | landlord WP 0.560 ADP 0.310 | peasant WP 0.530 ADP 0.150
+```
+
+- **WP / ADP**：混合对手对局下的地主胜率与平均分差；
+- **pure WP / pure ADP**：仅统计最新模型之间纯自对弈的胜率与均分（剔除规则与历史对手干扰）；
+- **ep**：三个座位实际执行的 PPO Epoch 轮数（若提前结束说明触发了 KL 早停保护）；
+- **kl / cf**：近似 KL 散度与 PPO 策略裁剪触发比例；
+- **[eval uX]**：后台 DouZero 评测的对局统计，包含总胜率、地主胜率与农民胜率。
+
+### 4. 胜率趋势图实时渲染
+
+使用轻量绘图脚本随时根据评测追加的 CSV 渲染胜率与 ADP 变化曲线：
+
 ```bash
-# 生成静态趋势图
-python tools/plot_eval.py --csv eval_vs_douzero.csv --out eval_curve.png
+# 渲染静态图片
+python tools/plot_eval.py --csv ckpt/eval_vs_douzero.csv --out ckpt/eval_curve.png
 
-# 实时监视模式（每 30 秒自动刷新图片）
-python tools/plot_eval.py --csv eval_vs_douzero.csv --out eval_curve.png --watch 30
+# 实时监视模式（每 30 秒自动重新绘图刷新）
+python tools/plot_eval.py --csv ckpt/eval_vs_douzero.csv --out ckpt/eval_curve.png --watch 30
 ```
 
-> 提示：若不希望内嵌在训练中，仍可使用外部独立轮询脚本 `tools/eval_vs_douzero_loop.py` 或独立对弈程序 `build/perfectdou_eval`。
+---
+
+## 常用训练参数参考
+
+| 参数 | 默认值 | 作用与建议 |
+| :--- | :--- | :--- |
+| `--updates N` | 200 | 训练总更新步数 |
+| `--games N` | 256 | 每次更新自对弈收集的牌局数（推荐 256～1024） |
+| `--threads N` | CPU核数 | 自对弈并发采样与多座位 PPO 优化的并行线程数 |
+| `--hidden H` | 256 | 神经网络隐层神经元宽度（128 可显著提升吞吐） |
+| `--lstm-hidden H`| 128 | LSTM 隐层时序特征维度 |
+| `--epochs N` | 4 | 每次更新每批数据的 PPO 迭代轮数 |
+| `--mb N` | 1024 | PPO Mini-batch 大小 |
+| `--lr N` | 3e-4 | 初始学习率（默认余弦退火，`--no-lr-decay` 保持固定） |
+| `--ent N` | 0.03 | 策略熵正则系数（默认余弦退火，`--no-ent-decay` 保持固定） |
+| `--clip N` | 0.2 | PPO 策略概率比率截断阈值 |
+| `--target-kl N` | 0.03 | 自适应 KL 散度早停阈值（超过自动截断 Epoch，0 为禁用） |
+| `--gamma / --lambda` | 1.0 / 0.95 | GAE 折扣因子与方差权衡参数 |
+| `--pool-size N` | 16 | 联赛滚动快照池大小 |
+| `--archive-size N`| 16 | 联赛长期几何稀疏归档池大小 |
+| `--pool-every K` | 20 | 每 K 轮向联赛历史池归档一次最新模型 |
+| `--historical-prob`| 0.2 | 自对弈中抽样历史模型的概率 |
+| `--rule-prob` | 0.1 | 自对弈中抽样经典规则智能体的概率 |
+| `--snapshot-every K`| 20 | 检查点落盘间隔（保存完整权重及优化器动量） |
+| `--resume DIR` | 空 | 从指定目录恢复模型权重及 Adam 动量续训 |
+| **`--eval-every N`** | **0** | **内置 DouZero 评测间隔（推荐 200～500，0 为关闭）** |
+| **`--eval`** | - | **快捷开启内置评测（等价于 `--eval-every 500`）** |
+| **`--eval-decks D`** | **100** | **每次评测副数（默认 100 副正反手互换即 200 局）** |
+| **`--eval-port P`** | **18765**| **DouZero TCP 服务端口** |
+| **`--eval-max-snapshots N`**| **0** | **磁盘最大保留快照数（0 为不限；设置后自动滚动淘汰旧快照硬防爆盘）** |
+
+> **大规模训练（如 25 亿帧样本）磁盘规划建议**：
+> - 25 亿帧样本折合约 160,000 次 Update（按每次 256 局折算）；
+> - 每次快照（3 个 Actor）占用约 **12.8 MB**；
+> - 推荐设置 `--eval-every 500`：整个训练产生约 320 个高密度评测点，磁盘快照总大小仅约 **4 GB**，且评测在后台每隔 15~30 分钟进行一次（耗时 ~20 秒），对主训练吞吐几乎零影响；
+> - 若磁盘空间极度紧张，可直接指定 `--eval-max-snapshots 100`，训练将始终只保留最新的 100 份模型。
+
+---
 
 ## 目录结构
 
 ```
-src/ddz/      牌、牌型识别/生成、621 动作空间、oracle、对局、特征
-src/nn/       矩阵运算、Linear/ReLU/LSTM、演员/评论家、Adam、模型存取
-src/algo/     批量自对弈 rollout、GAE、PPO 更新、DouZero 对弈评测与快照
-src/          训练入口 train.cpp、独立评测入口 eval_douzero.cpp
-tools/        DouZero 服务端、评测曲线绘制工具 plot_eval.py、外部评测轮询脚本
-tests/        Google Test 单元测试（规则/自对弈/反向传播数值与解析梯度/PPO 算法与稳定性/防爆熔断）
+src/ddz/      出牌规则、15 种牌型判定/生成、621 维抽象动作空间、Oracle 记忆化求解器、特征工程
+src/nn/       基础矩阵算子、GEMM 加速、Linear/ReLU/LSTM、Actor/Critic 神经网络、Adam 优化器
+src/algo/     自对弈 Rollout 采集器、GAE 优势估计、PPO 策略更新、内置 DouZero 对战评测驱动与快照
+src/          训练主入口 train.cpp、独立评测入口 eval_douzero.cpp
+tools/        DouZero TCP 服务端 douzero_serve.py、胜率曲线绘制 plot_eval.py、评测轮询脚本
+tests/        Google Test 单元测试套件（规则、自对弈、反向传播梯度、PPO 算法、防爆熔断、Mock 评测）
 ```
-
-## 实现说明
-
-- 所有网络为手写反向传播；`tests/test_grad` 对包括 LSTM 在内的演员/评论家
-  做数值与解析梯度校验（96 项）。
-- 手牌/历史等 0/1 特征以 uint8 紧凑存储；前向使用转置权重 + 向量化 GEMM。
-- oracle 结果在 rollout 工作线程内记忆化，DP 表一次性预计算，线程安全。
-- DouZero 生成器会产生少量其检测器判为 WRONG 的退化组合（不符合腾讯规则），
-  映射抽象动作时直接剔除。
-- 完整包含跨平台 Google Test 单元测试，在 GitHub Actions CI（Linux / macOS / Windows）实现自动化回归守护。
