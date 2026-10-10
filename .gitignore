@@ -74,3 +74,5 @@ eval_runs/
 logs/
 third_party/
 baselines/**/*.ckpt
+__pycache__/
+*.pyc

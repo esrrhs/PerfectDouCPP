@@ -9,10 +9,30 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
-#include <cstdlib>
-#include <limits>
+#include <filesystem>
+#include <fstream>
 #include <thread>
 #include <gtest/gtest.h>
+
+#if defined(_WIN32)
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <winsock2.h>
+#include <ws2tcpip.h>
+typedef SOCKET test_sock_t;
+#define TEST_INVALID_SOCK INVALID_SOCKET
+#else
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <unistd.h>
+typedef int test_sock_t;
+#define TEST_INVALID_SOCK (-1)
+#endif
 
 #include "algo/eval_douzero.h"
 #include "algo/ppo.h"
@@ -552,6 +572,126 @@ static void testActorCloningAndEvalFailSafe() {
     CHECK(!res.error.empty());
 }
 
+static void closeTestSock(test_sock_t s) {
+#if defined(_WIN32)
+    if (s != TEST_INVALID_SOCK) closesocket(s);
+#else
+    if (s >= 0) close(s);
+#endif
+}
+
+// 18. End-to-end DouZero evaluation, game playout, CSV metrics recording, and model snapshot saving.
+static void testMockDouZeroEvalAndDiskSnapshot() {
+#if defined(_WIN32)
+    WSADATA wsa;
+    WSAStartup(MAKEWORD(2, 2), &wsa);
+#endif
+
+    test_sock_t srv = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    ASSERT_NE(srv, TEST_INVALID_SOCK);
+
+    sockaddr_in srvAddr{};
+    srvAddr.sin_family = AF_INET;
+    srvAddr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    srvAddr.sin_port = 0; // OS assigns free ephemeral port
+    ASSERT_EQ(bind(srv, reinterpret_cast<sockaddr*>(&srvAddr), sizeof(srvAddr)), 0);
+    ASSERT_EQ(listen(srv, 1), 0);
+
+    socklen_t addrLen = sizeof(srvAddr);
+    ASSERT_EQ(getsockname(srv, reinterpret_cast<sockaddr*>(&srvAddr), &addrLen), 0);
+    int assignedPort = ntohs(srvAddr.sin_port);
+    ASSERT_GT(assignedPort, 0);
+
+    std::atomic<bool> srvRunning{true};
+    std::thread serverThread([&]() {
+        test_sock_t client = accept(srv, nullptr, nullptr);
+        if (client == TEST_INVALID_SOCK) return;
+        char c;
+        while (srvRunning.load()) {
+            std::string line;
+            while (recv(client, &c, 1, 0) == 1) {
+                if (c == '\n') break;
+                if (c != '\r') line.push_back(c);
+            }
+            if (line.empty() || line == "QUIT") break;
+            size_t lastTab = line.rfind('\t');
+            std::string legals = (lastTab != std::string::npos) ? line.substr(lastTab + 1) : "";
+            size_t slash = legals.find('/');
+            std::string choice = (slash != std::string::npos) ? legals.substr(0, slash) : legals;
+            choice.push_back('\n');
+            send(client, choice.data(), static_cast<int>(choice.size()), 0);
+        }
+        closeTestSock(client);
+    });
+
+    nn::NetConfig cfg{64, 32};
+    std::array<nn::Actor, 3> actors;
+    for (int s = 0; s < 3; ++s) {
+        actors[s].init(cfg, 100 + s);
+    }
+    auto cloned = cloneActors(actors);
+
+    std::string testDir = "build/test_eval_e2e_run";
+    std::string csvPath = testDir + "/eval.csv";
+    std::string snapDir = testDir + "/snapshots/u5";
+
+    DouZeroEvalConfig ecfg;
+    ecfg.host = "127.0.0.1";
+    ecfg.port = assignedPort;
+    ecfg.decks = 2; // 2 decks = 4 games
+    ecfg.update = 5;
+    ecfg.label = "u5";
+    ecfg.elapsedMinutes = 1.25;
+    ecfg.csvPath = csvPath;
+    ecfg.saveDir = snapDir;
+
+    auto res = evaluateAgainstDouZero(cloned, ecfg);
+
+    srvRunning = false;
+    closeTestSock(srv);
+    serverThread.join();
+
+#if defined(_WIN32)
+    WSACleanup();
+#endif
+
+    // Assert evaluation succeeded
+    EXPECT_TRUE(res.ok);
+    EXPECT_EQ(res.decks, 2);
+    EXPECT_EQ(res.games, 4);
+    EXPECT_GE(res.wp, 0.0);
+    EXPECT_LE(res.wp, 1.0);
+
+    // Assert CSV was created and written
+    EXPECT_TRUE(std::filesystem::exists(csvPath));
+    std::ifstream csvFile(csvPath);
+    std::string header, dataLine;
+    EXPECT_TRUE(std::getline(csvFile, header));
+    EXPECT_TRUE(header.find("update,minutes,timestamp") != std::string::npos);
+    EXPECT_TRUE(std::getline(csvFile, dataLine));
+    EXPECT_TRUE(dataLine.find("5,1.25,") != std::string::npos);
+    EXPECT_TRUE(dataLine.find("u5,2,4,") != std::string::npos);
+    csvFile.close();
+
+    // Assert snapshot models and meta.txt were saved to disk
+    EXPECT_TRUE(std::filesystem::exists(snapDir + "/actor0.bin"));
+    EXPECT_TRUE(std::filesystem::exists(snapDir + "/actor1.bin"));
+    EXPECT_TRUE(std::filesystem::exists(snapDir + "/actor2.bin"));
+    EXPECT_TRUE(std::filesystem::exists(snapDir + "/meta.txt"));
+
+    std::ifstream metaFile(snapDir + "/meta.txt");
+    std::string metaContent((std::istreambuf_iterator<char>(metaFile)),
+                            std::istreambuf_iterator<char>());
+    EXPECT_TRUE(metaContent.find("update 5") != std::string::npos);
+    EXPECT_TRUE(metaContent.find("games 4") != std::string::npos);
+    EXPECT_TRUE(metaContent.find("wp ") != std::string::npos);
+    metaFile.close();
+
+    // Clean up
+    std::error_code ec;
+    std::filesystem::remove_all(testDir, ec);
+}
+
 TEST(AlgoTest, AdvantageNormAndGAE) { testAdvantageNormAndGAE(); }
 TEST(AlgoTest, ValueClipping) { testValueClipping(); }
 TEST(AlgoTest, KLDivergence) { testKLDivergence(); }
@@ -569,3 +709,4 @@ TEST(AlgoTest, NaNGradientSkipped) { testNaNGradientSkipped(); }
 TEST(AlgoTest, PPOSurvivesNonFiniteSamples) { testPPOSurvivesNonFiniteSamples(); }
 TEST(AlgoTest, PPONoDeadlock) { testPPONoDeadlock(); }
 TEST(AlgoTest, ActorCloningAndEvalFailSafe) { testActorCloningAndEvalFailSafe(); }
+TEST(AlgoTest, MockDouZeroEvalAndDiskSnapshot) { testMockDouZeroEvalAndDiskSnapshot(); }
