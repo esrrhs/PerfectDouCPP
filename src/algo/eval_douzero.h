@@ -16,6 +16,7 @@ struct DouZeroEvalConfig {
     int decks = 50;
     uint64_t seed = 0;           // 0 means auto seed
     std::string csvPath = "";    // if not empty, append to CSV
+    std::string saveDir = "";    // if not empty, save cloned models to disk for backtracking
     std::string label = "";      // label or tag
     int update = 0;              // training update step
     double elapsedMinutes = 0.0; // elapsed minutes since training start

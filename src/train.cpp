@@ -79,6 +79,8 @@ struct Args {
     int evalPort = 18765;          // DouZero TCP server port
     std::string evalHost = "127.0.0.1";
     std::string evalCsv;           // empty = default to <out>/eval_vs_douzero.csv
+    std::string evalSaveDir;       // empty = default to <out>/eval_snapshots
+    bool evalSave = true;          // whether to save evaluated models to disk
     bool evalAsync = true;         // evaluate in background thread
 };
 
@@ -133,6 +135,10 @@ void parseArgs(int argc, char** argv, Args& a) {
     a.evalPort = std::atoi(argValue(argc, argv, "--eval-port", "18765"));
     a.evalHost = argValue(argc, argv, "--eval-host", "127.0.0.1");
     a.evalCsv = argValue(argc, argv, "--eval-csv", "");
+    a.evalSaveDir = argValue(argc, argv, "--eval-save-dir", "");
+    if (hasFlag(argc, argv, "--no-eval-save")) {
+        a.evalSave = false;
+    }
     if (hasFlag(argc, argv, "--no-eval-async") || hasFlag(argc, argv, "--eval-sync")) {
         a.evalAsync = false;
     }
@@ -234,11 +240,18 @@ int main(int argc, char** argv) {
         if (args.evalCsv.empty()) {
             args.evalCsv = args.out + "/eval_vs_douzero.csv";
         }
+        if (args.evalSave && args.evalSaveDir.empty()) {
+            args.evalSaveDir = args.out + "/eval_snapshots";
+        }
         std::cout << "  eval vs DouZero: every=" << args.evalEvery
                   << " decks=" << args.evalDecks << " (" << (args.evalDecks * 2) << " games)"
                   << " target=" << args.evalHost << ":" << args.evalPort
                   << " mode=" << (args.evalAsync ? "async" : "sync")
-                  << " csv=" << args.evalCsv << std::endl;
+                  << " csv=" << args.evalCsv;
+        if (args.evalSave) {
+            std::cout << " snapshots=" << args.evalSaveDir;
+        }
+        std::cout << std::endl;
     }
     std::thread evalThread;
 
@@ -814,6 +827,7 @@ int main(int argc, char** argv) {
             evalCfg.seed = static_cast<uint64_t>(upd * 10007 + 1);
             evalCfg.csvPath = args.evalCsv;
             evalCfg.label = "u" + std::to_string(upd);
+            evalCfg.saveDir = args.evalSave ? (args.evalSaveDir + "/" + evalCfg.label) : "";
             evalCfg.update = upd;
             evalCfg.elapsedMinutes = wallSecs / 60.0;
             evalCfg.verbose = false;

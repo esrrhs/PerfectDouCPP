@@ -270,6 +270,24 @@ DouZeroEvalResult evaluateAgainstDouZero(const std::array<nn::Actor, 3>& actors,
     // Evaluation runs purely on CPU; ensure this thread does not attempt GPU GEMM.
     nn::gemmSetThreadGpu(0);
 
+    // Save cloned model weights and metadata to disk for traceability
+    if (!cfg.saveDir.empty()) {
+        std::error_code ec;
+        std::filesystem::create_directories(cfg.saveDir, ec);
+        for (int s = 0; s < 3; ++s) {
+            std::string path = cfg.saveDir + "/actor" + std::to_string(s) + ".bin";
+            actors[s].save(path.c_str());
+        }
+        std::string metaPath = cfg.saveDir + "/meta.txt";
+        FILE* mf = std::fopen(metaPath.c_str(), "w");
+        if (mf) {
+            std::fprintf(mf, "update %d\nminutes %.2f\nlabel %s\n",
+                         cfg.update, cfg.elapsedMinutes,
+                         (cfg.label.empty() ? ("u" + std::to_string(cfg.update)) : cfg.label).c_str());
+            std::fclose(mf);
+        }
+    }
+
     SocketSubsystem sockSub;
     if (!sockSub.ok) {
         res.error = "network subsystem init failed";
@@ -394,6 +412,16 @@ DouZeroEvalResult evaluateAgainstDouZero(const std::array<nn::Actor, 3>& actors,
                          res.decks, res.games, res.wp, res.adp,
                          res.wpLandlord, res.adpLandlord, res.wpPeasant, res.adpPeasant);
             std::fclose(f);
+        }
+    }
+
+    if (!cfg.saveDir.empty() && res.ok) {
+        std::string metaPath = cfg.saveDir + "/meta.txt";
+        FILE* mf = std::fopen(metaPath.c_str(), "a");
+        if (mf) {
+            std::fprintf(mf, "games %d\nwp %.4f\nadp %.4f\nwp_landlord %.4f\nadp_landlord %.4f\nwp_peasant %.4f\nadp_peasant %.4f\n",
+                         res.games, res.wp, res.adp, res.wpLandlord, res.adpLandlord, res.wpPeasant, res.adpPeasant);
+            std::fclose(mf);
         }
     }
 
