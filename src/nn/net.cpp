@@ -669,6 +669,11 @@ void Adam::applyGradNorm(const std::vector<Param*>& ps, float maxNorm) {
     for (Param* p : ps)
         for (float g : p->dw) sum += double(g) * g;
     float norm = float(std::sqrt(sum));
+    if (!std::isfinite(norm)) {
+        // A NaN/Inf gradient would poison every weight and Adam moment.
+        std::fprintf(stderr, "WARN: non-finite gradient norm, skipping optimizer step\n");
+        return;
+    }
     if (norm > maxNorm) {
         float scale = maxNorm / (norm + 1e-6f);
         for (Param* p : ps)
