@@ -7,7 +7,12 @@
 
 **PerfectDouCPP** 是一套高性能、工业级的纯 C++17 斗地主强化学习端到端自对弈训练与评测系统。
 
-本项目借鉴了非完全信息博弈中**完美信息价值蒸馏（Perfect Information Distillation）**的核心理念，并进行了深度重构与工业级工程实现：**零重量级外部依赖**（仅使用标准 C++17、操作系统原生多线程与 socket），纯手写实现了超高速斗地主牌局规则引擎、特征工程、神经网络正反向传播算子、分层联赛对手池（League Training）以及鲁棒的 PPO 训练管线。单机多线程即可跑出极高的采样吞吐与稳定的收敛效果。
+### 算法渊源与致敬
+本项目在理论思想和规则体系上深度借鉴了斗地主强化学习领域的两项标杆工作：
+- **[DouZero](https://github.com/kwai/DouZero)**（ICML 2021, *Mastering DouDizhu with Self-Play Deep Reinforcement Learning*）：奠定了现代斗地主 AI 的基石。我们借鉴了其完备的腾讯斗地主 15 种牌型解析/压牌逻辑与特征张量化思想，并在系统内直接将其官方 DouZero-ADP 模型作为衡量我方策略水平的核心对战基线；
+- **[PerfectDou](https://github.com/Vincent-Guan/PerfectDou)**（NeurIPS 2022, *Dominating DouDizhu with Perfect Information Distillation*）：开创性地提出了非完全信息博弈下的**完美信息蒸馏（Perfect Information Distillation）**范式。我们借鉴了其全知 Critic（全知手牌价值估计）指导不完全信息 Actor 的核心思路，以及 621 维抽象动作空间的设计。
+
+在上述前沿学术研究的启发下，本项目重点进行了**全栈工业级工程落地与算法现代化重构**：抛弃了重型分布式集群与复杂外部依赖，纯 C++17 原生从零构建了超高速牌局引擎、多层正反向神经网络算子、双农民严格同策的分层联赛对手池（League Training）、工业级防 NaN 熔断与动态 KL 自适应早停机制，并直接内置了对 DouZero 的异步对战评测闭环。单机多线程即可实现极高吞吐与稳定收敛。
 
 ---
 
@@ -218,3 +223,10 @@ src/          训练主入口 train.cpp、独立评测入口 eval_douzero.cpp
 tools/        DouZero TCP 服务端 douzero_serve.py、胜率曲线绘制 plot_eval.py、评测轮询脚本
 tests/        Google Test 单元测试套件（规则、自对弈、反向传播梯度、PPO 算法、防爆熔断、Mock 评测）
 ```
+
+---
+
+## 参考文献与基准
+
+1. **DouZero**: Daochen Zha, et al. *"DouZero: Mastering DouDizhu with Self-Play Deep Reinforcement Learning"*, ICML 2021. [[Paper]](https://arxiv.org/abs/2106.06135) [[GitHub]](https://github.com/kwai/DouZero)
+2. **PerfectDou**: Yang Guan, et al. *"PerfectDou: Dominating DouDizhu with Perfect Information Distillation"*, NeurIPS 2022. [[Paper]](https://arxiv.org/abs/2203.16406) [[GitHub]](https://github.com/Vincent-Guan/PerfectDou)
