@@ -137,7 +137,8 @@ bool isLargest(const MoveInfo& a) {
 
 }  // namespace
 
-std::vector<LegalOption> legalOptions(const Game& g) {
+void legalOptions(const Game& g, std::vector<LegalOption>& out) {
+    out.clear();
     std::vector<CardSet> concrete = g.legal();
     int seat = g.turn;
     int prev = g.prevSeat();
@@ -145,8 +146,9 @@ std::vector<LegalOption> legalOptions(const Game& g) {
 
     // One option per concrete legal play, including each distinct set of
     // plane or four-with-two kickers. abstractId is the local slot.
-    std::vector<LegalOption> out;
-    out.reserve(concrete.size());
+    if (out.capacity() < concrete.size()) {
+        out.reserve(concrete.size());
+    }
     for (const CardSet& chosen : concrete) {
         MoveInfo info = detectMove(chosen);
         if (info.type == MT_WRONG) continue;
@@ -168,6 +170,11 @@ std::vector<LegalOption> legalOptions(const Game& g) {
         ex[5] = 1.0f;  // validity marker, needed for the all-zero pass matrix
         out.push_back(std::move(o));
     }
+}
+
+std::vector<LegalOption> legalOptions(const Game& g) {
+    std::vector<LegalOption> out;
+    legalOptions(g, out);
     return out;
 }
 

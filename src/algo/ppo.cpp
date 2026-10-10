@@ -19,25 +19,41 @@ namespace algo {
 
 void assignEpisodeReturns(std::vector<Transition>& tr, float gamma,
                           float lambda) {
-    std::unordered_map<int, std::vector<size_t>> groups;
-    for (size_t i = 0; i < tr.size(); ++i) groups[tr[i].gameId].push_back(i);
+    int N = static_cast<int>(tr.size());
+    if (N == 0) return;
+    int maxGameId = 0;
+    for (const auto& t : tr) {
+        if (t.gameId > maxGameId) maxGameId = t.gameId;
+    }
+    // Linked list per gameId: head[gameId] points to latest transition,
+    // nextTr[i] points to previous transition in that game.
+    // Zero dynamic allocations beyond two flat vectors.
+    std::vector<int> head(maxGameId + 1, -1);
+    std::vector<int> nextTr(N, -1);
+    for (int i = 0; i < N; ++i) {
+        int gid = tr[i].gameId;
+        if (gid >= 0) {
+            nextTr[i] = head[gid];
+            head[gid] = i;
+        }
+    }
 
     const float gaeFactor = gamma * lambda;
-    for (auto& [id, is] : groups) {
-        (void)id;
-        if (is.empty()) continue;
+    for (int g = 0; g <= maxGameId; ++g) {
+        int curr = head[g];
+        if (curr < 0) continue;
         float gae = 0.0f;
-        // Backward pass through the trajectory to compute GAE advantages
-        for (int step = static_cast<int>(is.size()) - 1; step >= 0; --step) {
-            size_t k = is[step];
-            float nextValue = 0.0f;
-            if (!tr[k].terminal && step + 1 < static_cast<int>(is.size())) {
-                nextValue = tr[is[step + 1]].value;
-            }
-            float delta = tr[k].reward + gamma * nextValue - tr[k].value;
-            gae = delta + (tr[k].terminal ? 0.0f : gaeFactor * gae);
-            tr[k].adv = gae;
-            tr[k].ret = tr[k].adv + tr[k].value;
+        float nextValue = 0.0f;
+        bool isFirstInBackward = true;
+        while (curr >= 0) {
+            float vNext = isFirstInBackward ? 0.0f : nextValue;
+            float delta = tr[curr].reward + gamma * vNext - tr[curr].value;
+            gae = delta + (tr[curr].terminal ? 0.0f : gaeFactor * gae);
+            tr[curr].adv = gae;
+            tr[curr].ret = tr[curr].adv + tr[curr].value;
+            nextValue = tr[curr].value;
+            isFirstInBackward = false;
+            curr = nextTr[curr];
         }
     }
 }

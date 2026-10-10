@@ -61,6 +61,7 @@ EncodedState encodeState(const Game& g);
 
 // One option per concrete legal play. abstractId is the local slot 0..n-1.
 std::vector<LegalOption> legalOptions(const Game& g);
+void legalOptions(const Game& g, std::vector<LegalOption>& out);
 
 // Writes the static 12x15 matrix of an abstract action into `out`.
 void actionCardMatrix(int abstractId, std::array<uint8_t, kCardMat>& out);

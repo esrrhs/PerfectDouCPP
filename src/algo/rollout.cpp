@@ -43,9 +43,10 @@ void gatherActions(const std::vector<Transition*>& tr, nn::Mat& actionFeat,
     int row = 0;
     for (int i = 0; i < B; ++i) {
         actionOffset.row(i)[0] = float(row);
+        float fi = float(i);
         for (const auto& [id, feature] : tr[i]->actions) {
-            std::copy(feature.begin(), feature.end(), actionFeat.row(row));
-            actionSample.row(row)[0] = float(i);
+            std::memcpy(actionFeat.row(row), feature.data(), ddz::kActionSize * sizeof(float));
+            actionSample.row(row)[0] = fi;
             actionId.row(row)[0] = float(id);
             ++row;
         }
@@ -87,9 +88,8 @@ void buildBatch(const std::vector<Transition*>& tr, nn::Mat& xImp, nn::Mat& seq,
         float seqSample[ddz::kHistoryLen * ddz::kCardMat];
         writeDense(*tr[i], xImp.row(i), seqSample, extra.row(i));
         for (int k = 0; k < ddz::kHistoryGroups; ++k)
-            std::copy(seqSample + k * 3 * ddz::kCardMat,
-                      seqSample + (k + 1) * 3 * ddz::kCardMat,
-                      seq.row(k * B + i));
+            std::memcpy(seq.row(k * B + i), seqSample + k * 3 * ddz::kCardMat,
+                        3 * ddz::kCardMat * sizeof(float));
     }
 }
 
@@ -102,17 +102,17 @@ void buildBatchFromCache(const std::vector<Transition*>& tr,
     int B = static_cast<int>(tr.size());
     sizeBatch(B, xImp, seq, extra);
     gatherActions(tr, actionFeat, actionSample, actionId, actionOffset);
+    constexpr size_t kGroupBytes = 3 * ddz::kCardMat * sizeof(float);
+    constexpr size_t kNodeBytes = ddz::kNodeSize * sizeof(float);
+    constexpr size_t kExtraBytes = ddz::kExtraSize * sizeof(float);
     for (int i = 0; i < B; ++i) {
         int id = static_cast<int>(tr[i] - base);
-        std::copy(xAll + size_t(id) * xStride,
-                  xAll + size_t(id) * xStride + ddz::kNodeSize, xImp.row(i));
-        const float* ss = seqAll + size_t(id) * ddz::kHistoryLen * ddz::kCardMat;
-        for (int k = 0; k < ddz::kHistoryGroups; ++k)
-            std::copy(ss + k * 3 * ddz::kCardMat,
-                      ss + (k + 1) * 3 * ddz::kCardMat,
-                      seq.row(k * B + i));
-        std::copy(eAll + size_t(id) * eStride,
-                  eAll + size_t(id) * eStride + ddz::kExtraSize, extra.row(i));
+        std::memcpy(xImp.row(i), xAll + size_t(id) * xStride, kNodeBytes);
+        const float* ss = seqAll + size_t(id) * (ddz::kHistoryLen * ddz::kCardMat);
+        for (int k = 0; k < ddz::kHistoryGroups; ++k) {
+            std::memcpy(seq.row(k * B + i), ss + k * 3 * ddz::kCardMat, kGroupBytes);
+        }
+        std::memcpy(extra.row(i), eAll + size_t(id) * eStride, kExtraBytes);
     }
 }
 
@@ -244,18 +244,38 @@ void runWorker(const ModelSet& models, const RolloutConfig& cfg, int nGames,
         }
     }
 
+    std::vector<int> latestGis;
+    latestGis.reserve(nGames);
+    std::vector<int> ruleGis;
+    ruleGis.reserve(nGames);
+    std::vector<std::pair<int, HistModelRef>> histGis;
+    histGis.reserve(nGames);
+
+    std::vector<Transition> trPool(nGames);
+    std::vector<const LegalOption*> chosenPool(nGames, nullptr);
+    std::vector<std::vector<LegalOption>> optionsPool(nGames);
+    std::vector<Transition*> ptrsPool(nGames, nullptr);
+
+    std::vector<Transition> hTrPool(nGames);
+    std::vector<std::vector<LegalOption>> hOptsPool(nGames);
+    std::vector<Transition*> hPtrsPool(nGames, nullptr);
+
+    Mat xImp, seq, actionFeat, actionSample, actionId, actionOffset, extra;
+    Mat hXImp, hSeq, hActionFeat, hActionSample, hActionId, hActionOffset, hExtra;
+
     auto encodeTransition = [&](const Game& g,
-                                const std::vector<LegalOption>& options) {
+                                const std::vector<LegalOption>& options,
+                                Transition& t) {
         EncodedState e = encodeState(g);
-        Transition t;
         t.imp = e.imp;
         t.scalar = e.scalar;
         t.extra = e.extra;
         t.extraScalar = e.extraScalar;
+        t.actions.clear();
+        t.actions.reserve(options.size());
         for (const LegalOption& o : options) {
             t.actions.emplace_back(o.abstractId, o.feature);
         }
-        return t;
     };
 
     auto chooseAction = [&](const Mat& logits, const std::vector<LegalOption>& opts,
@@ -323,10 +343,9 @@ void runWorker(const ModelSet& models, const RolloutConfig& cfg, int nGames,
     while (remaining > 0) {
         for (int seat = 0; seat < 3; ++seat) {
             // Group active games waiting on this seat by player type
-            std::vector<int> latestGis;
-            std::vector<int> ruleGis;
-            // Historical games grouped by their snapshot reference
-            std::vector<std::pair<int, HistModelRef>> histGis;  // (gi, histRef)
+            latestGis.clear();
+            ruleGis.clear();
+            histGis.clear();
 
             for (int gi = 0; gi < nGames; ++gi) {
                 if (active[gi] && games[gi].turn == seat) {
@@ -344,24 +363,21 @@ void runWorker(const ModelSet& models, const RolloutConfig& cfg, int nGames,
             // 1. Process latest players (batched neural forward, transitions recorded)
             if (!latestGis.empty()) {
                 int B = static_cast<int>(latestGis.size());
-                std::vector<Transition> tr(B);
-                std::vector<const LegalOption*> chosen(B, nullptr);
-                std::vector<std::vector<LegalOption>> options(B);
                 for (int i = 0; i < B; ++i) {
                     const Game& g = games[latestGis[i]];
-                    options[i] = legalOptions(g);
-                    if ((int)options[i].size() > kNumActions) {
+                    legalOptions(g, optionsPool[i]);
+                    if ((int)optionsPool[i].size() > kNumActions) {
                         std::fprintf(stderr, "legal moves %d exceed logit width %d\n",
-                                     (int)options[i].size(), kNumActions);
+                                     (int)optionsPool[i].size(), kNumActions);
                         std::abort();
                     }
-                    tr[i] = encodeTransition(g, options[i]);
-                    tr[i].gameId = latestGis[i];
+                    encodeTransition(g, optionsPool[i], trPool[i]);
+                    trPool[i].gameId = latestGis[i];
+                    ptrsPool[i] = &trPool[i];
+                    chosenPool[i] = nullptr;
                 }
 
-                std::vector<Transition*> ptrs(B);
-                for (int i = 0; i < B; ++i) ptrs[i] = &tr[i];
-                Mat xImp, seq, actionFeat, actionSample, actionId, actionOffset, extra;
+                std::vector<Transition*> ptrs(ptrsPool.begin(), ptrsPool.begin() + B);
                 buildBatch(ptrs, xImp, seq, actionFeat, actionSample, actionId,
                            actionOffset, extra);
 
@@ -373,28 +389,28 @@ void runWorker(const ModelSet& models, const RolloutConfig& cfg, int nGames,
                                                        criticW[seat], xImp, seq,
                                                        extra);
                 for (int i = 0; i < B; ++i) {
-                    if (options[i].empty()) {
+                    if (optionsPool[i].empty()) {
                         std::fprintf(stderr, "empty options B=%d i=%d seat=%d hand=%s\n",
                                      B, i, seat,
                                      games[latestGis[i]].hand[seat].str().c_str());
                         std::abort();
                     }
-                    auto [chosenId, logp] = chooseAction(logits, options[i], i);
-                    tr[i].action = chosenId;
-                    tr[i].logp = logp;
-                    tr[i].value = std::isfinite(values.row(i)[0]) ? values.row(i)[0] : 0.0f;
-                    for (const LegalOption& o : options[i]) {
-                        if (o.abstractId == chosenId) chosen[i] = &o;
+                    auto [chosenId, logp] = chooseAction(logits, optionsPool[i], i);
+                    trPool[i].action = chosenId;
+                    trPool[i].logp = logp;
+                    trPool[i].value = std::isfinite(values.row(i)[0]) ? values.row(i)[0] : 0.0f;
+                    for (const LegalOption& o : optionsPool[i]) {
+                        if (o.abstractId == chosenId) chosenPool[i] = &o;
                     }
                 }
 
                 for (int i = 0; i < B; ++i) {
                     int gi = latestGis[i];
                     Game& g = games[gi];
-                    const CardSet& concrete = chosen[i]->concrete;
+                    const CardSet& concrete = chosenPool[i]->concrete;
 
                     int storedIndex = static_cast<int>(res.seats[seat].size());
-                    res.seats[seat].push_back(std::move(tr[i]));
+                    res.seats[seat].push_back(std::move(trPool[i]));
                     lastIdx[seat][gi] = storedIndex;
 
                     g.step(concrete);
@@ -428,32 +444,29 @@ void runWorker(const ModelSet& models, const RolloutConfig& cfg, int nGames,
                                                     : cfg.historicalPool->recent[mRef.index]->actor[seat];
                     ActorInfer histInfer;
 
-                    std::vector<Transition> hTr(subB);
-                    std::vector<std::vector<LegalOption>> hOpts(subB);
                     for (int i = 0; i < subB; ++i) {
                         int gi = histGis[start + i].first;
                         const Game& g = games[gi];
-                        hOpts[i] = legalOptions(g);
-                        hTr[i] = encodeTransition(g, hOpts[i]);
+                        legalOptions(g, hOptsPool[i]);
+                        encodeTransition(g, hOptsPool[i], hTrPool[i]);
+                        hPtrsPool[i] = &hTrPool[i];
                     }
-                    std::vector<Transition*> ptrs(subB);
-                    for (int i = 0; i < subB; ++i) ptrs[i] = &hTr[i];
-                    Mat xImp, seq, actionFeat, actionSample, actionId, actionOffset, extra;
-                    buildBatch(ptrs, xImp, seq, actionFeat, actionSample, actionId,
-                               actionOffset, extra);
+                    std::vector<Transition*> ptrs(hPtrsPool.begin(), hPtrsPool.begin() + subB);
+                    buildBatch(ptrs, hXImp, hSeq, hActionFeat, hActionSample, hActionId,
+                               hActionOffset, hExtra);
 
                     const Mat& logits = actorInferForward(histActor, histInfer,
-                                                          xImp, seq, actionFeat,
-                                                          actionSample, actionId,
-                                                          actionOffset);
+                                                          hXImp, hSeq, hActionFeat,
+                                                          hActionSample, hActionId,
+                                                          hActionOffset);
 
                     for (int i = 0; i < subB; ++i) {
                         int gi = histGis[start + i].first;
                         Game& g = games[gi];
-                        auto [chosenId, logp] = chooseAction(logits, hOpts[i], i);
+                        auto [chosenId, logp] = chooseAction(logits, hOptsPool[i], i);
                         (void)logp;
                         CardSet concrete;
-                        for (const LegalOption& o : hOpts[i]) {
+                        for (const LegalOption& o : hOptsPool[i]) {
                             if (o.abstractId == chosenId) {
                                 concrete = o.concrete;
                                 break;

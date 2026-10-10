@@ -112,25 +112,32 @@ def serve(port, ckpt_dir):
     srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     srv.bind(("127.0.0.1", port))
-    srv.listen(1)
+    srv.listen(5)
     print("ready", flush=True)
-    conn, _ = srv.accept()
-    buf = b""
     try:
         while True:
-            while b"\n" not in buf:
-                chunk = conn.recv(1 << 20)
-                if not chunk:
-                    return
-                buf += chunk
-            line, buf = buf.split(b"\n", 1)
-            text = line.decode().strip()
-            if text == "" or text == "QUIT":
-                break
-            action = choose(agents[text.split("\t", 1)[0]], build(text))
-            conn.sendall((encode(action) + "\n").encode())
+            conn, _ = srv.accept()
+            buf = b""
+            try:
+                while True:
+                    while b"\n" not in buf:
+                        chunk = conn.recv(1 << 20)
+                        if not chunk:
+                            break
+                        buf += chunk
+                    if not buf:
+                        break
+                    line, buf = buf.split(b"\n", 1)
+                    text = line.decode().strip()
+                    if text == "" or text == "QUIT":
+                        break
+                    action = choose(agents[text.split("\t", 1)[0]], build(text))
+                    conn.sendall((encode(action) + "\n").encode())
+            except Exception as e:
+                pass
+            finally:
+                conn.close()
     finally:
-        conn.close()
         srv.close()
 
 
