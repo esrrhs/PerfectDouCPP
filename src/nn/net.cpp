@@ -13,6 +13,26 @@ Param::~Param() {
     gpuDropCache(&devG);
 }
 
+Param& Param::operator=(Param&& o) noexcept {
+    if (this != &o) {
+        gpuDropCache(&devW);
+        gpuDropCache(&devG);
+        w = std::move(o.w);
+        dw = std::move(o.dw);
+        m = std::move(o.m);
+        v = std::move(o.v);
+        rows = o.rows;
+        cols = o.cols;
+        devW = o.devW;
+        devG = o.devG;
+        o.devW = nullptr;
+        o.devG = nullptr;
+        o.rows = 0;
+        o.cols = 0;
+    }
+    return *this;
+}
+
 void Param::zeroGrad() {
     std::fill(dw.begin(), dw.end(), 0.0f);
     // Re-seed the existing device accumulator from the zeroed host gradient.

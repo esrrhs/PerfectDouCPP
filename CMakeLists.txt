@@ -25,6 +25,7 @@ add_library(perfectdou STATIC
   src/nn/kernels.cpp
   src/algo/rollout.cpp
   src/algo/ppo.cpp
+  src/algo/eval_douzero.cpp
 )
 target_include_directories(perfectdou PUBLIC src)
 target_link_libraries(perfectdou PUBLIC Threads::Threads)
@@ -55,7 +56,7 @@ if(WIN32)
     src/nn/gemm_d3d.cpp
     src/nn/gemm_cuda_bridge.cpp)
   target_compile_definitions(perfectdou PUBLIC PD_HAVE_D3D)
-  target_link_libraries(perfectdou PUBLIC d3d12 dxgi d3dcompiler)
+  target_link_libraries(perfectdou PUBLIC d3d12 dxgi d3dcompiler ws2_32)
   find_path(CUDA_TOOLKIT_INCLUDE cuda.h
     HINTS "$ENV{CUDA_PATH}/include"
           "C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v12.9/include"
@@ -73,9 +74,10 @@ add_executable(perfectdou_train src/train.cpp)
 target_link_libraries(perfectdou_train PRIVATE perfectdou)
 if(WIN32)
   target_link_libraries(perfectdou_train PRIVATE powrprof)
-  add_executable(perfectdou_eval src/eval_douzero.cpp)
-  target_link_libraries(perfectdou_eval PRIVATE perfectdou ws2_32)
 endif()
+
+add_executable(perfectdou_eval src/eval_douzero.cpp)
+target_link_libraries(perfectdou_eval PRIVATE perfectdou)
 
 enable_testing()
 add_executable(test_rules tests/test_rules.cpp)

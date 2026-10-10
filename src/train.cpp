@@ -36,6 +36,7 @@
 #include <powrprof.h>
 #endif
 
+#include "algo/eval_douzero.h"
 #include "algo/ppo.h"
 #include "algo/rollout.h"
 #include "ddz/oracle.h"
@@ -73,6 +74,12 @@ struct Args {
     std::string out = "ckpt";
     std::string resume;
     std::string backend = "auto";  // auto | cuda | cpu
+    int evalEvery = 0;             // 0 = disabled, > 0 = eval vs DouZero every N updates
+    int evalDecks = 50;            // number of decks per eval
+    int evalPort = 18765;          // DouZero TCP server port
+    std::string evalHost = "127.0.0.1";
+    std::string evalCsv;           // empty = default to <out>/eval_vs_douzero.csv
+    bool evalAsync = true;         // evaluate in background thread
 };
 
 const char* argValue(int argc, char** argv, const char* key, const char* def) {
@@ -121,6 +128,14 @@ void parseArgs(int argc, char** argv, Args& a) {
     a.backend = argValue(argc, argv, "--backend", "auto");
     const char* res = argValue(argc, argv, "--resume", "");
     if (*res) a.resume = res;
+    a.evalEvery = std::atoi(argValue(argc, argv, "--eval-every", "0"));
+    a.evalDecks = std::atoi(argValue(argc, argv, "--eval-decks", "50"));
+    a.evalPort = std::atoi(argValue(argc, argv, "--eval-port", "18765"));
+    a.evalHost = argValue(argc, argv, "--eval-host", "127.0.0.1");
+    a.evalCsv = argValue(argc, argv, "--eval-csv", "");
+    if (hasFlag(argc, argv, "--no-eval-async") || hasFlag(argc, argv, "--eval-sync")) {
+        a.evalAsync = false;
+    }
 }
 
 }  // namespace
@@ -214,6 +229,18 @@ int main(int argc, char** argv) {
               << ",hist=" << args.histProb << ",rule=" << args.ruleProb << ")"
               << " target=terminal-adp"
               << " seed=" << args.seed << std::endl;
+
+    if (args.evalEvery > 0) {
+        if (args.evalCsv.empty()) {
+            args.evalCsv = args.out + "/eval_vs_douzero.csv";
+        }
+        std::cout << "  eval vs DouZero: every=" << args.evalEvery
+                  << " decks=" << args.evalDecks << " (" << (args.evalDecks * 2) << " games)"
+                  << " target=" << args.evalHost << ":" << args.evalPort
+                  << " mode=" << (args.evalAsync ? "async" : "sync")
+                  << " csv=" << args.evalCsv << std::endl;
+    }
+    std::thread evalThread;
 
     nn::NetConfig cfg{args.hidden, args.lstmHidden};
     std::array<nn::Actor, 3> actor;
@@ -719,6 +746,7 @@ int main(int argc, char** argv) {
             }
             buf.cv.notify_all();
             if (producer.joinable()) producer.join();
+            if (evalThread.joinable()) evalThread.join();
             return 1;
         }
 
@@ -772,6 +800,42 @@ int main(int argc, char** argv) {
             (upd % args.snapshotEvery == 0 || upd == args.updates)) {
             saveAll(args.out, upd);
         }
+
+        if (args.evalEvery > 0 &&
+            (upd % args.evalEvery == 0 || upd == args.updates)) {
+            if (evalThread.joinable()) {
+                evalThread.join();
+            }
+            auto cloned = algo::cloneActors(actor);
+            algo::DouZeroEvalConfig evalCfg;
+            evalCfg.host = args.evalHost;
+            evalCfg.port = args.evalPort;
+            evalCfg.decks = args.evalDecks;
+            evalCfg.seed = static_cast<uint64_t>(upd * 10007 + 1);
+            evalCfg.csvPath = args.evalCsv;
+            evalCfg.label = "u" + std::to_string(upd);
+            evalCfg.update = upd;
+            evalCfg.elapsedMinutes = wallSecs / 60.0;
+            evalCfg.verbose = false;
+
+            auto runEval = [cloned = std::move(cloned), evalCfg]() {
+                auto res = algo::evaluateAgainstDouZero(cloned, evalCfg);
+                if (res.ok) {
+                    std::printf("[eval %s] done games %d | WP %.3f ADP %.3f | landlord WP %.3f ADP %.3f | peasant WP %.3f ADP %.3f\n",
+                                evalCfg.label.c_str(), res.games, res.wp, res.adp,
+                                res.wpLandlord, res.adpLandlord, res.wpPeasant, res.adpPeasant);
+                } else {
+                    std::printf("[eval %s] skipped: %s\n", evalCfg.label.c_str(), res.error.c_str());
+                }
+                std::fflush(stdout);
+            };
+
+            if (args.evalAsync) {
+                evalThread = std::thread(std::move(runEval));
+            } else {
+                runEval();
+            }
+        }
         // bound memory: nothing needed (oracle memo is per rollout worker)
     }
 
@@ -789,6 +853,8 @@ int main(int argc, char** argv) {
     job.cv.notify_all();
     for (auto& th : learners)
         if (th.joinable()) th.join();
+
+    if (evalThread.joinable()) evalThread.join();
 
 #if defined(_WIN32)
     if (awake) {

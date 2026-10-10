@@ -34,12 +34,24 @@ struct Param {
     mutable void* devG = nullptr;
 
     Param() = default;
-    Param(const Param&) : w(), dw(), m(), v() {}  // caches never copied
+    Param(const Param& o)
+        : w(o.w), dw(o.dw), m(o.m), v(o.v), rows(o.rows), cols(o.cols) {}
+    Param(Param&& o) noexcept
+        : w(std::move(o.w)), dw(std::move(o.dw)), m(std::move(o.m)), v(std::move(o.v)),
+          rows(o.rows), cols(o.cols), devW(o.devW), devG(o.devG) {
+        o.devW = nullptr;
+        o.devG = nullptr;
+        o.rows = 0;
+        o.cols = 0;
+    }
     Param& operator=(const Param& o) {
-        w = o.w; dw = o.dw; m = o.m; v = o.v;
-        rows = o.rows; cols = o.cols;
+        if (this != &o) {
+            w = o.w; dw = o.dw; m = o.m; v = o.v;
+            rows = o.rows; cols = o.cols;
+        }
         return *this;
     }
+    Param& operator=(Param&& o) noexcept;
     ~Param();
 
     void init(int r, int c) {

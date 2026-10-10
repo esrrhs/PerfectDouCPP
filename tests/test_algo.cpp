@@ -14,6 +14,7 @@
 #include <thread>
 #include <vector>
 
+#include "algo/eval_douzero.h"
 #include "algo/ppo.h"
 #include "algo/rollout.h"
 
@@ -524,6 +525,40 @@ static void testPPONoDeadlock() {
     watchdog.join();
 }
 
+// 17. Actor cloning deep copy independence and fail-safe handling when DouZero server is unreachable.
+static void testActorCloningAndEvalFailSafe() {
+    nn::NetConfig cfg{64, 32};
+    std::array<nn::Actor, 3> actors;
+    for (int s = 0; s < 3; ++s) {
+        actors[s].init(cfg, 42 + s);
+    }
+    auto cloned = cloneActors(actors);
+    for (int s = 0; s < 3; ++s) {
+        auto origParams = actors[s].params();
+        auto cloneParams = (*cloned)[s].params();
+        CHECK(origParams.size() == cloneParams.size());
+        for (size_t i = 0; i < origParams.size(); ++i) {
+            CHECK(origParams[i]->w.size() == cloneParams[i]->w.size());
+            for (size_t k = 0; k < origParams[i]->w.size(); ++k) {
+                CHECK(origParams[i]->w[k] == cloneParams[i]->w[k]);
+            }
+        }
+    }
+
+    // Mutating original weights must not affect cloned weights
+    actors[0].params()[0]->w[0] += 123.45f;
+    CHECK(actors[0].params()[0]->w[0] != (*cloned)[0].params()[0]->w[0]);
+
+    // Evaluation against down server should return cleanly without throwing or deadlocking
+    DouZeroEvalConfig ecfg;
+    ecfg.host = "127.0.0.1";
+    ecfg.port = 38999;
+    ecfg.decks = 2;
+    auto res = evaluateAgainstDouZero(cloned, ecfg);
+    CHECK(!res.ok);
+    CHECK(!res.error.empty());
+}
+
 int main() {
     std::printf("testAdvantageNormAndGAE...\n"); testAdvantageNormAndGAE();
     std::printf("testValueClipping...\n"); testValueClipping();
@@ -541,6 +576,7 @@ int main() {
     std::printf("testNaNGradientSkipped...\n"); testNaNGradientSkipped();
     std::printf("testPPOSurvivesNonFiniteSamples...\n"); testPPOSurvivesNonFiniteSamples();
     std::printf("testPPONoDeadlock...\n"); testPPONoDeadlock();
+    std::printf("testActorCloningAndEvalFailSafe...\n"); testActorCloningAndEvalFailSafe();
     std::printf("ALL ALGO TESTS PASSED\n");
     return 0;
 }
