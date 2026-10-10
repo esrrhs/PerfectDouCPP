@@ -345,7 +345,8 @@ bool ppoUpdate(nn::Actor& actor, nn::Critic& critic,
 
                 float s = mb[i]->adv;
                 float rc = std::clamp(ratio, 1.0f - cfg.clip, 1.0f + cfg.clip);
-                if (std::abs(ratio - 1.0f) > cfg.clip) {
+                if ((s > 0.0f && ratio > 1.0f + cfg.clip) ||
+                    (s < 0.0f && ratio < 1.0f - cfg.clip)) {
                     mbClipSum += 1.0f;
                 }
                 float l1 = ratio * s, l2 = rc * s;

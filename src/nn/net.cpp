@@ -441,6 +441,8 @@ void Critic::init(const NetConfig& c, uint64_t seed) {
     c3.init(c.hidden, c.hidden, rng);
     c4.init(c.hidden, c.hidden, rng);
     out.init(c.hidden, 1, rng);
+    std::fill(out.W.w.begin(), out.W.w.end(), 0.0f);
+    std::fill(out.b.w.begin(), out.b.w.end(), 0.0f);
     prepareInference();
 }
 
@@ -677,6 +679,79 @@ void Adam::applyGradNorm(const std::vector<Param*>& ps, float maxNorm) {
     gpuWait();
     // The step counter advanced, but a lost device does not copy w/m/v back.
     if (!gpuDeviceOk()) --t;
+}
+
+void saveOptimizer(const char* path, const std::vector<Param*>& ps, const Adam& opt) {
+    FILE* f = std::fopen(path, "wb");
+    if (!f) return;
+    std::fwrite("PDOP", 1, 4, f);
+    std::fwrite(&opt.t, sizeof(opt.t), 1, f);
+    std::fwrite(&opt.lr, sizeof(opt.lr), 1, f);
+    std::fwrite(&opt.beta1, sizeof(opt.beta1), 1, f);
+    std::fwrite(&opt.beta2, sizeof(opt.beta2), 1, f);
+    std::fwrite(&opt.eps, sizeof(opt.eps), 1, f);
+    int32_t n = int32_t(ps.size());
+    std::fwrite(&n, sizeof(n), 1, f);
+    for (const Param* p : ps) {
+        int sz = p->size();
+        std::fwrite(&sz, sizeof(sz), 1, f);
+        if (sz > 0) {
+            if (p->m.size() == size_t(sz)) {
+                std::fwrite(p->m.data(), sizeof(float), sz, f);
+            } else {
+                std::vector<float> zeros(sz, 0.0f);
+                std::fwrite(zeros.data(), sizeof(float), sz, f);
+            }
+            if (p->v.size() == size_t(sz)) {
+                std::fwrite(p->v.data(), sizeof(float), sz, f);
+            } else {
+                std::vector<float> zeros(sz, 0.0f);
+                std::fwrite(zeros.data(), sizeof(float), sz, f);
+            }
+        }
+    }
+    std::fclose(f);
+}
+
+bool loadOptimizer(const char* path, const std::vector<Param*>& ps, Adam& opt) {
+    FILE* f = std::fopen(path, "rb");
+    if (!f) return false;
+    char magic[4] = {0};
+    if (std::fread(magic, 1, 4, f) != 4 || std::memcmp(magic, "PDOP", 4) != 0) {
+        std::fclose(f);
+        return false;
+    }
+    if (std::fread(&opt.t, sizeof(opt.t), 1, f) != 1 ||
+        std::fread(&opt.lr, sizeof(opt.lr), 1, f) != 1 ||
+        std::fread(&opt.beta1, sizeof(opt.beta1), 1, f) != 1 ||
+        std::fread(&opt.beta2, sizeof(opt.beta2), 1, f) != 1 ||
+        std::fread(&opt.eps, sizeof(opt.eps), 1, f) != 1) {
+        std::fclose(f);
+        return false;
+    }
+    int32_t n = 0;
+    if (std::fread(&n, sizeof(n), 1, f) != 1 || n != int32_t(ps.size())) {
+        std::fclose(f);
+        return false;
+    }
+    for (Param* p : ps) {
+        int sz = 0;
+        if (std::fread(&sz, sizeof(sz), 1, f) != 1 || sz != p->size()) {
+            std::fclose(f);
+            return false;
+        }
+        if (sz > 0) {
+            p->m.resize(sz, 0.0f);
+            p->v.resize(sz, 0.0f);
+            if (std::fread(p->m.data(), sizeof(float), sz, f) != size_t(sz) ||
+                std::fread(p->v.data(), sizeof(float), sz, f) != size_t(sz)) {
+                std::fclose(f);
+                return false;
+            }
+        }
+    }
+    std::fclose(f);
+    return true;
 }
 
 }  // namespace nn

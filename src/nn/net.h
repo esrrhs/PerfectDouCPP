@@ -228,4 +228,7 @@ struct Adam {
     void applyGradNorm(const std::vector<Param*>& ps, float maxNorm);
 };
 
+void saveOptimizer(const char* path, const std::vector<Param*>& ps, const Adam& opt);
+bool loadOptimizer(const char* path, const std::vector<Param*>& ps, Adam& opt);
+
 }  // namespace nn

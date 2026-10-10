@@ -180,10 +180,8 @@ void runWorker(const ModelSet& models, const RolloutConfig& cfg, int nGames,
 
     for (int gi = 0; gi < nGames; ++gi) {
         games[gi].deal(dealRng);
-        // Pre-sample a single historical snapshot for this game so that if both peasants
-        // are historical players, they come from the exact same version and cooperate consistently.
-        HistModelRef gameHistRef;
-        if (hasHistPool) {
+        auto sampleHistRef = [&]() -> HistModelRef {
+            if (!hasHistPool) return HistModelRef{};
             bool pickArchive = false;
             if (hasRecent && hasArchive) {
                 float subR = float((dealRng.nextU64() >> 11) / double(1ULL << 53));
@@ -194,34 +192,55 @@ void runWorker(const ModelSet& models, const RolloutConfig& cfg, int nGames,
             if (pickArchive) {
                 int nArchive = static_cast<int>(cfg.historicalPool->archive.size());
                 int idx = int(dealRng.nextU64() % uint64_t(nArchive));
-                gameHistRef = HistModelRef{true, idx};
+                return HistModelRef{true, idx};
             } else {
                 int nRecent = static_cast<int>(cfg.historicalPool->recent.size());
                 int idx = int(dealRng.nextU64() % uint64_t(nRecent));
-                gameHistRef = HistModelRef{false, idx};
+                return HistModelRef{false, idx};
             }
+        };
+
+        // 1. Landlord camp (Seat 0): independently sampled
+        float rLandlord = float((dealRng.nextU64() >> 11) / double(1ULL << 53));
+        if (rLandlord < cfg.ruleProb) {
+            gameSeats[gi][0].type = PLAYER_RULE;
+        } else if (hasHistPool && rLandlord < (cfg.ruleProb + cfg.historicalProb)) {
+            gameSeats[gi][0].type = PLAYER_HISTORICAL;
+            gameSeats[gi][0].histRef = sampleHistRef();
+        } else {
+            gameSeats[gi][0].type = PLAYER_LATEST;
         }
 
-        for (int s = 0; s < 3; ++s) {
-            float r = float((dealRng.nextU64() >> 11) / double(1ULL << 53));
-            if (r < cfg.ruleProb) {
-                gameSeats[gi][s].type = PLAYER_RULE;
-            } else if (hasHistPool && r < (cfg.ruleProb + cfg.historicalProb)) {
-                gameSeats[gi][s].type = PLAYER_HISTORICAL;
-                gameSeats[gi][s].histRef = gameHistRef;
+        // 2. Peasant camp (Seat 1 & 2): sampled as a unified cooperative team
+        float rPeasant = float((dealRng.nextU64() >> 11) / double(1ULL << 53));
+        PlayerType peasantType = PLAYER_LATEST;
+        HistModelRef peasantHistRef;
+        if (rPeasant < cfg.ruleProb) {
+            peasantType = PLAYER_RULE;
+        } else if (hasHistPool && rPeasant < (cfg.ruleProb + cfg.historicalProb)) {
+            peasantType = PLAYER_HISTORICAL;
+            peasantHistRef = sampleHistRef();
+        } else {
+            peasantType = PLAYER_LATEST;
+        }
+        gameSeats[gi][1].type = peasantType;
+        gameSeats[gi][1].histRef = peasantHistRef;
+        gameSeats[gi][2].type = peasantType;
+        gameSeats[gi][2].histRef = peasantHistRef;
+
+        // Ensure at least one camp per game is PLAYER_LATEST so games always produce training data.
+        // If neither camp picked LATEST, flip an entire camp (50% Landlord, 50% Peasant team)
+        // so peasant team coordination is strictly preserved.
+        if (gameSeats[gi][0].type != PLAYER_LATEST && peasantType != PLAYER_LATEST) {
+            if ((dealRng.nextU64() & 1) == 0) {
+                gameSeats[gi][0].type = PLAYER_LATEST;
+                gameSeats[gi][0].histRef = HistModelRef{};
             } else {
-                gameSeats[gi][s].type = PLAYER_LATEST;
+                gameSeats[gi][1].type = PLAYER_LATEST;
+                gameSeats[gi][1].histRef = HistModelRef{};
+                gameSeats[gi][2].type = PLAYER_LATEST;
+                gameSeats[gi][2].histRef = HistModelRef{};
             }
-        }
-        // Ensure at least one seat per game is PLAYER_LATEST so games always produce training data
-        bool anyLatest = false;
-        for (int s = 0; s < 3; ++s) {
-            if (gameSeats[gi][s].type == PLAYER_LATEST) anyLatest = true;
-        }
-        if (!anyLatest) {
-            int pick = int(dealRng.nextU64() % 3);
-            gameSeats[gi][pick].type = PLAYER_LATEST;
-            gameSeats[gi][pick].histRef = HistModelRef{};
         }
     }
 
@@ -234,7 +253,6 @@ void runWorker(const ModelSet& models, const RolloutConfig& cfg, int nGames,
         t.extra = e.extra;
         t.extraScalar = e.extraScalar;
         for (const LegalOption& o : options) {
-            t.mask[o.abstractId >> 6] |= uint64_t(1) << (o.abstractId & 63);
             t.actions.emplace_back(o.abstractId, o.feature);
         }
         return t;
@@ -265,6 +283,36 @@ void runWorker(const ModelSet& models, const RolloutConfig& cfg, int nGames,
     };
 
     int remaining = nGames;
+    auto handleGameOver = [&](int gi, Game& g) {
+        active[gi] = false;
+        --remaining;
+        ++res.stats.games;
+        if (g.winner == 0) ++res.stats.landlordWins;
+        double mult = std::pow(2.0, g.bombCount);
+        long long scoreLL = g.winner == 0
+                               ? llround(2.0 * mult)
+                               : -llround(2.0 * mult);
+        res.stats.landlordScore += scoreLL;
+
+        bool isPure = (gameSeats[gi][0].type == PLAYER_LATEST &&
+                       gameSeats[gi][1].type == PLAYER_LATEST &&
+                       gameSeats[gi][2].type == PLAYER_LATEST);
+        if (isPure) {
+            ++res.stats.pureSelfPlayGames;
+            if (g.winner == 0) ++res.stats.pureSelfPlayWins;
+            res.stats.pureSelfPlayScore += scoreLL;
+        }
+
+        for (int s = 0; s < 3; ++s) {
+            int idx = lastIdx[s][gi];
+            if (idx >= 0) {
+                auto& t = res.seats[s][idx];
+                t.reward += float(g.payoff(s)) + g.shaping(s, cfg.shapingCap);
+                t.terminal = true;
+            }
+        }
+    };
+
     while (remaining > 0) {
         for (int seat = 0; seat < 3; ++seat) {
             // Group active games waiting on this seat by player type
@@ -347,23 +395,7 @@ void runWorker(const ModelSet& models, const RolloutConfig& cfg, int nGames,
                     if (isBombLike(concrete)) res.stats.bombs += 1;
 
                     if (g.over) {
-                        active[gi] = false;
-                        --remaining;
-                        ++res.stats.games;
-                        if (g.winner == 0) ++res.stats.landlordWins;
-                        double mult = std::pow(2.0, g.bombCount);
-                        long long scoreLL = g.winner == 0
-                                               ? llround(2.0 * mult)
-                                               : -llround(2.0 * mult);
-                        res.stats.landlordScore += scoreLL;
-                        for (int s = 0; s < 3; ++s) {
-                            int idx = lastIdx[s][gi];
-                            if (idx >= 0) {
-                                auto& t = res.seats[s][idx];
-                                t.reward += float(g.payoff(s)) + g.shaping(s, cfg.shapingCap);
-                                t.terminal = true;
-                            }
-                        }
+                        handleGameOver(gi, g);
                     }
                 }
             }
@@ -426,23 +458,7 @@ void runWorker(const ModelSet& models, const RolloutConfig& cfg, int nGames,
                         if (isBombLike(concrete)) res.stats.bombs += 1;
 
                         if (g.over) {
-                            active[gi] = false;
-                            --remaining;
-                            ++res.stats.games;
-                            if (g.winner == 0) ++res.stats.landlordWins;
-                            double mult = std::pow(2.0, g.bombCount);
-                            long long scoreLL = g.winner == 0
-                                                   ? llround(2.0 * mult)
-                                                   : -llround(2.0 * mult);
-                            res.stats.landlordScore += scoreLL;
-                            for (int s = 0; s < 3; ++s) {
-                                int idx = lastIdx[s][gi];
-                                if (idx >= 0) {
-                                    auto& t = res.seats[s][idx];
-                                    t.reward += float(g.payoff(s)) + g.shaping(s, cfg.shapingCap);
-                                    t.terminal = true;
-                                }
-                            }
+                            handleGameOver(gi, g);
                         }
                     }
                     start = end;
@@ -460,23 +476,7 @@ void runWorker(const ModelSet& models, const RolloutConfig& cfg, int nGames,
                 if (isBombLike(concrete)) res.stats.bombs += 1;
 
                 if (g.over) {
-                    active[gi] = false;
-                    --remaining;
-                    ++res.stats.games;
-                    if (g.winner == 0) ++res.stats.landlordWins;
-                    double mult = std::pow(2.0, g.bombCount);
-                    long long scoreLL = g.winner == 0
-                                           ? llround(2.0 * mult)
-                                           : -llround(2.0 * mult);
-                    res.stats.landlordScore += scoreLL;
-                    for (int s = 0; s < 3; ++s) {
-                        int idx = lastIdx[s][gi];
-                        if (idx >= 0) {
-                            auto& t = res.seats[s][idx];
-                            t.reward += float(g.payoff(s)) + g.shaping(s, cfg.shapingCap);
-                            t.terminal = true;
-                        }
-                    }
+                    handleGameOver(gi, g);
                 }
             }
         }
@@ -516,6 +516,9 @@ void collectRollout(const ModelSet& models, const RolloutConfig& cfg,
         stats.games += r.stats.games;
         stats.landlordWins += r.stats.landlordWins;
         stats.landlordScore += r.stats.landlordScore;
+        stats.pureSelfPlayGames += r.stats.pureSelfPlayGames;
+        stats.pureSelfPlayWins += r.stats.pureSelfPlayWins;
+        stats.pureSelfPlayScore += r.stats.pureSelfPlayScore;
         stats.bombs += r.stats.bombs;
         stats.moves += r.stats.moves;
         for (int s = 0; s < 3; ++s) {

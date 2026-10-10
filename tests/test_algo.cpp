@@ -202,12 +202,82 @@ static void testRunningNormalizer() {
     CHECK(std::abs(d - val) < 1e-4f);
 }
 
+// 6. Test Adam state serialization roundtrip
+static void testAdamSerialization() {
+    nn::NetConfig cfg{64, 32};
+    nn::Actor a1;
+    a1.init(cfg, 123);
+    auto ps1 = a1.params();
+    CHECK(!ps1.empty());
+    ps1[0]->m[0] = 0.777f;
+    ps1[0]->v[0] = 0.888f;
+
+    nn::Adam opt1;
+    opt1.lr = 2.5e-4f;
+    opt1.beta1 = 0.91f;
+    opt1.beta2 = 0.998f;
+    opt1.eps = 1e-6f;
+    opt1.t = 77;
+
+    const char* tmpPath = "test_opt_roundtrip.bin";
+    nn::saveOptimizer(tmpPath, ps1, opt1);
+
+    nn::Actor a2;
+    a2.init(cfg, 123);
+    auto ps2 = a2.params();
+    nn::Adam opt2;
+    bool ok = nn::loadOptimizer(tmpPath, ps2, opt2);
+    CHECK(ok);
+    CHECK(opt2.t == 77);
+    CHECK(std::abs(opt2.lr - 2.5e-4f) < 1e-8f);
+    CHECK(std::abs(opt2.beta1 - 0.91f) < 1e-6f);
+    CHECK(std::abs(opt2.beta2 - 0.998f) < 1e-6f);
+    CHECK(std::abs(opt2.eps - 1e-6f) < 1e-9f);
+    CHECK(std::abs(ps2[0]->m[0] - 0.777f) < 1e-6f);
+    CHECK(std::abs(ps2[0]->v[0] - 0.888f) < 1e-6f);
+
+    std::remove(tmpPath);
+}
+
+// 7. Test Critic head zero-initialization
+static void testCriticZeroInit() {
+    nn::NetConfig cfg{64, 32};
+    nn::Critic critic;
+    critic.init(cfg, 456);
+    for (float w : critic.out.W.w) {
+        CHECK(w == 0.0f);
+    }
+    for (float b : critic.out.b.w) {
+        CHECK(b == 0.0f);
+    }
+}
+
+// 8. Test ClipFraction sign gating logic
+static void testClipFractionSignGating() {
+    float clip = 0.2f;
+    auto isClipped = [clip](float adv, float ratio) {
+        return (adv > 0.0f && ratio > 1.0f + clip) ||
+               (adv < 0.0f && ratio < 1.0f - clip);
+    };
+
+    // Beneficial moves where ratio is bounded
+    CHECK(isClipped(1.0f, 1.3f) == true);   // positive adv, ratio > 1+clip -> clipped
+    CHECK(isClipped(1.0f, 0.7f) == false);  // positive adv, ratio < 1-clip -> pessimistic lower bound, unclipped
+
+    // Detrimental moves where ratio is bounded
+    CHECK(isClipped(-1.0f, 0.7f) == true);  // negative adv, ratio < 1-clip -> clipped
+    CHECK(isClipped(-1.0f, 1.3f) == false); // negative adv, ratio > 1+clip -> pessimistic upper bound, unclipped
+}
+
 int main() {
     std::printf("testAdvantageNormAndGAE...\n"); testAdvantageNormAndGAE();
     std::printf("testValueClipping...\n"); testValueClipping();
     std::printf("testKLDivergence...\n"); testKLDivergence();
     std::printf("testArchiveAnchorPreservation...\n"); testArchiveAnchorPreservation();
     std::printf("testRunningNormalizer...\n"); testRunningNormalizer();
+    std::printf("testAdamSerialization...\n"); testAdamSerialization();
+    std::printf("testCriticZeroInit...\n"); testCriticZeroInit();
+    std::printf("testClipFractionSignGating...\n"); testClipFractionSignGating();
     std::printf("ALL ALGO TESTS PASSED\n");
     return 0;
 }

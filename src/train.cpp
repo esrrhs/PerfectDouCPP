@@ -5,7 +5,7 @@
 //   * imperfect-information actor over concrete legal plays
 //   * perfect-information critic (sees all hands, PTIE / perfect information
 //     distillation through the advantage)
-//   * PPO, pure terminal ADP reward (paper aligned)
+//   * PPO, TD(lambda) bootstrapped value targets with terminal ADP reward (paper aligned architecture)
 //
 // Example:
 //   perfectdou_train --updates 200 --games 256 --threads 8 --out ckpt
@@ -18,6 +18,7 @@
 #include <cstring>
 #include <deque>
 #include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <memory>
 #include <mutex>
@@ -43,6 +44,7 @@ namespace {
 
 struct Args {
     int updates = 200;
+    int startUpdate = 1;
     int games = 256;
     int threads = int(std::thread::hardware_concurrency());
     int hidden = 256;
@@ -57,8 +59,8 @@ struct Args {
     float gamma = 1.0f;
     float lambda = 0.95f;
     float targetKL = 0.03f;
-    bool clipVf = true;
-    float vfClip = 5.0f;
+    bool clipVf = false;
+    float vfClip = 32.0f;
     float shapingCap = 0.05f;
     bool lrDecay = true;
     bool entDecay = true;
@@ -87,6 +89,7 @@ bool hasFlag(int argc, char** argv, const char* key) {
 
 void parseArgs(int argc, char** argv, Args& a) {
     a.updates = std::atoi(argValue(argc, argv, "--updates", "200"));
+    a.startUpdate = std::atoi(argValue(argc, argv, "--start-update", "1"));
     a.games = std::atoi(argValue(argc, argv, "--games", "256"));
     a.threads = std::atoi(argValue(argc, argv, "--threads",
                                   std::to_string(a.threads).c_str()));
@@ -102,7 +105,7 @@ void parseArgs(int argc, char** argv, Args& a) {
     a.gamma = float(std::atof(argValue(argc, argv, "--gamma", "1.0")));
     a.lambda = float(std::atof(argValue(argc, argv, "--lambda", "0.95")));
     a.targetKL = float(std::atof(argValue(argc, argv, "--target-kl", "0.03")));
-    a.vfClip = float(std::atof(argValue(argc, argv, "--vf-clip", "5.0")));
+    a.vfClip = float(std::atof(argValue(argc, argv, "--vf-clip", "32.0")));
     a.shapingCap = float(std::atof(argValue(argc, argv, "--shaping-cap", "0.05")));
     if (hasFlag(argc, argv, "--clip-vf")) a.clipVf = true;
     if (hasFlag(argc, argv, "--no-clip-vf")) a.clipVf = false;
@@ -178,7 +181,22 @@ int main(int argc, char** argv) {
                           "CPU";
 #endif
     std::cout << "  GEMM backend: " << backend << "\n";
+    if (!args.resume.empty() && !hasFlag(argc, argv, "--start-update")) {
+        std::string metaPath = args.resume + "/meta.txt";
+        std::ifstream metaFile(metaPath);
+        if (metaFile.is_open()) {
+            std::string key;
+            int val = 0;
+            while (metaFile >> key >> val) {
+                if (key == "update" || key == "updates") {
+                    args.startUpdate = val + 1;
+                }
+            }
+        }
+    }
+
     std::cout << "  updates=" << args.updates
+              << (args.startUpdate > 1 ? " (start=" + std::to_string(args.startUpdate) + ")" : "")
               << " games/update=" << args.games
               << " buffer=" << args.buffer
               << " threads=" << args.threads
@@ -209,6 +227,14 @@ int main(int argc, char** argv) {
         if (!args.resume.empty()) {
             actor[s].load((args.resume + "/actor" + std::to_string(s) + ".bin").c_str());
             critic[s].load((args.resume + "/critic" + std::to_string(s) + ".bin").c_str());
+            std::string optA = args.resume + "/opt_actor" + std::to_string(s) + ".bin";
+            std::string optC = args.resume + "/opt_critic" + std::to_string(s) + ".bin";
+            if (std::filesystem::exists(optA)) {
+                nn::loadOptimizer(optA.c_str(), actor[s].params(), aOpt[s]);
+            }
+            if (std::filesystem::exists(optC)) {
+                nn::loadOptimizer(optC.c_str(), critic[s].params(), cOpt[s]);
+            }
         }
     }
 
@@ -223,11 +249,21 @@ int main(int argc, char** argv) {
     ppo.clipVf = args.clipVf;
     ppo.vfClip = args.vfClip;
 
-    auto saveAll = [&](const std::string& dir) {
+    auto saveAll = [&](const std::string& dir, int currentUpd = 0) {
         std::filesystem::create_directories(dir);
         for (int s = 0; s < 3; ++s) {
             actor[s].save((dir + "/actor" + std::to_string(s) + ".bin").c_str());
             critic[s].save((dir + "/critic" + std::to_string(s) + ".bin").c_str());
+            nn::saveOptimizer((dir + "/opt_actor" + std::to_string(s) + ".bin").c_str(),
+                             actor[s].params(), aOpt[s]);
+            nn::saveOptimizer((dir + "/opt_critic" + std::to_string(s) + ".bin").c_str(),
+                             critic[s].params(), cOpt[s]);
+        }
+        if (currentUpd > 0) {
+            std::ofstream metaFile(dir + "/meta.txt");
+            if (metaFile.is_open()) {
+                metaFile << "update " << currentUpd << "\n";
+            }
         }
     };
 
@@ -300,7 +336,7 @@ int main(int argc, char** argv) {
         args.threads = 1;
         std::array<std::vector<algo::Transition>, 3> streams;
         std::array<algo::PPOStats, 3> ps{};
-        for (int upd = 1; upd <= args.updates; ++upd) {
+        for (int upd = args.startUpdate; upd <= args.updates; ++upd) {
             algo::ModelSet models{{&actor[0], &actor[1], &actor[2]},
                                   {&critic[0], &critic[1], &critic[2]}};
             algo::RolloutConfig rc;
@@ -383,13 +419,22 @@ int main(int argc, char** argv) {
                                   .count();
             double wp = double(rs.landlordWins) / std::max(1, rs.games);
             double adp = double(rs.landlordScore) / std::max(1, rs.games);
+            std::string pureStr;
+            if (rs.pureSelfPlayGames > 0) {
+                char pbuf[64];
+                std::snprintf(pbuf, sizeof(pbuf), " (pure WP %.3f ADP %7.2f [%d g])",
+                              double(rs.pureSelfPlayWins) / rs.pureSelfPlayGames,
+                              double(rs.pureSelfPlayScore) / rs.pureSelfPlayGames,
+                              rs.pureSelfPlayGames);
+                pureStr = pbuf;
+            }
             std::printf(
                 "upd %4d | wall %.1fs rollout %.1fs learn %.1fs ep %d,%d,%d/%d threads 1 | "
-                "WP %.3f ADP %7.2f | lr %.2e ent %5.3f/%5.3f/%5.3f | "
+                "WP %.3f ADP %7.2f%s | lr %.2e ent %5.3f/%5.3f/%5.3f | "
                 "kl %.4f/%.4f/%.4f cf %.2f/%.2f/%.2f | n %lld/%lld/%lld\n",
                 upd, wallSecs, rollSecs, learnSecs,
                 ps[0].epochsCompleted, ps[1].epochsCompleted, ps[2].epochsCompleted,
-                args.epochs, wp, adp, currentLr, ps[0].entropy,
+                args.epochs, wp, adp, pureStr.c_str(), currentLr, ps[0].entropy,
                 ps[1].entropy, ps[2].entropy,
                 ps[0].lastEpochKL, ps[1].lastEpochKL, ps[2].lastEpochKL,
                 ps[0].clipFraction, ps[1].clipFraction, ps[2].clipFraction,
@@ -398,8 +443,12 @@ int main(int argc, char** argv) {
             if (args.poolEvery > 0 && upd % args.poolEvery == 0) {
                 pushHistPool(actor, upd);
             }
+            if (args.snapshotEvery > 0 &&
+                (upd % args.snapshotEvery == 0 || upd == args.updates)) {
+                saveAll(args.out, upd);
+            }
         }
-        saveAll(args.out);
+        saveAll(args.out, args.updates);
         std::cout << "models saved to " << args.out << "/\n";
         return 0;
     }
@@ -534,7 +583,7 @@ int main(int argc, char** argv) {
     buf.cap = std::max(1, args.buffer);
 
     std::thread producer([&] {
-        for (int chunk = 0; chunk < args.updates; ++chunk) {
+        for (int chunk = args.startUpdate - 1; chunk < args.updates; ++chunk) {
             {
                 std::lock_guard<std::mutex> lock(buf.mu);
                 if (buf.stop) return;
@@ -579,7 +628,7 @@ int main(int argc, char** argv) {
         }
     });
 
-    for (int upd = 1; upd <= args.updates; ++upd) {
+    for (int upd = args.startUpdate; upd <= args.updates; ++upd) {
         auto wall0 = std::chrono::steady_clock::now();
         Sample sample;
         int qReady = 0;
@@ -681,15 +730,24 @@ int main(int argc, char** argv) {
         double adp = double(rs.landlordScore) / std::max(1, rs.games);
         double bpg = double(rs.bombs) / std::max(1, rs.games);
         double mpg = double(rs.moves) / std::max(1, rs.games);
+        std::string pureStr;
+        if (rs.pureSelfPlayGames > 0) {
+            char pbuf[64];
+            std::snprintf(pbuf, sizeof(pbuf), " (pure WP %.3f ADP %7.2f [%d g])",
+                          double(rs.pureSelfPlayWins) / rs.pureSelfPlayGames,
+                          double(rs.pureSelfPlayScore) / rs.pureSelfPlayGames,
+                          rs.pureSelfPlayGames);
+            pureStr = pbuf;
+        }
         std::printf(
             "upd %4d | q %d/%d left %d end %d | wall %.1fs rollout %.1fs learn %.1fs "
-            "games %d mb %d ep %d,%d,%d/%d threads %d | WP %.3f ADP %7.2f bomb/g %.2f "
+            "games %d mb %d ep %d,%d,%d/%d threads %d | WP %.3f ADP %7.2f%s bomb/g %.2f "
             "moves/g %.1f | lr %.2e ent %5.3f/%5.3f/%5.3f vL %7.2f/%7.2f/%7.2f "
             "kl %.4f/%.4f/%.4f cf %.2f/%.2f/%.2f | ret %7.1f/%7.1f/%7.1f | n %lld/%lld/%lld\n",
             upd, qReady, buf.cap, qLeft, qEnd, wallSecs, rollSecs, learnSecs,
             rs.games, args.minibatch,
             ps[0].epochsCompleted, ps[1].epochsCompleted, ps[2].epochsCompleted,
-            args.epochs, args.threads, wp, adp, bpg, mpg,
+            args.epochs, args.threads, wp, adp, pureStr.c_str(), bpg, mpg,
             currentLr, ps[0].entropy, ps[1].entropy, ps[2].entropy,
             ps[0].vLoss, ps[1].vLoss, ps[2].vLoss,
             ps[0].lastEpochKL, ps[1].lastEpochKL, ps[2].lastEpochKL,
@@ -703,7 +761,7 @@ int main(int argc, char** argv) {
         }
         if (args.snapshotEvery > 0 &&
             (upd % args.snapshotEvery == 0 || upd == args.updates)) {
-            saveAll(args.out);
+            saveAll(args.out, upd);
         }
         // bound memory: nothing needed (oracle memo is per rollout worker)
     }
@@ -732,7 +790,7 @@ int main(int argc, char** argv) {
     SetThreadExecutionState(ES_CONTINUOUS);
 #endif
 
-    saveAll(args.out);
+    saveAll(args.out, args.updates);
     std::cout << "models saved to " << args.out << "/\n";
     return 0;
 }

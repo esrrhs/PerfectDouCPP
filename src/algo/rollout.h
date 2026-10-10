@@ -22,7 +22,6 @@ struct Transition {
     std::array<float, ddz::kImpScalars> scalar{};
     std::array<uint8_t, ddz::kExtraBin> extra{};
     std::array<float, ddz::kExtraScalars> extraScalar{};
-    std::array<uint64_t, 10> mask{};  // 621 action bits
     // Released-model action representation (abstract id -> 12x15 + 6).
     std::vector<std::pair<int, std::array<float, ddz::kActionSize>>> actions;
     int action = -1;
@@ -39,6 +38,9 @@ struct RolloutStats {
     int games = 0;
     int landlordWins = 0;
     long long landlordScore = 0;  // ADP accumulated for the landlord camp
+    int pureSelfPlayGames = 0;
+    int pureSelfPlayWins = 0;
+    long long pureSelfPlayScore = 0;
     long long bombs = 0;
     long long moves = 0;
     std::array<long long, 3> transitions{};

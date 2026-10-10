@@ -11,7 +11,7 @@ namespace algo {
 
 struct PPOConfig {
     float clip = 0.2f;       // Policy ratio clipping
-    float vfClip = 5.0f;     // Value clipping range (ADP returns span roughly +-2..48)
+    float vfClip = 32.0f;    // Value clipping range when enabled (wide to accommodate ADP explosive bomb swings)
     float entCoef = 0.03f;
     float vfCoef = 0.5f;
     int epochs = 4;
@@ -21,7 +21,7 @@ struct PPOConfig {
     float gamma = 1.0f;
     float lambda = 0.95f;    // GAE lambda (0.95 for variance reduction, 1.0 for pure Monte Carlo)
     float targetKL = 0.03f;  // Early stopping threshold (0 to disable)
-    bool clipVf = true;      // Value loss clipping enabled
+    bool clipVf = false;     // Value loss clipping disabled by default (prevents saturation on high-bomb swings)
 };
 
 struct PPOStats {

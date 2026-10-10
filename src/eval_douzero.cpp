@@ -142,7 +142,6 @@ ddz::CardSet ourMove(nn::Actor& actor, nn::ActorInfer& w, const ddz::Game& g,
     t.extra = e.extra;
     t.extraScalar = e.extraScalar;
     for (const ddz::LegalOption& o : options) {
-        t.mask[o.abstractId >> 6] |= uint64_t(1) << (o.abstractId & 63);
         t.actions.emplace_back(o.abstractId, o.feature);
     }
     std::vector<algo::Transition*> ptrs{&t};

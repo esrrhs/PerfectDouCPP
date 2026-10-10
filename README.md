@@ -22,9 +22,9 @@ pthread），包含超高速牌局引擎、特征工程、神经网络反向传�
 | LSTM(5×540，即每步拼接 3 次出牌) + 对每个合法动作共享 MLP[256,256,256,512,1] | `src/nn/net.cpp`（支持 CPU AMX/AVX2；Windows 训练 GPU 为 CUDA cuBLAS + D3D12 其余核） |
 | 完美信息价值网络 MLP[256×4] | `src/nn/net.cpp`（PTIE：完美 critic 通过优势蒸馏给不完美 actor） |
 | 终局 ADP 收益目标与微量 Shaping | 终局收益为地主 $\pm 2 \times 2^{\text{bomb}}$，农民 $\pm 1 \times 2^{\text{bomb}}$；默认启用 GAE（$\lambda=0.95$）降低多步决策方差（可通过 `--lambda 1.0` 退化为纯蒙特卡洛 ADP），辅以微量残局 Shaping（`--shaping-cap 0.05`，引导清牌且不扰动胜负格局） |
-| PPO 工业级策略裁剪与价值裁剪 | `src/algo/ppo.cpp`，实现策略裁剪 $L_{\text{CLIP}}$ 与优势值标准化（Advantage Normalization）；价值网络默认启用价值裁剪 $L_{\text{VF}}$（默认 `--vf-clip 5.0`，与斗地主 ADP 回报尺度相匹配，严格偏导饱和截断，可通过 `--no-clip-vf` 禁用） |
+| PPO 工业级策略裁剪与价值估计 | `src/algo/ppo.cpp`，实现策略裁剪 $L_{\text{CLIP}}$ 与优势值标准化（Advantage Normalization）；价值网络支持价值裁剪 $L_{\text{VF}}$（默认禁用 `--no-clip-vf`，避免绝对截断抑制炸弹翻倍大样本回归；可通过 `--clip-vf` 开启，阈值 `--vf-clip 32.0`） |
 | 动态 KL 散度与自适应早停 | $\text{approxKL} = (r - 1) - \ln r$，每个 Epoch 独立评估均值，超过 $1.5 \times \text{targetKL}$ 触发早停，防止策略崩溃 |
-| 分层联赛训练池（League Training） | `src/algo/rollout.cpp`，混合最近快照（Rolling Pool）、几何稀疏长期归档（Long-term Archive，锚定最早基线）与规则智能体（Heuristic RuleAgent），单局保证农民策略一致性 |
+| 分层联赛训练池（League Training） | `src/algo/rollout.cpp`，混合最近快照（Rolling Pool）、几何稀疏长期归档（Long-term Archive，锚定最早基线）与规则智能体（Heuristic RuleAgent），阵营级采样（地主独立抽样，两农民座位严格同步绑定同策略快照），保证农民合作一致性 |
 | 三个座位独立模型、批量自对弈 | `src/algo/rollout.cpp`（多线程无锁快照推进，原子安全） |
 
 论文的叫牌阶段与分布式集群（880 CPU + 8 GPU、25 亿帧）未实现：本项目只训练
@@ -73,8 +73,9 @@ ctest --test-dir build          # 规则测试 + 神经网络数值梯度检查
 --lambda N          GAE 权衡参数 lambda（默认 0.95 降低多步决策方差；1.0 为纯蒙特卡洛终局 ADP）
 --clip N            PPO clip（默认 0.2）
 --target-kl N       动态 KL 散度早停阈值（默认 0.03，0 禁用）
---no-clip-vf        禁用 PPO 价值函数裁剪损失（默认启用 clipVf）
---vf-clip N         PPO 价值函数裁剪阈值（默认 5.0，与斗地主 ADP 回报尺度相匹配）
+--clip-vf           启用 PPO 价值函数裁剪损失（默认禁用 clipVf，避免炸弹高回报饱和）
+--no-clip-vf        禁用 PPO 价值函数裁剪损失（默认）
+--vf-clip N         PPO 价值函数裁剪阈值（默认 32.0，与斗地主 ADP 炸弹翻倍尺度相匹配）
 --shaping-cap N     残局微量奖励塑造上限（默认 0.05，平局打破与出牌紧凑度引导）
 --pool-size N       联赛最近滚动快照池大小（默认 16）
 --archive-size N    联赛长期几何稀疏归档池大小（默认 16）
@@ -82,7 +83,8 @@ ctest --test-dir build          # 规则测试 + 神经网络数值梯度检查
 --historical-prob P       自对弈中抽样历史对手的概率（默认 0.2）
 --rule-prob P       自对弈中抽样经典规则智能体的概率（默认 0.1）
 --snapshot-every K  每 K 轮落盘，最后一轮必存
---resume DIR        从 actor{0,1,2}.bin / critic{0,1,2}.bin 继续
+--start-update U    指定起始更新轮数（默认 1，若从带有 meta.txt 的断点 resume 则自动续接）
+--resume DIR        从 actor/critic 权重与 Adam 动量继续（支持自动续接进度与学习率）
 --backend auto|cuda|cpu   GEMM 后端（Windows：cuda = cuBLAS GEMM + D3D12 其余核）
 ```
 
@@ -100,11 +102,11 @@ ctest --test-dir build          # 规则测试 + 神经网络数值梯度检查
 - 数值为 FP32。`tests/test_gemm` 校验 CPU/GPU GEMM，`tests/test_grad` 校验整网梯度。
 - 没有 CUDA 时使用 CPU GEMM（Apple 为 Accelerate，ARM 为 NEON，其余为标量）。
 
-输出文件：`ckpt/actor{0,1,2}.bin`、`ckpt/critic{0,1,2}.bin`
-（座位 0=landlord，1=landlord_down，2=landlord_up），供后续推理程序加载。
+输出文件：`ckpt/actor{0,1,2}.bin`、`ckpt/critic{0,1,2}.bin`、`ckpt/opt_actor{0,1,2}.bin`、`ckpt/opt_critic{0,1,2}.bin`、`ckpt/meta.txt`
+（座位 0=landlord，1=landlord_down，2=landlord_up），供后续推理程序加载或断点续训。
 
 每轮打印：
-- **牌局统计**：WP（地主胜率）、ADP（均差分）、炸弹率（bomb/g）、平均步数（moves/g）；
+- **牌局统计**：WP（地主胜率）、ADP（均差分）、pure WP/ADP（两阵营纯最新自对弈指标）、炸弹率（bomb/g）、平均步数（moves/g）；
 - **优化监控**：lr（当前学习率）、ent（三座位策略熵）、vL（三座位价值网络损失）；
 - **稳定指标**：ep（三座位实际完成的 Epoch 数，显示早停状态）、kl（末轮近似 KL 散度）、cf（PPO Clip 触发比例）；
 - **收益规模**：ret（三座位平均累积回报）、n（三座位样本数量）。
