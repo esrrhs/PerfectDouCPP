@@ -270,6 +270,13 @@ void runWorker(const ModelSet& models, const RolloutConfig& cfg, int nGames,
             sum += probs[a];
         }
         float draw = float((sampleRng.nextU64() >> 11) / double(1ULL << 53));
+        if (!(sum > 0.0f) || !std::isfinite(sum)) {
+            // NaN/Inf logits: fall back to a uniform choice over legal moves
+            // so a bad forward pass cannot write NaN into the training stream.
+            size_t k = std::min(size_t(draw * opts.size()), opts.size() - 1);
+            return std::make_pair(opts[k].abstractId,
+                                  -std::log(float(opts.size())));
+        }
         int chosenId = opts.front().abstractId;
         float acc = 0.0f;
         for (const LegalOption& o : opts) {
@@ -375,7 +382,7 @@ void runWorker(const ModelSet& models, const RolloutConfig& cfg, int nGames,
                     auto [chosenId, logp] = chooseAction(logits, options[i], i);
                     tr[i].action = chosenId;
                     tr[i].logp = logp;
-                    tr[i].value = values.row(i)[0];
+                    tr[i].value = std::isfinite(values.row(i)[0]) ? values.row(i)[0] : 0.0f;
                     for (const LegalOption& o : options[i]) {
                         if (o.abstractId == chosenId) chosen[i] = &o;
                     }

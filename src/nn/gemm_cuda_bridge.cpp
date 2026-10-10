@@ -895,7 +895,7 @@ bool syncLane(int idx) {
 }
 
 bool cudaBridgeHasWork() {
-    int idx = t_lane < 0 ? 0 : t_lane;
+    int idx = t_lane < 0 ? laneIndex() : t_lane;
     return g_lanes[idx].submitted.load(std::memory_order_acquire) >
            g_lanes[idx].completed.load(std::memory_order_acquire);
 }
@@ -931,7 +931,10 @@ bool cudaBridgeDtoH(ID3D12Device* device, ID3D12Resource* resource, size_t offse
 
 void cudaBridgeDrop(ID3D12Resource* resource) {
     if (!resource) return;
-    if (!cudaBridgeSyncAll()) return;
+    // Even if a sync fails the mapping must still go: the D3D resource is
+    // about to be released, and a stale entry would leak the CUDA mapping and
+    // alias a later resource allocated at the same address.
+    cudaBridgeSyncAll();
     std::lock_guard<std::mutex> lock(g_mu);
     if (!g_ready) return;
     auto it = g_maps.find(resource);

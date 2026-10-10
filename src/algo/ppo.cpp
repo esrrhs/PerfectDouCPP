@@ -247,7 +247,10 @@ bool ppoUpdate(nn::Actor& actor, nn::Critic& critic,
                     eAll.data(), eStride, out.data.xImp, out.data.seq,
                     out.data.actionFeat, out.data.actionSample,
                     out.data.actionId, out.data.actionOffset, out.data.extra);
-                produced.store(tail + 1, std::memory_order_release);
+                {
+                    std::lock_guard<std::mutex> lk(slotMu);
+                    produced.store(tail + 1, std::memory_order_release);
+                }
                 slotCv.notify_one();
             }
         }
@@ -339,12 +342,18 @@ bool ppoUpdate(nn::Actor& actor, nn::Critic& critic,
             std::fill(dLogits.d.begin(), dLogits.d.end(), 0.0f);
             float mbKLSum = 0.0f;
             float mbClipSum = 0.0f;
+            bool nonFinite = false;
             for (int i = 0; i < B; ++i) {
                 float probs[nn::kNumActions];
                 maskedSoftmax(logits.row(i), nn::kNumActions, probs);
                 int act = mb[i]->action;
                 float newLogp = std::log(std::max(probs[act], 1e-12f));
                 float logRatio = newLogp - mb[i]->logp;
+                if (!std::isfinite(logRatio) || !std::isfinite(mb[i]->adv)) {
+                    nonFinite = true;
+                    continue;
+                }
+                logRatio = std::clamp(logRatio, -20.0f, 20.0f);
                 float ratio = std::exp(logRatio);
                 // Approx KL divergence: (ratio - 1) - log(ratio) (k3 approximation, non-negative)
                 float approxKL = (ratio - 1.0f) - logRatio;
@@ -397,6 +406,11 @@ bool ppoUpdate(nn::Actor& actor, nn::Critic& critic,
             for (int i = 0; i < B; ++i) {
                 float vPred = values.row(i)[0];
                 float vTarget = mb[i]->ret;
+                if (!std::isfinite(vPred) || !std::isfinite(vTarget)) {
+                    nonFinite = true;
+                    dValue.row(i)[0] = 0.0f;
+                    continue;
+                }
                 float err = vPred - vTarget;
                 if (cfg.clipVf) {
                     // PPO Value Clipping: L_vf = max((v - target)^2, (v_clipped - target)^2)
@@ -420,6 +434,8 @@ bool ppoUpdate(nn::Actor& actor, nn::Critic& critic,
                 }
             }
 
+            if (nonFinite)
+                std::fprintf(stderr, "WARN: non-finite logits/values/targets in minibatch; samples skipped\n");
             onGpu([&] {
                 actor.backward(dLogits);
                 critic.backward(dValue);
@@ -429,7 +445,10 @@ bool ppoUpdate(nn::Actor& actor, nn::Critic& critic,
             // CUDA copies are already in this seat's scratch, so the producer
             // may refill the host batch while the stream finishes. The D3D
             // path waited inside onGpu.
-            consumed.store(head + 1, std::memory_order_release);
+            {
+                std::lock_guard<std::mutex> lk(slotMu);
+                consumed.store(head + 1, std::memory_order_release);
+            }
             slotCv.notify_one();
             if (ownGpu) {
                 nn::gpuSync();
@@ -478,7 +497,10 @@ bool ppoUpdate(nn::Actor& actor, nn::Critic& critic,
                 }
             }
     }
-    stopProducer.store(true, std::memory_order_release);
+    {
+        std::lock_guard<std::mutex> lk(slotMu);
+        stopProducer.store(true, std::memory_order_release);
+    }
     slotCv.notify_all();
     if (prepareThread.joinable()) prepareThread.join();
     if (!deviceOk) return false;

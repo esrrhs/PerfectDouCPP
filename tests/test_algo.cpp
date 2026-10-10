@@ -10,6 +10,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <limits>
 #include <thread>
 #include <vector>
 
@@ -424,6 +425,105 @@ static void testConcurrentLaneStress() {
     CHECK(completedCycles.load() > 0);
 }
 
+// 13. loadOptimizer must not clobber state when the file is truncated
+static void testLoadOptimizerAtomic() {
+    nn::NetConfig cfg{64, 32};
+    nn::Actor a;
+    a.init(cfg, 5);
+    auto ps = a.params();
+    nn::Adam src;
+    src.t = 11;
+    const char* path = "test_opt_trunc.bin";
+    nn::saveOptimizer(path, ps, src);
+    FILE* f = std::fopen(path, "rb");
+    CHECK(f);
+    std::fseek(f, 0, SEEK_END);
+    long sz = std::ftell(f);
+    std::fseek(f, 0, SEEK_SET);
+    std::vector<char> buf(size_t(sz) / 2);
+    CHECK(std::fread(buf.data(), 1, buf.size(), f) == buf.size());
+    std::fclose(f);
+    f = std::fopen(path, "wb");
+    std::fwrite(buf.data(), 1, buf.size(), f);
+    std::fclose(f);
+
+    ps[0]->m[0] = 0.5f;
+    nn::Adam dst;
+    dst.t = 3;
+    dst.lr = 1e-3f;
+    CHECK(!nn::loadOptimizer(path, ps, dst));
+    CHECK(dst.t == 3);
+    CHECK(dst.lr == 1e-3f);
+    CHECK(ps[0]->m[0] == 0.5f);
+    std::remove(path);
+}
+
+// 14. A NaN gradient must be skipped instead of poisoning weights
+static void testNaNGradientSkipped() {
+    nn::NetConfig cfg{64, 32};
+    nn::Actor a;
+    a.init(cfg, 6);
+    auto ps = a.params();
+    std::vector<float> before = ps[0]->w;
+    for (nn::Param* p : ps) std::fill(p->dw.begin(), p->dw.end(), 0.1f);
+    ps[0]->dw[0] = std::nanf("");
+    nn::Adam opt;
+    opt.applyGradNorm(ps, 0.5f);
+    CHECK(opt.t == 0);
+    for (nn::Param* p : ps)
+        for (float w : p->w) CHECK(std::isfinite(w));
+    CHECK(ps[0]->w == before);
+}
+
+// 15. PPO update must survive NaN/Inf in stored transitions
+static void testPPOSurvivesNonFiniteSamples() {
+    nn::NetConfig cfg{64, 32};
+    nn::Actor actor;
+    nn::Critic critic;
+    actor.init(cfg, 42);
+    critic.init(cfg, 43);
+    nn::Adam ao, co;
+    nn::Rng64 rng(7);
+    std::vector<Transition> tr(16);
+    for (size_t i = 0; i < tr.size(); ++i) {
+        tr[i].gameId = int(i / 8);
+        tr[i].action = int(i % nn::kNumActions);
+        tr[i].reward = (i % 2) ? 1.0f : -1.0f;
+        tr[i].logp = -2.0f;
+        std::array<float, ddz::kActionSize> feat{};
+        tr[i].actions.emplace_back(tr[i].action, feat);
+        if (i % 8 == 7) tr[i].terminal = true;
+    }
+    tr[3].logp = -std::numeric_limits<float>::infinity();
+    PPOConfig pc;
+    pc.epochs = 1;
+    pc.minibatch = 8;
+    PPOStats st;
+    ppoUpdate(actor, critic, tr, pc, ao, co, rng, st);
+    for (nn::Param* p : actor.params())
+        for (float w : p->w) CHECK(std::isfinite(w));
+    for (nn::Param* p : critic.params())
+        for (float w : p->w) CHECK(std::isfinite(w));
+}
+
+// 16. Producer/consumer ring in ppoUpdate must not hang (repeat to expose
+// lost-wakeup races); a watchdog aborts instead of hanging CI.
+static void testPPONoDeadlock() {
+    std::atomic<bool> done{false};
+    std::thread watchdog([&] {
+        for (int i = 0; i < 600 && !done.load(); ++i)
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        if (!done.load()) {
+            std::printf("deadlock detected in ppoUpdate\n");
+            std::fflush(stdout);
+            std::abort();
+        }
+    });
+    for (int rep = 0; rep < 20; ++rep) testPPOWeightsFiniteAfterUpdate();
+    done = true;
+    watchdog.join();
+}
+
 int main() {
     std::printf("testAdvantageNormAndGAE...\n"); testAdvantageNormAndGAE();
     std::printf("testValueClipping...\n"); testValueClipping();
@@ -437,6 +537,10 @@ int main() {
     std::printf("testKLDivergenceNaNProtection...\n"); testKLDivergenceNaNProtection();
     std::printf("testPPOWeightsFiniteAfterUpdate...\n"); testPPOWeightsFiniteAfterUpdate();
     std::printf("testConcurrentLaneStress...\n"); testConcurrentLaneStress();
+    std::printf("testLoadOptimizerAtomic...\n"); testLoadOptimizerAtomic();
+    std::printf("testNaNGradientSkipped...\n"); testNaNGradientSkipped();
+    std::printf("testPPOSurvivesNonFiniteSamples...\n"); testPPOSurvivesNonFiniteSamples();
+    std::printf("testPPONoDeadlock...\n"); testPPONoDeadlock();
     std::printf("ALL ALGO TESTS PASSED\n");
     return 0;
 }
