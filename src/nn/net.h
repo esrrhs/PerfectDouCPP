@@ -18,8 +18,8 @@ constexpr int kExtraInput = 362;
 constexpr int kLstmSteps = 10;
 constexpr int kLstmIn = 540;     // three consecutive moves per LSTM step
 // Logit width for one decision. Concrete legal moves are scored in slots
-// 0..n-1. Random 20-card hands peaked at 316 moves, so 512 leaves room.
-constexpr int kNumActions = 512;
+// 0..n-1. A live hand reached 519 moves, past the old 512 cap.
+constexpr int kNumActions = 2048;
 constexpr int kActionInput = 186; // 12*15 action matrix + 6 properties
 
 struct Param {
