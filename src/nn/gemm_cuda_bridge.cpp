@@ -115,15 +115,10 @@ constexpr int kLanes = 8;
 struct Lane {
     CUstream stream = nullptr;
     cublasHandle_t blas = nullptr;
-    HANDLE done = nullptr;
     bool busy = false;
 };
-void CUDA_CB onLaneDone(void* user) {
-    // No CUDA calls here. The waiting thread blocks on this event, not inside
-    // cuStreamSynchronize, so the driver lock stays free for the other seats.
-    SetEvent(static_cast<HANDLE>(user));
-}
 Lane g_lanes[kLanes];
+std::mutex g_laneMus[kLanes];
 std::atomic<int> g_laneNext{0};
 thread_local int t_lane = -1;
 
@@ -311,14 +306,6 @@ bool ensureInit() {
     // uses that stream, which would stall every seat at every readback.
     // cublasSetStream is checked; the gemm does not stay on NULL.
     for (Lane& ln : g_lanes) {
-        if (!ln.done) {
-            ln.done = CreateEventA(nullptr, FALSE, FALSE, nullptr);
-            if (!ln.done) {
-                std::snprintf(g_err, sizeof(g_err), "CreateEvent failed");
-                g_failed = true;
-                return false;
-            }
-        }
         st = g_api.cuStreamCreate(&ln.stream, CU_STREAM_NON_BLOCKING);
         if (st != CUDA_SUCCESS) {
             setCu(st, "cuStreamCreate");
@@ -870,24 +857,15 @@ void cudaBridgeSetStream(int seat) {
 }
 
 bool syncLane(int idx) {
+    if (idx < 0 || idx >= kLanes) return false;
+    std::lock_guard<std::mutex> laneLock(g_laneMus[idx]);
     CUstream s = nullptr;
-    HANDLE ev = nullptr;
     {
         std::lock_guard<std::mutex> lock(g_mu);
         if (!ensureInit()) return false;
-        if (idx < 0 || idx >= kLanes) return false;
         if (!g_lanes[idx].busy) return true;
         s = g_lanes[idx].stream;
-        ev = g_lanes[idx].done;
-        ResetEvent(ev);
-        CUresult st = g_api.cuLaunchHostFunc(s, onLaneDone, ev);
-        if (st != CUDA_SUCCESS) {
-            setCu(st, "cuLaunchHostFunc");
-            return false;
-        }
     }
-    // OS wait, not a CUDA synchronize: another seat can launch while this one runs.
-    WaitForSingleObject(ev, INFINITE);
     CUresult st = g_api.cuStreamSynchronize(s);
     std::lock_guard<std::mutex> lock(g_mu);
     if (st != CUDA_SUCCESS) {
