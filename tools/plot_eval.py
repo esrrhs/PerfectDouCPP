@@ -37,10 +37,7 @@ def read_eval_csv(csv_path: Path) -> list[dict]:
     return rows
 
 
-def plot_curves(rows: list[dict], out_png: Path, x_col: str = "update") -> bool:
-    if not rows:
-        return False
-
+def parse_rows(rows: list[dict], x_col: str = "update") -> list[dict]:
     parsed = []
     for r in rows:
         try:
@@ -64,11 +61,13 @@ def plot_curves(rows: list[dict], out_png: Path, x_col: str = "update") -> bool:
             })
         except (ValueError, TypeError):
             continue
+    parsed.sort(key=lambda item: item["x"])
+    return parsed
 
+
+def plot_single(parsed: list[dict], out_png: Path, x_col: str = "update") -> bool:
     if not parsed:
         return False
-
-    parsed.sort(key=lambda item: item["x"])
     x = np.array([p["x"] for p in parsed], dtype=float)
     wp = np.array([p["wp"] for p in parsed], dtype=float)
     adp = np.array([p["adp"] for p in parsed], dtype=float)
@@ -123,39 +122,105 @@ def plot_curves(rows: list[dict], out_png: Path, x_col: str = "update") -> bool:
     return True
 
 
+def plot_comparison(datasets: list[tuple[str, list[dict]]], out_png: Path, x_col: str = "update") -> bool:
+    valid_data = [(label, parse_rows(rows, x_col)) for label, rows in datasets]
+    valid_data = [(label, p) for label, p in valid_data if len(p) > 0]
+    if not valid_data:
+        return False
+    if len(valid_data) == 1:
+        return plot_single(valid_data[0][1], out_png, x_col)
+
+    colors = ["#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd", "#8c564b", "#e377c2", "#7f7f7f"]
+    markers = ["o", "s", "^", "v", "D", "P", "*", "X"]
+
+    fig, axes = plt.subplots(2, 1, figsize=(11, 8), sharex=True)
+    ax1, ax2 = axes[0], axes[1]
+
+    ax1.axhline(0.5, color="gray", linestyle=":", linewidth=1, label="50% baseline")
+    ax2.axhline(0.0, color="gray", linestyle=":", linewidth=1, label="0.0 baseline")
+
+    for i, (label, parsed) in enumerate(valid_data):
+        c = colors[i % len(colors)]
+        m = markers[i % len(markers)]
+        x = np.array([p["x"] for p in parsed], dtype=float)
+        wp = np.array([p["wp"] for p in parsed], dtype=float)
+        adp = np.array([p["adp"] for p in parsed], dtype=float)
+
+        ax1.plot(x, wp, marker=m, color=c, linewidth=1.8, markersize=5, label=f"{label} (WP)")
+        ax2.plot(x, adp, marker=m, color=c, linewidth=1.8, markersize=5, label=f"{label} (ADP)")
+
+        if len(x) >= 4:
+            deg = min(2, len(x) - 1)
+            poly_w = np.polyfit(x, wp, deg)
+            poly_a = np.polyfit(x, adp, deg)
+            xx = np.linspace(x.min(), x.max(), 100)
+            ax1.plot(xx, np.polyval(poly_w, xx), "--", color=c, alpha=0.5)
+            ax2.plot(xx, np.polyval(poly_a, xx), "--", color=c, alpha=0.5)
+
+    ax1.set_ylabel("Win Rate (WP)", fontsize=11)
+    ax1.set_title("A/B Experiment Comparison vs DouZero", fontsize=13, fontweight="bold")
+    ax1.grid(True, linestyle="--", alpha=0.4)
+    ax1.legend(loc="best", framealpha=0.9)
+
+    x_label = "Training Update" if x_col == "update" else "Elapsed Time (minutes)"
+    ax2.set_xlabel(x_label, fontsize=11)
+    ax2.set_ylabel("ADP (Reward / Game)", fontsize=11)
+    ax2.grid(True, linestyle="--", alpha=0.4)
+    ax2.legend(loc="best", framealpha=0.9)
+
+    fig.tight_layout()
+    out_png.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_png, dpi=140)
+    plt.close(fig)
+    return True
+
+
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Plot PerfectDou vs DouZero evaluation curves.")
-    parser.add_argument("--csv", default="ckpt/eval_vs_douzero.csv", help="Path to eval CSV file")
+    parser = argparse.ArgumentParser(description="Plot PerfectDou vs DouZero evaluation curves (single or A/B comparison).")
+    parser.add_argument("--csv", nargs="+", default=["ckpt/eval_vs_douzero.csv"], help="One or more eval CSV paths")
+    parser.add_argument("--labels", nargs="+", default=None, help="Labels for each CSV in A/B comparison")
     parser.add_argument("--out", default="", help="Path to output PNG image (default: <csv_dir>/eval_curve.png)")
     parser.add_argument("--x", choices=["update", "minutes"], default="update", help="X-axis column")
     parser.add_argument("--watch", type=int, default=0, help="Watch interval in seconds (0 = run once)")
     args = parser.parse_args()
 
-    csv_path = Path(args.csv)
-    out_png = Path(args.out) if args.out else csv_path.parent / "eval_curve.png"
+    csv_paths = [Path(p) for p in args.csv]
+    out_png = Path(args.out) if args.out else csv_paths[0].parent / "eval_curve.png"
+
+    labels = args.labels
+    if labels is None or len(labels) != len(csv_paths):
+        labels = [p.parent.name if p.parent.name else p.stem for p in csv_paths]
+
+    def render() -> bool:
+        datasets = []
+        for label, p in zip(labels, csv_paths):
+            if p.is_file():
+                datasets.append((label, read_eval_csv(p)))
+        if not datasets:
+            return False
+        return plot_comparison(datasets, out_png, args.x)
 
     if args.watch > 0:
-        print(f"Monitoring {csv_path} every {args.watch}s -> {out_png}")
-        last_mtime = 0.0
+        print(f"Monitoring {len(csv_paths)} CSV(s) every {args.watch}s -> {out_png}")
+        last_mtimes = {}
         while True:
-            if csv_path.is_file():
-                mtime = csv_path.stat().st_mtime
-                if mtime != last_mtime:
-                    rows = read_eval_csv(csv_path)
-                    if plot_curves(rows, out_png, args.x):
-                        print(f"[{time.strftime('%H:%M:%S')}] Updated {out_png} ({len(rows)} entries)")
-                    last_mtime = mtime
+            changed = False
+            for p in csv_paths:
+                if p.is_file():
+                    mt = p.stat().st_mtime
+                    if last_mtimes.get(str(p)) != mt:
+                        changed = True
+                        last_mtimes[str(p)] = mt
+            if changed:
+                if render():
+                    print(f"[{time.strftime('%H:%M:%S')}] Updated {out_png}")
             time.sleep(args.watch)
     else:
-        rows = read_eval_csv(csv_path)
-        if not rows:
-            print(f"No data found in {csv_path}")
-            return 1
-        if plot_curves(rows, out_png, args.x):
-            print(f"Successfully generated plot at {out_png} ({len(rows)} entries)")
+        if render():
+            print(f"Successfully generated plot at {out_png}")
             return 0
         else:
-            print("Failed to parse plot data.")
+            print("Failed to generate plot: no valid CSV data found.")
             return 1
 
 

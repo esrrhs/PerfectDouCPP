@@ -162,16 +162,40 @@ upd   500 | q 1/1 left 0 end 1 | wall 4.2s rollout 0.5s learn 3.7s games 256 mb 
 - **kl / cf**：近似 KL 散度与 PPO 策略裁剪触发比例；
 - **[eval uX]**：后台 DouZero 评测的对局统计，包含总胜率、地主胜率与农民胜率。
 
-### 4. 胜率趋势图实时渲染
+### 4. 胜率趋势图实时渲染与 A/B 对照
 
 使用轻量绘图脚本随时根据评测追加的 CSV 渲染胜率与 ADP 变化曲线：
 
 ```bash
-# 渲染静态图片
+# 单实验渲染静态图片
 python tools/plot_eval.py --csv ckpt/eval_vs_douzero.csv --out ckpt/eval_curve.png
 
 # 实时监视模式（每 30 秒自动重新绘图刷新）
 python tools/plot_eval.py --csv ckpt/eval_vs_douzero.csv --out ckpt/eval_curve.png --watch 30
+```
+
+#### A/B 对照实验使用指引
+系统天然支持完整的 A/B 对照实验目录隔离。通过 `--out <DIR>` 即可将所有实验产物（训练 Checkpoint、评测 CSV、评测模型快照）整体隔离在各自独立的目录下：
+
+```bash
+# 实验 A（基准实验）
+./build/perfectdou_train --out exp_baseline --lr 3e-4 --eval-every 500
+
+# 实验 B（新参数对照）
+./build/perfectdou_train --out exp_lr_1e4 --lr 1e-4 --eval-every 500
+```
+
+每个实验会自动生成独立的产物：
+- `exp_baseline/`：最终模型、`eval_vs_douzero.csv`、`eval_snapshots/`（包含各步数快照）；
+- `exp_lr_1e4/`：最终模型、`eval_vs_douzero.csv`、`eval_snapshots/`。
+
+若需要将两个或多个实验画在同一张图上进行直观对比：
+```bash
+# 一键生成 A/B 对比趋势图（支持任意多个实验）
+python tools/plot_eval.py \
+    --csv exp_baseline/eval_vs_douzero.csv exp_lr_1e4/eval_vs_douzero.csv \
+    --labels "Baseline (3e-4)" "Low LR (1e-4)" \
+    --out ab_comparison.png
 ```
 
 ---
