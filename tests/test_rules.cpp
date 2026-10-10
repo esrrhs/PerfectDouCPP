@@ -7,6 +7,8 @@
 #include <set>
 #include <vector>
 
+#include <gtest/gtest.h>
+
 #include "ddz/action_space.h"
 #include "ddz/features.h"
 #include "ddz/game.h"
@@ -18,14 +20,7 @@
 
 using namespace ddz;
 
-#define CHECK(cond)                                                       \
-    do {                                                                  \
-        if (!(cond)) {                                                    \
-            std::printf("CHECK failed at %s:%d: %s\n", __FILE__, __LINE__, \
-                        #cond);                                           \
-            std::abort();                                                 \
-        }                                                                 \
-    } while (0)
+#define CHECK(cond) ASSERT_TRUE(cond)
 
 static void testDetect() {
     auto t = [](const std::string& s, int type) {
@@ -422,18 +417,14 @@ static void testRuleAgent() {
     CHECK(steps > 0);
 }
 
-int main() {
-    std::printf("testDetect...\n"); testDetect();
-    std::printf("testActionSpace...\n"); testActionSpace();
-    std::printf("testGenerator...\n"); testGenerator();
-    std::printf("testOracle...\n"); testOracle();
-    std::printf("testBottomCards...\n"); testBottomCards();
-    std::printf("testShaping...\n"); testShaping();
-    std::printf("testEpisodeReturn...\n"); testEpisodeReturn();
-    std::printf("testDouzeroFeatures...\n"); testDouzeroFeatures();
-    std::printf("testRandomGames...\n"); testRandomGames();
-    std::printf("testFeatures...\n"); testFeatures();
-    std::printf("testRuleAgent...\n"); testRuleAgent();
-    std::printf("ALL TESTS PASSED\n");
-    return 0;
-}
+TEST(RulesTest, Detect) { testDetect(); }
+TEST(RulesTest, ActionSpace) { testActionSpace(); }
+TEST(RulesTest, Generator) { testGenerator(); }
+TEST(RulesTest, Oracle) { testOracle(); }
+TEST(RulesTest, BottomCards) { testBottomCards(); }
+TEST(RulesTest, Shaping) { testShaping(); }
+TEST(RulesTest, EpisodeReturn) { testEpisodeReturn(); }
+TEST(RulesTest, DouzeroFeatures) { testDouzeroFeatures(); }
+TEST(RulesTest, RandomGames) { testRandomGames(); }
+TEST(RulesTest, Features) { testFeatures(); }
+TEST(RulesTest, RuleAgent) { testRuleAgent(); }

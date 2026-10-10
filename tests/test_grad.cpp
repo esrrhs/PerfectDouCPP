@@ -8,6 +8,8 @@
 #include <thread>
 #include <vector>
 
+#include <gtest/gtest.h>
+
 #include "nn/gemm.h"
 #include "nn/net.h"
 
@@ -472,7 +474,7 @@ static int concurrentParity() {
     return failed == 0 ? 0 : 1;
 }
 
-int main() {
+TEST(GradTest, AnalyticGradientCheck) {
     // Numerical reference runs on the synchronous CPU backend.
     gemmInit();
     gemmSetGpu(false);
@@ -613,22 +615,37 @@ int main() {
     checkCritic("lstm.Wh", critic.lstm.Wh);
 
     std::printf("gradient check: %d params, %d failures\n", checked, failed);
-    int numFail = failed;
+    EXPECT_EQ(failed, 0);
+}
 
-    // Same graph on GPU: analytic outputs/gradients must match the CPU ones.
-    int gpuFail = gpuParity();
+TEST(GradTest, GpuParity) {
+    gemmInit();
+    if (!gemmHasGpu()) {
+        GTEST_SKIP() << "No GPU available, skipping GPU parity test";
+    }
+    EXPECT_EQ(gpuParity(), 0);
+}
 
-    // Realistic sizes: accumulated gradients over several minibatches and
-    // Adam-updated weights must also agree, round after round.
+TEST(GradTest, TrainParity) {
 #if defined(PD_HAVE_D3D)
-    int trainFail = trainParity();
-    int concFail = concurrentParity();
+    gemmInit();
+    if (!gemmHasGpu()) {
+        GTEST_SKIP() << "No GPU available, skipping Train parity test";
+    }
+    EXPECT_EQ(trainParity(), 0);
 #else
-    int trainFail = 0;
-    int concFail = 0;
+    GTEST_SKIP() << "Train parity requires Windows D3D12/CUDA";
 #endif
-    return (numFail == 0 && gpuFail == 0 && trainFail == 0 &&
-            concFail == 0)
-               ? 0
-               : 1;
+}
+
+TEST(GradTest, ConcurrentParity) {
+#if defined(PD_HAVE_D3D)
+    gemmInit();
+    if (!gemmHasGpu()) {
+        GTEST_SKIP() << "No GPU available, skipping Concurrent parity test";
+    }
+    EXPECT_EQ(concurrentParity(), 0);
+#else
+    GTEST_SKIP() << "Concurrent parity requires Windows D3D12/CUDA";
+#endif
 }

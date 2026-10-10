@@ -12,20 +12,13 @@
 #include <cstdlib>
 #include <limits>
 #include <thread>
-#include <vector>
+#include <gtest/gtest.h>
 
 #include "algo/eval_douzero.h"
 #include "algo/ppo.h"
 #include "algo/rollout.h"
 
-#define CHECK(cond)                                                       \
-    do {                                                                  \
-        if (!(cond)) {                                                    \
-            std::printf("CHECK failed at %s:%d: %s\n", __FILE__, __LINE__, \
-                        #cond);                                           \
-            std::abort();                                                 \
-        }                                                                 \
-    } while (0)
+#define CHECK(cond) ASSERT_TRUE(cond)
 
 using namespace algo;
 
@@ -559,24 +552,20 @@ static void testActorCloningAndEvalFailSafe() {
     CHECK(!res.error.empty());
 }
 
-int main() {
-    std::printf("testAdvantageNormAndGAE...\n"); testAdvantageNormAndGAE();
-    std::printf("testValueClipping...\n"); testValueClipping();
-    std::printf("testKLDivergence...\n"); testKLDivergence();
-    std::printf("testArchiveAnchorPreservation...\n"); testArchiveAnchorPreservation();
-    std::printf("testRunningNormalizer...\n"); testRunningNormalizer();
-    std::printf("testAdamSerialization...\n"); testAdamSerialization();
-    std::printf("testCriticZeroInit...\n"); testCriticZeroInit();
-    std::printf("testClipFractionSignGating...\n"); testClipFractionSignGating();
-    std::printf("testMaskedSoftmaxNaNProtection...\n"); testMaskedSoftmaxNaNProtection();
-    std::printf("testKLDivergenceNaNProtection...\n"); testKLDivergenceNaNProtection();
-    std::printf("testPPOWeightsFiniteAfterUpdate...\n"); testPPOWeightsFiniteAfterUpdate();
-    std::printf("testConcurrentLaneStress...\n"); testConcurrentLaneStress();
-    std::printf("testLoadOptimizerAtomic...\n"); testLoadOptimizerAtomic();
-    std::printf("testNaNGradientSkipped...\n"); testNaNGradientSkipped();
-    std::printf("testPPOSurvivesNonFiniteSamples...\n"); testPPOSurvivesNonFiniteSamples();
-    std::printf("testPPONoDeadlock...\n"); testPPONoDeadlock();
-    std::printf("testActorCloningAndEvalFailSafe...\n"); testActorCloningAndEvalFailSafe();
-    std::printf("ALL ALGO TESTS PASSED\n");
-    return 0;
-}
+TEST(AlgoTest, AdvantageNormAndGAE) { testAdvantageNormAndGAE(); }
+TEST(AlgoTest, ValueClipping) { testValueClipping(); }
+TEST(AlgoTest, KLDivergence) { testKLDivergence(); }
+TEST(AlgoTest, ArchiveAnchorPreservation) { testArchiveAnchorPreservation(); }
+TEST(AlgoTest, RunningNormalizer) { testRunningNormalizer(); }
+TEST(AlgoTest, AdamSerialization) { testAdamSerialization(); }
+TEST(AlgoTest, CriticZeroInit) { testCriticZeroInit(); }
+TEST(AlgoTest, ClipFractionSignGating) { testClipFractionSignGating(); }
+TEST(AlgoTest, MaskedSoftmaxNaNProtection) { testMaskedSoftmaxNaNProtection(); }
+TEST(AlgoTest, KLDivergenceNaNProtection) { testKLDivergenceNaNProtection(); }
+TEST(AlgoTest, PPOWeightsFiniteAfterUpdate) { testPPOWeightsFiniteAfterUpdate(); }
+TEST(AlgoTest, ConcurrentLaneStress) { testConcurrentLaneStress(); }
+TEST(AlgoTest, LoadOptimizerAtomic) { testLoadOptimizerAtomic(); }
+TEST(AlgoTest, NaNGradientSkipped) { testNaNGradientSkipped(); }
+TEST(AlgoTest, PPOSurvivesNonFiniteSamples) { testPPOSurvivesNonFiniteSamples(); }
+TEST(AlgoTest, PPONoDeadlock) { testPPONoDeadlock(); }
+TEST(AlgoTest, ActorCloningAndEvalFailSafe) { testActorCloningAndEvalFailSafe(); }

@@ -4,6 +4,8 @@
 #include <random>
 #include <vector>
 
+#include <gtest/gtest.h>
+
 #include "nn/gemm.h"
 
 using namespace nn;
@@ -27,21 +29,16 @@ static float maxDiff(char tA, char tB, int M, int N, int K) {
     return md;
 }
 
-int main() {
+TEST(GemmTest, Parity) {
     gemmInit();
-    std::printf("GPU available: %s\n", gemmHasGpu() ? "yes" : "no");
     if (!gemmHasGpu()) {
-        std::printf("SKIP (no GPU)\n");
-        std::fflush(stdout);
-        return 0;
+        GTEST_SKIP() << "No GPU available, skipping GEMM GPU parity test";
     }
     // large enough to exceed the GPU threshold (>=1e6 MACs)
     float d1 = maxDiff('N', 'N', 256, 256, 4274);
     float d2 = maxDiff('T', 'N', 256, 256, 256);
     float d3 = maxDiff('N', 'T', 256, 256, 4274);
-    std::printf("max diff NN=%.2e TN=%.2e NT=%.2e\n", d1, d2, d3);
-    bool ok = d1 < 1e-2 && d2 < 1e-2 && d3 < 1e-2;
-    std::printf("%s\n", ok ? "GEMM PARITY OK" : "GEMM PARITY FAIL");
-    std::fflush(stdout);
-    return ok ? 0 : 1;
+    EXPECT_LT(d1, 1e-2f);
+    EXPECT_LT(d2, 1e-2f);
+    EXPECT_LT(d3, 1e-2f);
 }

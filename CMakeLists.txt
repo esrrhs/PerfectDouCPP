@@ -80,19 +80,30 @@ add_executable(perfectdou_eval src/eval_douzero.cpp)
 target_link_libraries(perfectdou_eval PRIVATE perfectdou)
 
 enable_testing()
+include(FetchContent)
+FetchContent_Declare(
+  googletest
+  URL https://github.com/google/googletest/archive/refs/tags/v1.15.2.tar.gz
+)
+set(gtest_force_shared_crt ON CACHE BOOL "" FORCE)
+set(INSTALL_GTEST OFF CACHE BOOL "" FORCE)
+set(BUILD_GMOCK OFF CACHE BOOL "" FORCE)
+FetchContent_MakeAvailable(googletest)
+include(GoogleTest)
+
 add_executable(test_rules tests/test_rules.cpp)
-target_link_libraries(test_rules PRIVATE perfectdou)
-add_test(NAME rules COMMAND test_rules)
+target_link_libraries(test_rules PRIVATE perfectdou GTest::gtest_main)
+gtest_discover_tests(test_rules)
 
 add_executable(test_grad tests/test_grad.cpp)
-target_link_libraries(test_grad PRIVATE perfectdou)
-add_test(NAME gradients COMMAND test_grad)
+target_link_libraries(test_grad PRIVATE perfectdou GTest::gtest_main)
+gtest_discover_tests(test_grad)
 
 add_executable(test_gemm tests/test_gemm.cpp)
-target_link_libraries(test_gemm PRIVATE perfectdou)
-add_test(NAME gemm COMMAND test_gemm)
+target_link_libraries(test_gemm PRIVATE perfectdou GTest::gtest_main)
+gtest_discover_tests(test_gemm)
 
 add_executable(test_algo tests/test_algo.cpp)
-target_link_libraries(test_algo PRIVATE perfectdou)
-add_test(NAME algorithms COMMAND test_algo)
+target_link_libraries(test_algo PRIVATE perfectdou GTest::gtest_main)
+gtest_discover_tests(test_algo)
 
