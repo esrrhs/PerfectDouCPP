@@ -161,8 +161,20 @@ int fDP(int a, int b, int c, int d) {
 // The map lives on the heap. A thread_local unordered_map is destroyed from
 // the TLS callback after MinGW's pthread runtime has already freed that
 // storage, which is the 0xC0000374 seen when a rollout worker exits.
+// Direct-mapped fixed size cache: 65536 slots (approx 1MB per thread).
+// Eliminates dynamic allocation, node pointer chasing and hash bucket overhead.
+constexpr size_t kCacheSlots = 65536;
+constexpr size_t kCacheMask = kCacheSlots - 1;
+
+struct CacheEntry {
+    uint64_t key = 0;
+    int8_t val = 0;
+};
+
 struct Memo {
-    std::unordered_map<uint64_t, int> m;
+    std::vector<CacheEntry> table;
+    size_t count = 0;
+    Memo() : table(kCacheSlots) {}
 };
 
 Memo*& memoPtr() {
@@ -170,10 +182,10 @@ Memo*& memoPtr() {
     return p;
 }
 
-std::unordered_map<uint64_t, int>& cache() {
+Memo& getMemo() {
     Memo*& p = memoPtr();
     if (!p) p = new Memo;
-    return p->m;
+    return *p;
 }
 
 void releaseMemo() {
@@ -186,6 +198,48 @@ uint64_t packKey(const std::array<int8_t, kRanks>& cnt) {
     uint64_t k = 0;
     for (int r = 0; r < kRanks; ++r) k |= uint64_t(cnt[r]) << (3 * r);
     return k;
+}
+
+inline size_t hashKey(uint64_t k) {
+    // MurmurHash3 64-bit finalizer
+    k ^= k >> 33;
+    k *= 0xff51afd7ed558ccdULL;
+    k ^= k >> 33;
+    k *= 0xc4ceb9fe1a85ec53ULL;
+    k ^= k >> 33;
+    return static_cast<size_t>(k & kCacheMask);
+}
+
+// Quick check if any potential straight, pair chain or plane chain is possible (ranks 3..A, indices 0..11)
+inline bool hasPotentialChain(const std::array<int8_t, kRanks>& cnt) {
+    int maxConsecutive = 0;
+    int curConsecutive = 0;
+    int maxPairChain = 0;
+    int curPairChain = 0;
+    int maxPlane = 0;
+    int curPlane = 0;
+    for (int r = 0; r < kNormalRanks; ++r) {
+        int c = cnt[r];
+        if (c >= 1) {
+            ++curConsecutive;
+            if (curConsecutive > maxConsecutive) maxConsecutive = curConsecutive;
+        } else {
+            curConsecutive = 0;
+        }
+        if (c >= 2) {
+            ++curPairChain;
+            if (curPairChain > maxPairChain) maxPairChain = curPairChain;
+        } else {
+            curPairChain = 0;
+        }
+        if (c >= 3) {
+            ++curPlane;
+            if (curPlane > maxPlane) maxPlane = curPlane;
+        } else {
+            curPlane = 0;
+        }
+    }
+    return (maxConsecutive >= kMinStraight) || (maxPairChain >= kMinPairChain) || (maxPlane >= kMinPlane);
 }
 
 // lower bound ignoring chains
@@ -218,8 +272,22 @@ void enumWingMultisets(const std::array<int8_t, kRanks>& cnt, int rank, int need
 
 int solve(std::array<int8_t, kRanks> cnt) {
     uint64_t key = packKey(cnt);
-    auto it = cache().find(key);
-    if (it != cache().end()) return it->second;
+    if (key == 0) return 0;
+
+    Memo& memo = getMemo();
+    size_t h = hashKey(key);
+    if (memo.table[h].key == key && memo.table[h].val > 0) {
+        return memo.table[h].val;
+    }
+
+    // Fast-path: if there's no chain possible, non-chain DP lowerBound is exact!
+    if (!hasPotentialChain(cnt)) {
+        int ans = lowerBound(cnt);
+        if (memo.table[h].key == 0) ++memo.count;
+        memo.table[h].key = key;
+        memo.table[h].val = static_cast<int8_t>(ans);
+        return ans;
+    }
 
     int best = 100;
     // Jokers: rocket is one move, otherwise the joker is played as a solo
@@ -311,7 +379,9 @@ int solve(std::array<int8_t, kRanks> cnt) {
         enumerateChains(3, kMinPlane, true);
     }
 
-    cache().emplace(key, best);
+    if (memo.table[h].key == 0) ++memo.count;
+    memo.table[h].key = key;
+    memo.table[h].val = static_cast<int8_t>(best);
     return best;
 }
 
@@ -325,6 +395,9 @@ int minSteps(const CardSet& hand) {
 
 void clearOracleCache() { releaseMemo(); }
 
-size_t oracleCacheSize() { return cache().size(); }
+size_t oracleCacheSize() {
+    Memo* p = memoPtr();
+    return p ? p->count : 0;
+}
 
 }  // namespace ddz
