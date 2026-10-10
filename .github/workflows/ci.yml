@@ -31,7 +31,7 @@ jobs:
         run: cmake --build build --config Release -j
 
       - name: Run Tests
-        run: ctest --test-dir build -C Release --output-on-failure
+        run: ctest --test-dir build -C Release --output-on-failure --timeout 300
 
       - name: E2E Training Smoke Test
         shell: bash
