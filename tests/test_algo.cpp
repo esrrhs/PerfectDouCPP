@@ -635,6 +635,12 @@ static void testMockDouZeroEvalAndDiskSnapshot() {
     std::string csvPath = testDir + "/eval.csv";
     std::string snapDir = testDir + "/snapshots/u5";
 
+    // Pre-create older snapshots to verify maxSnapshots retention pruning
+    std::filesystem::create_directories(testDir + "/snapshots/u1");
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    std::filesystem::create_directories(testDir + "/snapshots/u2");
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+
     DouZeroEvalConfig ecfg;
     ecfg.host = "127.0.0.1";
     ecfg.port = assignedPort;
@@ -644,6 +650,7 @@ static void testMockDouZeroEvalAndDiskSnapshot() {
     ecfg.elapsedMinutes = 1.25;
     ecfg.csvPath = csvPath;
     ecfg.saveDir = snapDir;
+    ecfg.maxSnapshots = 2; // keep at most 2 snapshots (should prune u1, retain u2 & u5)
 
     auto res = evaluateAgainstDouZero(cloned, ecfg);
 
@@ -686,6 +693,11 @@ static void testMockDouZeroEvalAndDiskSnapshot() {
     EXPECT_TRUE(metaContent.find("games 4") != std::string::npos);
     EXPECT_TRUE(metaContent.find("wp ") != std::string::npos);
     metaFile.close();
+
+    // Assert maxSnapshots retention pruned u1 and kept u2 & u5
+    EXPECT_FALSE(std::filesystem::exists(testDir + "/snapshots/u1"));
+    EXPECT_TRUE(std::filesystem::exists(testDir + "/snapshots/u2"));
+    EXPECT_TRUE(std::filesystem::exists(snapDir));
 
     // Clean up
     std::error_code ec;

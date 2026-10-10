@@ -286,6 +286,31 @@ DouZeroEvalResult evaluateAgainstDouZero(const std::array<nn::Actor, 3>& actors,
                          (cfg.label.empty() ? ("u" + std::to_string(cfg.update)) : cfg.label).c_str());
             std::fclose(mf);
         }
+
+        // Protect disk space: prune oldest snapshots if maxSnapshots limit is set
+        if (cfg.maxSnapshots > 0) {
+            try {
+                std::filesystem::path parent = std::filesystem::path(cfg.saveDir).parent_path();
+                if (std::filesystem::exists(parent) && std::filesystem::is_directory(parent)) {
+                    std::vector<std::pair<std::filesystem::file_time_type, std::filesystem::path>> dirs;
+                    for (const auto& entry : std::filesystem::directory_iterator(parent)) {
+                        if (entry.is_directory()) {
+                            dirs.emplace_back(entry.last_write_time(), entry.path());
+                        }
+                    }
+                    if (static_cast<int>(dirs.size()) > cfg.maxSnapshots) {
+                        std::sort(dirs.begin(), dirs.end(), [](const auto& a, const auto& b) {
+                            return a.first < b.first;
+                        });
+                        int toRemove = static_cast<int>(dirs.size()) - cfg.maxSnapshots;
+                        for (int i = 0; i < toRemove; ++i) {
+                            std::filesystem::remove_all(dirs[i].second, ec);
+                        }
+                    }
+                }
+            } catch (...) {
+            }
+        }
     }
 
     SocketSubsystem sockSub;

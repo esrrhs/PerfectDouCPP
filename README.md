@@ -60,9 +60,9 @@ ctest --test-dir build --output-on-failure   # 运行全部 34 项 Google Test �
 # --backend cuda / --backend cpu 可强制切换（已移除会挂驱动的纯 D3D12 gpu 路径）
 ./build/perfectdou_train --updates 1000 --games 256 --threads 10 --out ckpt
 
-# 开启内置定期 DouZero 评测与模型快照落盘
-./build/perfectdou_train --updates 1000 --games 256 --threads 10 --out ckpt \
-    --eval-every 50 --eval-decks 100 --eval-port 19999 --eval-save-dir eval_snapshots
+# 开启内置定期 DouZero 评测与模型快照落盘（推荐间隔 200~500 步）
+./build/perfectdou_train --updates 100000 --games 256 --threads 10 --out ckpt \
+    --eval-every 500 --eval-decks 100 --eval-port 18765 --eval-save-dir eval_snapshots
 
 # 快速/低配机器
 ./build/perfectdou_train --updates 300 --games 128 --threads 8 \
@@ -101,12 +101,14 @@ ctest --test-dir build --output-on-failure   # 运行全部 34 项 Google Test �
 --backend auto|cuda|cpu   GEMM 后端（Windows：cuda = cuBLAS GEMM + D3D12 其余核）
 
 [内置对 DouZero 定期评测参数]
---eval-every N      每 N 轮更新触发一次与 DouZero 的对弈评测（默认 0 不开启）
+--eval-every N      每 N 轮更新触发一次与 DouZero 的对弈评测（默认 0 不开启；推荐 200~500）
+--eval              快捷开启内置评测（默认每 500 轮评测一次）
 --eval-decks D      每次评测副数（默认 100，正反手对换即 200 局）
 --eval-host H       DouZero 服务 IP 地址（默认 127.0.0.1）
---eval-port P       DouZero 服务端口（默认 19999）
+--eval-port P       DouZero 服务端口（默认 18765）
 --eval-csv PATH     评测结果追加写入的 CSV 路径（默认 eval_vs_douzero.csv）
 --eval-save-dir DIR 评测时自动归档模型权重的目录（默认 eval_snapshots，存放 u{step} 快照）
+--eval-max-snapshots N 磁盘上保留的最大快照文件夹数量（默认 0 保存全部；>0 时自动滚动清理最老快照硬防爆盘）
 --eval-sync         使用同步阻塞模式评测（默认异步后台线程评测，不阻塞主训练）
 ```
 
@@ -136,27 +138,29 @@ ctest --test-dir build --output-on-failure   # 运行全部 34 项 Google Test �
 ## 对 DouZero-ADP 周期性评测与胜率趋势图
 
 ### 1. 启动 DouZero 评测服务端
-评测需要先启动官方开源 DouZero 模型的对弈服务（基于 socket 通信）：
+评测需要先启动官方开源 DouZero 模型的对弈服务（基于 TCP 通信，CPU 推理，默认端口 18765）：
 ```bash
 # 准备 third_party/DouZero 与 baselines/douzero_ADP/*.ckpt
 export PYTHONPATH=third_party/DouZero   # Windows: set PYTHONPATH=...
-python tools/douzero_server.py --port 19999 \
-    --landlord baselines/douzero_ADP/landlord.ckpt \
-    --landlord-up baselines/douzero_ADP/landlord_up.ckpt \
-    --landlord-down baselines/douzero_ADP/landlord_down.ckpt
+python tools/douzero_serve.py --port 18765 --ckpt-dir baselines/douzero_ADP
 ```
 
 ### 2. 训练内置评测与模型快照落盘（推荐）
-在训练命令中直接加上 `--eval-every`，训练进程会在达到指定步数时：
+在训练命令中直接加上 `--eval-every`（或快捷开关 `--eval`），训练进程会在达到指定步数时：
 1. **自动克隆与落盘**：对当前 Actor 模型执行线程安全深拷贝，并立即保存权重到 `eval_snapshots/u<step>/actor{0,1,2}.bin` 与初始 `meta.txt`，供随时复盘回溯；
 2. **异步后台对战**：在独立后台线程与 DouZero 服务进行每副牌正反手互换对打（默认 100 副牌共 200 局）；
 3. **记录与回写**：评测结束后自动将最终 WP、ADP、分角色胜率等追加至 `eval_vs_douzero.csv`，并回写快照目录下的 `meta.txt`。
 
 ```bash
-./build/perfectdou_train --updates 2000 --games 256 --threads 10 \
-    --eval-every 50 --eval-decks 100 --eval-port 19999 \
+./build/perfectdou_train --updates 100000 --games 256 --threads 10 \
+    --eval-every 500 --eval-decks 100 --eval-port 18765 \
     --eval-save-dir eval_snapshots --eval-csv eval_vs_douzero.csv
 ```
+
+> **大规模训练（如论文 25 亿帧）磁盘容量与间隔建议**：
+> - 25 亿帧折合约 160,000 次 Update（按每次 256 局算）。单次快照（3 个 Actor）约 **12.8 MB**；
+> - 推荐设置 `--eval-every 500`（或 200~500）：整个训练周期产生约 320 个高解析度数据点，磁盘总快照仅占用 **~4 GB**，后台对弈每 15~30 分钟打一次（耗时 ~20 秒），对主训练吞吐 **0 影响**；
+> - 若磁盘空间紧张，可加 `--eval-max-snapshots 100`（仅保留最新 100 份快照，硬防爆盘）。
 
 ### 3. 渲染胜率/ADP 趋势曲线
 使用 `tools/plot_eval.py` 读取评测 CSV，自动绘制地主/农民双阵营与整体胜率及 ADP 趋势曲线（含平滑拟合线）：

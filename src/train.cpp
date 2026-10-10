@@ -74,13 +74,14 @@ struct Args {
     std::string out = "ckpt";
     std::string resume;
     std::string backend = "auto";  // auto | cuda | cpu
-    int evalEvery = 0;             // 0 = disabled, > 0 = eval vs DouZero every N updates
-    int evalDecks = 50;            // number of decks per eval
+    int evalEvery = 0;             // 0 = disabled, > 0 = eval vs DouZero every N updates (recommended: 200~500)
+    int evalDecks = 100;           // number of decks per eval (100 decks = 200 games)
     int evalPort = 18765;          // DouZero TCP server port
     std::string evalHost = "127.0.0.1";
     std::string evalCsv;           // empty = default to <out>/eval_vs_douzero.csv
     std::string evalSaveDir;       // empty = default to <out>/eval_snapshots
     bool evalSave = true;          // whether to save evaluated models to disk
+    int evalMaxSnapshots = 0;      // 0 = keep all, > 0 = keep at most N recent snapshots on disk
     bool evalAsync = true;         // evaluate in background thread
 };
 
@@ -131,11 +132,15 @@ void parseArgs(int argc, char** argv, Args& a) {
     const char* res = argValue(argc, argv, "--resume", "");
     if (*res) a.resume = res;
     a.evalEvery = std::atoi(argValue(argc, argv, "--eval-every", "0"));
-    a.evalDecks = std::atoi(argValue(argc, argv, "--eval-decks", "50"));
+    if (a.evalEvery == 0 && hasFlag(argc, argv, "--eval")) {
+        a.evalEvery = 500;
+    }
+    a.evalDecks = std::atoi(argValue(argc, argv, "--eval-decks", "100"));
     a.evalPort = std::atoi(argValue(argc, argv, "--eval-port", "18765"));
     a.evalHost = argValue(argc, argv, "--eval-host", "127.0.0.1");
     a.evalCsv = argValue(argc, argv, "--eval-csv", "");
     a.evalSaveDir = argValue(argc, argv, "--eval-save-dir", "");
+    a.evalMaxSnapshots = std::atoi(argValue(argc, argv, "--eval-max-snapshots", "0"));
     if (hasFlag(argc, argv, "--no-eval-save")) {
         a.evalSave = false;
     }
@@ -250,6 +255,9 @@ int main(int argc, char** argv) {
                   << " csv=" << args.evalCsv;
         if (args.evalSave) {
             std::cout << " snapshots=" << args.evalSaveDir;
+            if (args.evalMaxSnapshots > 0) {
+                std::cout << " (keep max " << args.evalMaxSnapshots << ")";
+            }
         }
         std::cout << std::endl;
     }
@@ -828,6 +836,7 @@ int main(int argc, char** argv) {
             evalCfg.csvPath = args.evalCsv;
             evalCfg.label = "u" + std::to_string(upd);
             evalCfg.saveDir = args.evalSave ? (args.evalSaveDir + "/" + evalCfg.label) : "";
+            evalCfg.maxSnapshots = args.evalMaxSnapshots;
             evalCfg.update = upd;
             evalCfg.elapsedMinutes = wallSecs / 60.0;
             evalCfg.verbose = false;
