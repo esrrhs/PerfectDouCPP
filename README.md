@@ -35,13 +35,22 @@ pthread），包含超高速牌局引擎、特征工程、神经网络反向传�
 本实现对可验证部分同时对照论文和官方 ONNX；PPO epoch/clip/max-grad-norm 等论文
 未披露的值采用常见 PPO2 默认值。
 
-## 构建
+## 构建与测试
+
+项目使用 CMake 构建，内置 Google Test 单元测试套件（34 项高覆盖度测试），跨平台支持 Linux (GCC/Clang)、macOS (Apple Clang/Accelerate) 与 Windows (MSVC/CUDA)。
 
 ```bash
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j
-ctest --test-dir build          # 规则测试 + 神经网络数值梯度检查
+ctest --test-dir build --output-on-failure   # 运行全部 34 项 Google Test 单元测试
 ```
+
+测试套件涵盖：
+- **`RulesTest`**：出牌规则合法性、15 种牌型解析生成、621 维抽象动作空间、最小步数 Oracle 记忆化、随机自对弈状态机及特征编码；
+- **`GradTest`**：反向传播数值与解析梯度校验（包含多层 MLP 与 LSTM 96 项核验）；
+- **`AlgoTest`**：GAE/优势值归一化、PPO 策略/价值裁剪、自适应 KL 早停、Adam 动量原子序列化；
+- **健壮性与防爆测试**：Masked Softmax 防 NaN 熔断防护、KL 散度防除零与无穷、训练样本非法值过滤跳过、PPO 并发多车道无死锁压力测试；
+- **评测系统单测**：Actor 线程安全深拷贝、Mock DouZero 评测通信、CSV 写入与磁盘快照回溯验证。
 
 ## 训练
 
@@ -50,6 +59,10 @@ ctest --test-dir build          # 规则测试 + 神经网络数值梯度检查
 # Windows：--backend auto 优先 CUDA（cuBLAS GEMM + D3D12 其余核），否则 CPU。
 # --backend cuda / --backend cpu 可强制切换（已移除会挂驱动的纯 D3D12 gpu 路径）
 ./build/perfectdou_train --updates 1000 --games 256 --threads 10 --out ckpt
+
+# 开启内置定期 DouZero 评测与模型快照落盘
+./build/perfectdou_train --updates 1000 --games 256 --threads 10 --out ckpt \
+    --eval-every 50 --eval-decks 100 --eval-port 19999 --eval-save-dir eval_snapshots
 
 # 快速/低配机器
 ./build/perfectdou_train --updates 300 --games 128 --threads 8 \
@@ -86,6 +99,15 @@ ctest --test-dir build          # 规则测试 + 神经网络数值梯度检查
 --start-update U    指定起始更新轮数（默认 1，若从带有 meta.txt 的断点 resume 则自动续接）
 --resume DIR        从 actor/critic 权重与 Adam 动量继续（支持自动续接进度与学习率）
 --backend auto|cuda|cpu   GEMM 后端（Windows：cuda = cuBLAS GEMM + D3D12 其余核）
+
+[内置对 DouZero 定期评测参数]
+--eval-every N      每 N 轮更新触发一次与 DouZero 的对弈评测（默认 0 不开启）
+--eval-decks D      每次评测副数（默认 100，正反手对换即 200 局）
+--eval-host H       DouZero 服务 IP 地址（默认 127.0.0.1）
+--eval-port P       DouZero 服务端口（默认 19999）
+--eval-csv PATH     评测结果追加写入的 CSV 路径（默认 eval_vs_douzero.csv）
+--eval-save-dir DIR 评测时自动归档模型权重的目录（默认 eval_snapshots，存放 u{step} 快照）
+--eval-sync         使用同步阻塞模式评测（默认异步后台线程评测，不阻塞主训练）
 ```
 
 后端说明：
@@ -111,38 +133,60 @@ ctest --test-dir build          # 规则测试 + 神经网络数值梯度检查
 - **稳定指标**：ep（三座位实际完成的 Epoch 数，显示早停状态）、kl（末轮近似 KL 散度）、cf（PPO Clip 触发比例）；
 - **收益规模**：ret（三座位平均累积回报）、n（三座位样本数量）。
 
-## 对 DouZero-ADP 周期性评测
+## 对 DouZero-ADP 周期性评测与胜率趋势图
 
-训练写盘的同时，可用 `tools/eval_vs_douzero_loop.py` 每隔一段时间复制模型、在
-CPU 上与公开 DouZero-ADP 对打（每副牌打两次并互换角色），把 WP/ADP 追加到 CSV
-并刷新带拟合线的曲线图。依赖：本仓库的 `perfectdou_eval`、DouZero 源码、
-`baselines/douzero_ADP/*.ckpt`、Python 包 `torch`/`numpy`/`matplotlib`。用法见
-脚本顶部 docstring。
+### 1. 启动 DouZero 评测服务端
+评测需要先启动官方开源 DouZero 模型的对弈服务（基于 socket 通信）：
+```bash
+# 准备 third_party/DouZero 与 baselines/douzero_ADP/*.ckpt
+export PYTHONPATH=third_party/DouZero   # Windows: set PYTHONPATH=...
+python tools/douzero_server.py --port 19999 \
+    --landlord baselines/douzero_ADP/landlord.ckpt \
+    --landlord-up baselines/douzero_ADP/landlord_up.ckpt \
+    --landlord-down baselines/douzero_ADP/landlord_down.ckpt
+```
+
+### 2. 训练内置评测与模型快照落盘（推荐）
+在训练命令中直接加上 `--eval-every`，训练进程会在达到指定步数时：
+1. **自动克隆与落盘**：对当前 Actor 模型执行线程安全深拷贝，并立即保存权重到 `eval_snapshots/u<step>/actor{0,1,2}.bin` 与初始 `meta.txt`，供随时复盘回溯；
+2. **异步后台对战**：在独立后台线程与 DouZero 服务进行每副牌正反手互换对打（默认 100 副牌共 200 局）；
+3. **记录与回写**：评测结束后自动将最终 WP、ADP、分角色胜率等追加至 `eval_vs_douzero.csv`，并回写快照目录下的 `meta.txt`。
 
 ```bash
-# 需先准备 third_party/DouZero 与 baselines/douzero_ADP/{landlord,landlord_up,landlord_down}.ckpt
-export PYTHONPATH=third_party/DouZero   # Windows: set PYTHONPATH=...
-python tools/eval_vs_douzero_loop.py \
-    --train-dir ckpt_long --out-dir eval_runs \
-    --interval-sec 600 --decks 100
+./build/perfectdou_train --updates 2000 --games 256 --threads 10 \
+    --eval-every 50 --eval-decks 100 --eval-port 19999 \
+    --eval-save-dir eval_snapshots --eval-csv eval_vs_douzero.csv
 ```
+
+### 3. 渲染胜率/ADP 趋势曲线
+使用 `tools/plot_eval.py` 读取评测 CSV，自动绘制地主/农民双阵营与整体胜率及 ADP 趋势曲线（含平滑拟合线）：
+```bash
+# 生成静态趋势图
+python tools/plot_eval.py --csv eval_vs_douzero.csv --out eval_curve.png
+
+# 实时监视模式（每 30 秒自动刷新图片）
+python tools/plot_eval.py --csv eval_vs_douzero.csv --out eval_curve.png --watch 30
+```
+
+> 提示：若不希望内嵌在训练中，仍可使用外部独立轮询脚本 `tools/eval_vs_douzero_loop.py` 或独立对弈程序 `build/perfectdou_eval`。
 
 ## 目录结构
 
 ```
 src/ddz/      牌、牌型识别/生成、621 动作空间、oracle、对局、特征
 src/nn/       矩阵运算、Linear/ReLU/LSTM、演员/评论家、Adam、模型存取
-src/algo/     批量自对弈 rollout、GAE、PPO 更新
-src/          训练入口 train.cpp；Windows 另有 eval_douzero.cpp
-tools/        DouZero TCP 服务与周期性评测脚本
-tests/        规则单测（随机自对弈校验）与数值梯度检查
+src/algo/     批量自对弈 rollout、GAE、PPO 更新、DouZero 对弈评测与快照
+src/          训练入口 train.cpp、独立评测入口 eval_douzero.cpp
+tools/        DouZero 服务端、评测曲线绘制工具 plot_eval.py、外部评测轮询脚本
+tests/        Google Test 单元测试（规则/自对弈/反向传播数值与解析梯度/PPO 算法与稳定性/防爆熔断）
 ```
 
 ## 实现说明
 
 - 所有网络为手写反向传播；`tests/test_grad` 对包括 LSTM 在内的演员/评论家
-  做数值梯度校验（96 项）。
+  做数值与解析梯度校验（96 项）。
 - 手牌/历史等 0/1 特征以 uint8 紧凑存储；前向使用转置权重 + 向量化 GEMM。
 - oracle 结果在 rollout 工作线程内记忆化，DP 表一次性预计算，线程安全。
 - DouZero 生成器会产生少量其检测器判为 WRONG 的退化组合（不符合腾讯规则），
   映射抽象动作时直接剔除。
+- 完整包含跨平台 Google Test 单元测试，在 GitHub Actions CI（Linux / macOS / Windows）实现自动化回归守护。
