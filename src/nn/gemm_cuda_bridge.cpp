@@ -115,8 +115,11 @@ constexpr int kLanes = 8;
 struct Lane {
     CUstream stream = nullptr;
     cublasHandle_t blas = nullptr;
-    uint64_t submitted = 0;
-    uint64_t completed = 0;
+    std::atomic<uint64_t> submitted{0};
+    std::atomic<uint64_t> completed{0};
+    Lane() = default;
+    Lane(const Lane&) = delete;
+    Lane& operator=(const Lane&) = delete;
 };
 Lane g_lanes[kLanes];
 std::mutex g_laneMus[kLanes];
@@ -244,9 +247,11 @@ bool enter() {
 void dropAll() {
     if (g_ctx) g_api.cuCtxSetCurrent(g_ctx);
     for (Lane& ln : g_lanes) {
-        if (ln.submitted > ln.completed && ln.stream) g_api.cuStreamSynchronize(ln.stream);
-        ln.submitted = 0;
-        ln.completed = 0;
+        if (ln.submitted.load(std::memory_order_acquire) > ln.completed.load(std::memory_order_acquire) && ln.stream) {
+            g_api.cuStreamSynchronize(ln.stream);
+        }
+        ln.submitted.store(0, std::memory_order_release);
+        ln.completed.store(0, std::memory_order_release);
     }
     for (auto& kv : g_maps) {
         if (kv.second.ptr && g_api.cuMemFree) g_api.cuMemFree(kv.second.ptr);
@@ -766,7 +771,7 @@ bool cudaBridgeGemm(ID3D12Device* device,
         std::snprintf(g_err, sizeof(g_err), "cublasSgemm failed (%d)", (int)bs);
         return false;
     }
-    ++ln.submitted;
+    ln.submitted.fetch_add(1, std::memory_order_release);
     return true;
 }
 
@@ -855,7 +860,7 @@ bool cudaBridgeKernel(ID3D12Device* device, const char* name,
         setCu(st, name);
         return false;
     }
-    ++ln.submitted;
+    ln.submitted.fetch_add(1, std::memory_order_release);
     return true;
 }
 
@@ -872,9 +877,9 @@ bool syncLane(int idx) {
     {
         std::lock_guard<std::mutex> lock(g_mu);
         if (!ensureInit()) return false;
-        if (g_lanes[idx].submitted <= g_lanes[idx].completed) return true;
+        target = g_lanes[idx].submitted.load(std::memory_order_acquire);
+        if (target <= g_lanes[idx].completed.load(std::memory_order_acquire)) return true;
         s = g_lanes[idx].stream;
-        target = g_lanes[idx].submitted;
     }
     CUresult st = g_api.cuStreamSynchronize(s);
     std::lock_guard<std::mutex> lock(g_mu);
@@ -882,16 +887,17 @@ bool syncLane(int idx) {
         setCu(st, "cuStreamSynchronize");
         return false;
     }
-    if (target > g_lanes[idx].completed) {
-        g_lanes[idx].completed = target;
+    uint64_t cur = g_lanes[idx].completed.load(std::memory_order_relaxed);
+    if (target > cur) {
+        g_lanes[idx].completed.store(target, std::memory_order_release);
     }
     return true;
 }
 
 bool cudaBridgeHasWork() {
-    std::lock_guard<std::mutex> lock(g_mu);
     int idx = t_lane < 0 ? 0 : t_lane;
-    return g_lanes[idx].submitted > g_lanes[idx].completed;
+    return g_lanes[idx].submitted.load(std::memory_order_acquire) >
+           g_lanes[idx].completed.load(std::memory_order_acquire);
 }
 
 bool cudaBridgeSync() {
