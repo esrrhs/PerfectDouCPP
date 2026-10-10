@@ -895,7 +895,7 @@ bool syncLane(int idx) {
 }
 
 bool cudaBridgeHasWork() {
-    int idx = t_lane < 0 ? 0 : t_lane;
+    int idx = t_lane < 0 ? laneIndex() : t_lane;
     return g_lanes[idx].submitted.load(std::memory_order_acquire) >
            g_lanes[idx].completed.load(std::memory_order_acquire);
 }

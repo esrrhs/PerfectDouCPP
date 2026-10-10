@@ -721,16 +721,16 @@ void saveOptimizer(const char* path, const std::vector<Param*>& ps, const Adam& 
 bool loadOptimizer(const char* path, const std::vector<Param*>& ps, Adam& opt) {
     FILE* f = std::fopen(path, "rb");
     if (!f) return false;
+    // Parse into temporaries so a truncated or mismatched file leaves the
+    // optimizer and the parameters' moments untouched.
     char magic[4] = {0};
-    if (std::fread(magic, 1, 4, f) != 4 || std::memcmp(magic, "PDOP", 4) != 0) {
-        std::fclose(f);
-        return false;
-    }
-    if (std::fread(&opt.t, sizeof(opt.t), 1, f) != 1 ||
-        std::fread(&opt.lr, sizeof(opt.lr), 1, f) != 1 ||
-        std::fread(&opt.beta1, sizeof(opt.beta1), 1, f) != 1 ||
-        std::fread(&opt.beta2, sizeof(opt.beta2), 1, f) != 1 ||
-        std::fread(&opt.eps, sizeof(opt.eps), 1, f) != 1) {
+    Adam tmp = opt;
+    if (std::fread(magic, 1, 4, f) != 4 || std::memcmp(magic, "PDOP", 4) != 0 ||
+        std::fread(&tmp.t, sizeof(tmp.t), 1, f) != 1 ||
+        std::fread(&tmp.lr, sizeof(tmp.lr), 1, f) != 1 ||
+        std::fread(&tmp.beta1, sizeof(tmp.beta1), 1, f) != 1 ||
+        std::fread(&tmp.beta2, sizeof(tmp.beta2), 1, f) != 1 ||
+        std::fread(&tmp.eps, sizeof(tmp.eps), 1, f) != 1) {
         std::fclose(f);
         return false;
     }
@@ -739,23 +739,31 @@ bool loadOptimizer(const char* path, const std::vector<Param*>& ps, Adam& opt) {
         std::fclose(f);
         return false;
     }
-    for (Param* p : ps) {
+    std::vector<std::vector<float>> ms(ps.size()), vs(ps.size());
+    for (size_t k = 0; k < ps.size(); ++k) {
         int sz = 0;
-        if (std::fread(&sz, sizeof(sz), 1, f) != 1 || sz != p->size()) {
+        if (std::fread(&sz, sizeof(sz), 1, f) != 1 || sz != ps[k]->size()) {
             std::fclose(f);
             return false;
         }
         if (sz > 0) {
-            p->m.resize(sz, 0.0f);
-            p->v.resize(sz, 0.0f);
-            if (std::fread(p->m.data(), sizeof(float), sz, f) != size_t(sz) ||
-                std::fread(p->v.data(), sizeof(float), sz, f) != size_t(sz)) {
+            ms[k].resize(sz);
+            vs[k].resize(sz);
+            if (std::fread(ms[k].data(), sizeof(float), sz, f) != size_t(sz) ||
+                std::fread(vs[k].data(), sizeof(float), sz, f) != size_t(sz)) {
                 std::fclose(f);
                 return false;
             }
         }
     }
     std::fclose(f);
+    for (size_t k = 0; k < ps.size(); ++k) {
+        if (ps[k]->size() > 0) {
+            ps[k]->m = std::move(ms[k]);
+            ps[k]->v = std::move(vs[k]);
+        }
+    }
+    opt = tmp;
     return true;
 }
 
