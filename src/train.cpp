@@ -44,15 +44,15 @@
 namespace {
 
 struct Args {
-    int updates = 200;
+    int updates = 100000;
     int startUpdate = 1;
-    int games = 256;
+    int games = 512;
     int threads = int(std::thread::hardware_concurrency());
-    int hidden = 256;
-    int lstmHidden = 128;
-    int epochs = 4;
-    int minibatch = 1024;
-    int snapshotEvery = 20;
+    int hidden = 1024;
+    int lstmHidden = 256;
+    int epochs = 2;
+    int minibatch = 2048;
+    int snapshotEvery = 50;
     int buffer = 2;
     float lr = 3e-4f;
     float clip = 0.2f;
@@ -75,11 +75,11 @@ struct Args {
     float histProb = 0.2f;
     float ruleProb = 0.1f;
     uint64_t seed = 1;
-    std::string out = "ckpt";
+    std::string out = "ckpt_long";
     std::string resume;
-    std::string backend = "auto";  // auto | cuda | cpu
-    int evalEvery = 0;             // 0 = disabled, > 0 = eval vs DouZero every N updates (recommended: 200~500)
-    int evalDecks = 100;           // number of decks per eval (100 decks = 200 games)
+    std::string backend = "cuda";  // auto | cuda | cpu
+    int evalEvery = 200;           // eval vs DouZero every 200 updates
+    int evalDecks = 1000;          // 1000 decks = 2000 games (swapped seats)
     int evalPort = 18765;          // DouZero TCP server port
     std::string evalHost = "127.0.0.1";
     std::string evalCsv;           // empty = default to <out>/eval_vs_douzero.csv
@@ -102,17 +102,17 @@ bool hasFlag(int argc, char** argv, const char* key) {
 }
 
 void parseArgs(int argc, char** argv, Args& a) {
-    a.updates = std::atoi(argValue(argc, argv, "--updates", "200"));
+    a.updates = std::atoi(argValue(argc, argv, "--updates", std::to_string(a.updates).c_str()));
     a.startUpdate = std::atoi(argValue(argc, argv, "--start-update", "1"));
-    a.games = std::atoi(argValue(argc, argv, "--games", "256"));
+    a.games = std::atoi(argValue(argc, argv, "--games", std::to_string(a.games).c_str()));
     a.threads = std::atoi(argValue(argc, argv, "--threads",
                                   std::to_string(a.threads).c_str()));
-    a.hidden = std::atoi(argValue(argc, argv, "--hidden", "1024"));
-    a.lstmHidden = std::atoi(argValue(argc, argv, "--lstm-hidden", "256"));
-    a.epochs = std::atoi(argValue(argc, argv, "--epochs", "4"));
-    a.minibatch = std::atoi(argValue(argc, argv, "--mb", "1024"));
-    a.snapshotEvery = std::atoi(argValue(argc, argv, "--snapshot-every", "20"));
-    a.buffer = std::atoi(argValue(argc, argv, "--buffer", "2"));
+    a.hidden = std::atoi(argValue(argc, argv, "--hidden", std::to_string(a.hidden).c_str()));
+    a.lstmHidden = std::atoi(argValue(argc, argv, "--lstm-hidden", std::to_string(a.lstmHidden).c_str()));
+    a.epochs = std::atoi(argValue(argc, argv, "--epochs", std::to_string(a.epochs).c_str()));
+    a.minibatch = std::atoi(argValue(argc, argv, "--mb", std::to_string(a.minibatch).c_str()));
+    a.snapshotEvery = std::atoi(argValue(argc, argv, "--snapshot-every", std::to_string(a.snapshotEvery).c_str()));
+    a.buffer = std::atoi(argValue(argc, argv, "--buffer", std::to_string(a.buffer).c_str()));
     a.lr = float(std::atof(argValue(argc, argv, "--lr", "3e-4")));
     a.clip = float(std::atof(argValue(argc, argv, "--clip", "0.2")));
     a.ent = float(std::atof(argValue(argc, argv, "--ent", "0.03")));
@@ -126,7 +126,7 @@ void parseArgs(int argc, char** argv, Args& a) {
     if (hasFlag(argc, argv, "--no-independent-peasants") || hasFlag(argc, argv, "--coupled-peasants")) {
         a.independentPeasants = false;
     }
-    a.campMode = argValue(argc, argv, "--camp-mode", "alt");
+    a.campMode = argValue(argc, argv, "--camp-mode", a.campMode.c_str());
     if (hasFlag(argc, argv, "--clip-vf")) a.clipVf = true;
     if (hasFlag(argc, argv, "--no-clip-vf")) a.clipVf = false;
     if (hasFlag(argc, argv, "--no-lr-decay")) a.lrDecay = false;
@@ -137,15 +137,15 @@ void parseArgs(int argc, char** argv, Args& a) {
     a.histProb = float(std::atof(argValue(argc, argv, "--historical-prob", "0.2")));
     a.ruleProb = float(std::atof(argValue(argc, argv, "--rule-prob", "0.1")));
     a.seed = std::atoll(argValue(argc, argv, "--seed", "1"));
-    a.out = argValue(argc, argv, "--out", "ckpt");
-    a.backend = argValue(argc, argv, "--backend", "auto");
+    a.out = argValue(argc, argv, "--out", a.out.c_str());
+    a.backend = argValue(argc, argv, "--backend", a.backend.c_str());
     const char* res = argValue(argc, argv, "--resume", "");
     if (*res) a.resume = res;
-    a.evalEvery = std::atoi(argValue(argc, argv, "--eval-every", "0"));
-    if (a.evalEvery == 0 && hasFlag(argc, argv, "--eval")) {
-        a.evalEvery = 500;
+    a.evalEvery = std::atoi(argValue(argc, argv, "--eval-every", std::to_string(a.evalEvery).c_str()));
+    if (hasFlag(argc, argv, "--no-eval")) {
+        a.evalEvery = 0;
     }
-    a.evalDecks = std::atoi(argValue(argc, argv, "--eval-decks", "100"));
+    a.evalDecks = std::atoi(argValue(argc, argv, "--eval-decks", std::to_string(a.evalDecks).c_str()));
     a.evalPort = std::atoi(argValue(argc, argv, "--eval-port", "18765"));
     a.evalHost = argValue(argc, argv, "--eval-host", "127.0.0.1");
     a.evalCsv = argValue(argc, argv, "--eval-csv", "");
