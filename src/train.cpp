@@ -327,6 +327,10 @@ int main(int argc, char** argv) {
         }
     };
 
+    // Ensure output directory exists from update 0
+    std::filesystem::create_directories(args.out);
+    saveAll(args.out, 0);
+
     // warm up the shared (read-only) oracle DP table before spawning workers
     ddz::minSteps(ddz::CardSet::parse("34567"));
 
