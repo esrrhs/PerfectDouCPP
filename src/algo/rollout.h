@@ -82,6 +82,8 @@ struct RolloutConfig {
     // Asymmetric reward shaping for landlord (Plan A: encourage active aggression and reduce conservative bias)
     float landlordWinMul = 2.5f;   // default 2.5x base mult when landlord wins (up from 2.0x)
     float landlordLossMul = 1.5f;  // default 1.5x base mult when landlord loses (down from 2.0x)
+    // Sample peasant players independently (Seat 1 and Seat 2 can have different models/rules)
+    bool independentPeasants = true;
 };
 
 // Runs self-play / league games using the current models, historical pool, and rule agent.

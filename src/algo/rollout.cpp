@@ -202,46 +202,59 @@ void runWorker(const ModelSet& models, const RolloutConfig& cfg, int nGames,
             }
         };
 
-        // 1. Landlord camp (Seat 0): independently sampled
-        float rLandlord = float((dealRng.nextU64() >> 11) / double(1ULL << 53));
-        if (rLandlord < cfg.ruleProb) {
-            gameSeats[gi][0].type = PLAYER_RULE;
-        } else if (hasHistPool && rLandlord < (cfg.ruleProb + cfg.historicalProb)) {
-            gameSeats[gi][0].type = PLAYER_HISTORICAL;
-            gameSeats[gi][0].histRef = sampleHistRef();
-        } else {
-            gameSeats[gi][0].type = PLAYER_LATEST;
-        }
-
-        // 2. Peasant camp (Seat 1 & 2): sampled as a unified cooperative team
-        float rPeasant = float((dealRng.nextU64() >> 11) / double(1ULL << 53));
-        PlayerType peasantType = PLAYER_LATEST;
-        HistModelRef peasantHistRef;
-        if (rPeasant < cfg.ruleProb) {
-            peasantType = PLAYER_RULE;
-        } else if (hasHistPool && rPeasant < (cfg.ruleProb + cfg.historicalProb)) {
-            peasantType = PLAYER_HISTORICAL;
-            peasantHistRef = sampleHistRef();
-        } else {
-            peasantType = PLAYER_LATEST;
-        }
-        gameSeats[gi][1].type = peasantType;
-        gameSeats[gi][1].histRef = peasantHistRef;
-        gameSeats[gi][2].type = peasantType;
-        gameSeats[gi][2].histRef = peasantHistRef;
-
-        // Ensure at least one camp per game is PLAYER_LATEST so games always produce training data.
-        // If neither camp picked LATEST, flip an entire camp (50% Landlord, 50% Peasant team)
-        // so peasant team coordination is strictly preserved.
-        if (gameSeats[gi][0].type != PLAYER_LATEST && peasantType != PLAYER_LATEST) {
-            if ((dealRng.nextU64() & 1) == 0) {
-                gameSeats[gi][0].type = PLAYER_LATEST;
-                gameSeats[gi][0].histRef = HistModelRef{};
+        auto sampleSeatPlayer = [&]() -> std::pair<PlayerType, HistModelRef> {
+            float r = float((dealRng.nextU64() >> 11) / double(1ULL << 53));
+            if (r < cfg.ruleProb) {
+                return {PLAYER_RULE, HistModelRef{}};
+            } else if (hasHistPool && r < (cfg.ruleProb + cfg.historicalProb)) {
+                return {PLAYER_HISTORICAL, sampleHistRef()};
             } else {
-                gameSeats[gi][1].type = PLAYER_LATEST;
-                gameSeats[gi][1].histRef = HistModelRef{};
-                gameSeats[gi][2].type = PLAYER_LATEST;
-                gameSeats[gi][2].histRef = HistModelRef{};
+                return {PLAYER_LATEST, HistModelRef{}};
+            }
+        };
+
+        // 1. Landlord camp (Seat 0): independently sampled
+        auto [landlordType, landlordHistRef] = sampleSeatPlayer();
+        gameSeats[gi][0].type = landlordType;
+        gameSeats[gi][0].histRef = landlordHistRef;
+
+        // 2. Peasant camp (Seat 1 & 2): independently sampled or unified
+        if (cfg.independentPeasants) {
+            auto [p1Type, p1HistRef] = sampleSeatPlayer();
+            gameSeats[gi][1].type = p1Type;
+            gameSeats[gi][1].histRef = p1HistRef;
+
+            auto [p2Type, p2HistRef] = sampleSeatPlayer();
+            gameSeats[gi][2].type = p2Type;
+            gameSeats[gi][2].histRef = p2HistRef;
+        } else {
+            auto [pType, pHistRef] = sampleSeatPlayer();
+            gameSeats[gi][1].type = pType;
+            gameSeats[gi][1].histRef = pHistRef;
+            gameSeats[gi][2].type = pType;
+            gameSeats[gi][2].histRef = pHistRef;
+        }
+
+        // Ensure at least one seat per game is PLAYER_LATEST so games always produce training data.
+        if (gameSeats[gi][0].type != PLAYER_LATEST &&
+            gameSeats[gi][1].type != PLAYER_LATEST &&
+            gameSeats[gi][2].type != PLAYER_LATEST) {
+            if (cfg.independentPeasants) {
+                // Pick one seat at random (0, 1, or 2) and set to PLAYER_LATEST
+                int pickSeat = int(dealRng.nextU64() % 3);
+                gameSeats[gi][pickSeat].type = PLAYER_LATEST;
+                gameSeats[gi][pickSeat].histRef = HistModelRef{};
+            } else {
+                // Either flip landlord or entire peasant team
+                if ((dealRng.nextU64() & 1) == 0) {
+                    gameSeats[gi][0].type = PLAYER_LATEST;
+                    gameSeats[gi][0].histRef = HistModelRef{};
+                } else {
+                    gameSeats[gi][1].type = PLAYER_LATEST;
+                    gameSeats[gi][1].histRef = HistModelRef{};
+                    gameSeats[gi][2].type = PLAYER_LATEST;
+                    gameSeats[gi][2].histRef = HistModelRef{};
+                }
             }
         }
     }
