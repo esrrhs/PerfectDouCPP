@@ -213,39 +213,83 @@ void runWorker(const ModelSet& models, const RolloutConfig& cfg, int nGames,
             }
         };
 
-        // 1. Landlord camp (Seat 0): independently sampled
-        auto [landlordType, landlordHistRef] = sampleSeatPlayer();
-        gameSeats[gi][0].type = landlordType;
-        gameSeats[gi][0].histRef = landlordHistRef;
-
-        // 2. Peasant camp (Seat 1 & 2): independently sampled or unified
-        if (cfg.independentPeasants) {
-            auto [p1Type, p1HistRef] = sampleSeatPlayer();
-            gameSeats[gi][1].type = p1Type;
-            gameSeats[gi][1].histRef = p1HistRef;
-
-            auto [p2Type, p2HistRef] = sampleSeatPlayer();
-            gameSeats[gi][2].type = p2Type;
-            gameSeats[gi][2].histRef = p2HistRef;
+        // 1. Landlord camp (Seat 0)
+        if (cfg.trainCamp == 0) {
+            // Landlord focus: Landlord is strictly PLAYER_LATEST
+            gameSeats[gi][0].type = PLAYER_LATEST;
+            gameSeats[gi][0].histRef = HistModelRef{};
+        } else if (cfg.trainCamp == 1) {
+            // Peasant focus: Landlord is an opponent (can be LATEST, HISTORICAL, or RULE)
+            auto [lType, lHistRef] = sampleSeatPlayer();
+            gameSeats[gi][0].type = lType;
+            gameSeats[gi][0].histRef = lHistRef;
         } else {
-            auto [pType, pHistRef] = sampleSeatPlayer();
-            gameSeats[gi][1].type = pType;
-            gameSeats[gi][1].histRef = pHistRef;
-            gameSeats[gi][2].type = pType;
-            gameSeats[gi][2].histRef = pHistRef;
+            auto [lType, lHistRef] = sampleSeatPlayer();
+            gameSeats[gi][0].type = lType;
+            gameSeats[gi][0].histRef = lHistRef;
+        }
+
+        // 2. Peasant camp (Seat 1 & 2)
+        if (cfg.trainCamp == 1) {
+            // Peasant focus: both peasants are strictly PLAYER_LATEST
+            gameSeats[gi][1].type = PLAYER_LATEST;
+            gameSeats[gi][1].histRef = HistModelRef{};
+            gameSeats[gi][2].type = PLAYER_LATEST;
+            gameSeats[gi][2].histRef = HistModelRef{};
+        } else if (cfg.trainCamp == 0) {
+            // Landlord focus: peasants are opponents sampled independently or unified
+            // (can be LATEST, HISTORICAL, or RULE)
+            if (cfg.independentPeasants) {
+                auto [p1Type, p1HistRef] = sampleSeatPlayer();
+                gameSeats[gi][1].type = p1Type;
+                gameSeats[gi][1].histRef = p1HistRef;
+
+                auto [p2Type, p2HistRef] = sampleSeatPlayer();
+                gameSeats[gi][2].type = p2Type;
+                gameSeats[gi][2].histRef = p2HistRef;
+            } else {
+                auto [pType, pHistRef] = sampleSeatPlayer();
+                gameSeats[gi][1].type = pType;
+                gameSeats[gi][1].histRef = pHistRef;
+                gameSeats[gi][2].type = pType;
+                gameSeats[gi][2].histRef = pHistRef;
+            }
+        } else {
+            // Standard mixed mode
+            if (cfg.independentPeasants) {
+                auto [p1Type, p1HistRef] = sampleSeatPlayer();
+                gameSeats[gi][1].type = p1Type;
+                gameSeats[gi][1].histRef = p1HistRef;
+
+                auto [p2Type, p2HistRef] = sampleSeatPlayer();
+                gameSeats[gi][2].type = p2Type;
+                gameSeats[gi][2].histRef = p2HistRef;
+            } else {
+                auto [pType, pHistRef] = sampleSeatPlayer();
+                gameSeats[gi][1].type = pType;
+                gameSeats[gi][1].histRef = pHistRef;
+                gameSeats[gi][2].type = pType;
+                gameSeats[gi][2].histRef = pHistRef;
+            }
         }
 
         // Ensure at least one seat per game is PLAYER_LATEST so games always produce training data.
         if (gameSeats[gi][0].type != PLAYER_LATEST &&
             gameSeats[gi][1].type != PLAYER_LATEST &&
             gameSeats[gi][2].type != PLAYER_LATEST) {
-            if (cfg.independentPeasants) {
-                // Pick one seat at random (0, 1, or 2) and set to PLAYER_LATEST
+            if (cfg.trainCamp == 0) {
+                gameSeats[gi][0].type = PLAYER_LATEST;
+                gameSeats[gi][0].histRef = HistModelRef{};
+            } else if (cfg.trainCamp == 1) {
+                gameSeats[gi][1].type = PLAYER_LATEST;
+                gameSeats[gi][1].histRef = HistModelRef{};
+                gameSeats[gi][2].type = PLAYER_LATEST;
+                gameSeats[gi][2].histRef = HistModelRef{};
+            } else if (cfg.independentPeasants) {
                 int pickSeat = int(dealRng.nextU64() % 3);
                 gameSeats[gi][pickSeat].type = PLAYER_LATEST;
                 gameSeats[gi][pickSeat].histRef = HistModelRef{};
             } else {
-                // Either flip landlord or entire peasant team
                 if ((dealRng.nextU64() & 1) == 0) {
                     gameSeats[gi][0].type = PLAYER_LATEST;
                     gameSeats[gi][0].histRef = HistModelRef{};

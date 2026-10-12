@@ -66,6 +66,7 @@ struct Args {
     float landlordWinMul = 2.5f;
     float landlordLossMul = 1.5f;
     bool independentPeasants = true;
+    std::string campMode = "alt";  // "all" = train all together, "alt" = alternate landlord/peasant, "landlord" = landlord only, "peasant" = peasant only
     bool lrDecay = true;
     bool entDecay = true;
     int poolSize = 16;
@@ -106,8 +107,8 @@ void parseArgs(int argc, char** argv, Args& a) {
     a.games = std::atoi(argValue(argc, argv, "--games", "256"));
     a.threads = std::atoi(argValue(argc, argv, "--threads",
                                   std::to_string(a.threads).c_str()));
-    a.hidden = std::atoi(argValue(argc, argv, "--hidden", "256"));
-    a.lstmHidden = std::atoi(argValue(argc, argv, "--lstm-hidden", "128"));
+    a.hidden = std::atoi(argValue(argc, argv, "--hidden", "1024"));
+    a.lstmHidden = std::atoi(argValue(argc, argv, "--lstm-hidden", "256"));
     a.epochs = std::atoi(argValue(argc, argv, "--epochs", "4"));
     a.minibatch = std::atoi(argValue(argc, argv, "--mb", "1024"));
     a.snapshotEvery = std::atoi(argValue(argc, argv, "--snapshot-every", "20"));
@@ -125,6 +126,7 @@ void parseArgs(int argc, char** argv, Args& a) {
     if (hasFlag(argc, argv, "--no-independent-peasants") || hasFlag(argc, argv, "--coupled-peasants")) {
         a.independentPeasants = false;
     }
+    a.campMode = argValue(argc, argv, "--camp-mode", "alt");
     if (hasFlag(argc, argv, "--clip-vf")) a.clipVf = true;
     if (hasFlag(argc, argv, "--no-clip-vf")) a.clipVf = false;
     if (hasFlag(argc, argv, "--no-lr-decay")) a.lrDecay = false;
@@ -247,6 +249,7 @@ int main(int argc, char** argv) {
               << ",every=" << args.poolEvery
               << ",hist=" << args.histProb << ",rule=" << args.ruleProb
               << (args.independentPeasants ? ",indepPeasants" : ",coupledPeasants") << ")"
+              << " campMode=" << args.campMode
               << " target=terminal-adp"
               << " seed=" << args.seed << std::endl;
 
@@ -638,6 +641,7 @@ int main(int argc, char** argv) {
         std::array<std::vector<algo::Transition>, 3> streams;
         algo::RolloutStats stats{};
         double rollSecs = 0;
+        int trainCamp = -1;
     };
     struct Buffer {
         std::mutex mu;
@@ -665,11 +669,19 @@ int main(int argc, char** argv) {
             rc.ruleProb = args.ruleProb;
             rc.shapingCap = args.shapingCap;
             rc.landlordWinMul = args.landlordWinMul;
-            rc.landlordLossMul = args.landlordLossMul;
-            rc.independentPeasants = args.independentPeasants;
+            int currentCamp = -1;
+            if (args.campMode == "landlord") {
+                currentCamp = 0;
+            } else if (args.campMode == "peasant") {
+                currentCamp = 1;
+            } else if (args.campMode == "alt") {
+                currentCamp = (chunk % 2);  // even = landlord (0), odd = peasant (1)
+            }
+            rc.trainCamp = currentCamp;
             auto snapPool = std::atomic_load(&histPool);
             rc.historicalPool = snapPool.get();
             Sample sample;
+            sample.trainCamp = currentCamp;
             auto t0 = std::chrono::steady_clock::now();
             algo::collectRollout(models, rc, sample.streams, sample.stats);
             sample.rollSecs = std::chrono::duration<double>(
@@ -740,7 +752,13 @@ int main(int argc, char** argv) {
             std::lock_guard<std::mutex> lock(job.mu);
             job.upd = upd;
         }
-        unsigned failed = runLearn((1u << nLearn) - 1u);
+        unsigned targetMask = (1u << nLearn) - 1u;
+        if (sample.trainCamp == 0) {
+            targetMask = (1u << 0);  // Landlord only (Seat 0)
+        } else if (sample.trainCamp == 1) {
+            targetMask = (1u << 1) | (1u << 2);  // Peasant only (Seats 1 and 2)
+        }
+        unsigned failed = runLearn(targetMask);
         for (int attempt = 1; failed != 0 && attempt <= 2; ++attempt) {
             std::fprintf(stderr,
                          "GPU device lost during update %d (seats 0x%x), "
@@ -749,7 +767,7 @@ int main(int argc, char** argv) {
             releaseGpu();
             if (!nn::gpuRecreate()) {
                 std::fprintf(stderr, "D3D12 device recreate failed\n");
-                failed = (1u << nLearn) - 1u;
+                failed = targetMask;
                 break;
             }
             failed = runLearn(failed);
