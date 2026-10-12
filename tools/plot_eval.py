@@ -65,6 +65,26 @@ def parse_rows(rows: list[dict], x_col: str = "update") -> list[dict]:
     return parsed
 
 
+def compute_smooth(y: np.ndarray, alpha: float = 0.15) -> tuple[np.ndarray, np.ndarray]:
+    """Compute Exponential Moving Average (EMA) and rolling standard deviation."""
+    n = len(y)
+    if n == 0:
+        return y.copy(), np.zeros_like(y)
+    smoothed = np.empty(n, dtype=float)
+    smoothed[0] = y[0]
+    for i in range(1, n):
+        smoothed[i] = alpha * y[i] + (1.0 - alpha) * smoothed[i - 1]
+
+    # Rolling standard deviation over a small window to reflect eval variance
+    win = max(3, min(15, n // 4))
+    stds = np.empty(n, dtype=float)
+    for i in range(n):
+        i_start = max(0, i - win + 1)
+        sub = y[i_start : i + 1]
+        stds[i] = np.std(sub) if len(sub) > 1 else 0.0
+    return smoothed, stds
+
+
 def plot_single(parsed: list[dict], out_png: Path, x_col: str = "update") -> bool:
     if not parsed:
         return False
@@ -81,39 +101,52 @@ def plot_single(parsed: list[dict], out_png: Path, x_col: str = "update") -> boo
     # Subplot 1: Win Rate (WP)
     ax1 = axes[0]
     ax1.axhline(0.5, color="gray", linestyle=":", linewidth=1, label="50% baseline")
-    ax1.plot(x, wp, "o-", color="#1f77b4", linewidth=2, markersize=5, label="Overall WP")
-    ax1.plot(x, wp_l, "^--", color="#ff7f0e", linewidth=1.2, markersize=4, alpha=0.7, label="Landlord WP")
-    ax1.plot(x, wp_p, "v--", color="#2ca02c", linewidth=1.2, markersize=4, alpha=0.7, label="Peasant WP")
 
+    # Raw scatter points and light lines for individual runs
+    ax1.plot(x, wp_l, "^--", color="#ff7f0e", linewidth=1.0, markersize=3.5, alpha=0.45, label="Landlord WP")
+    ax1.plot(x, wp_p, "v--", color="#2ca02c", linewidth=1.0, markersize=3.5, alpha=0.45, label="Peasant WP")
+    ax1.plot(x, wp, "o-", color="#1f77b4", linewidth=1.0, markersize=3.5, alpha=0.35, label="Overall WP (Raw)")
+
+    # Smoothed robust trend line + confidence envelope
     if len(x) >= 3:
-        deg = 1 if len(x) < 5 else min(2, len(x) - 1)
-        poly = np.polyfit(x, wp, deg)
-        xx = np.linspace(x.min(), x.max(), 100)
-        ax1.plot(xx, np.polyval(poly, xx), "--", color="#d62728", alpha=0.8, label=f"Trend (deg={deg})")
+        smooth_wp, std_wp = compute_smooth(wp, alpha=0.15)
+        ax1.plot(x, smooth_wp, "-", color="#d62728", linewidth=2.4, label="Overall WP (Smoothed Trend)")
+        ax1.fill_between(x, smooth_wp - std_wp, smooth_wp + std_wp, color="#d62728", alpha=0.15, label="WP ±1σ Band")
+        # Also smooth Landlord & Peasant if plenty of data
+        if len(x) >= 10:
+            smooth_l, _ = compute_smooth(wp_l, alpha=0.15)
+            smooth_p, _ = compute_smooth(wp_p, alpha=0.15)
+            ax1.plot(x, smooth_l, "-", color="#ff7f0e", linewidth=1.6, alpha=0.9, label="Landlord Trend")
+            ax1.plot(x, smooth_p, "-", color="#2ca02c", linewidth=1.6, alpha=0.9, label="Peasant Trend")
 
     ax1.set_ylabel("Win Rate (WP)", fontsize=11)
     ax1.set_title("PerfectDou vs DouZero Evaluation Progress", fontsize=13, fontweight="bold")
     ax1.grid(True, linestyle="--", alpha=0.4)
-    ax1.legend(loc="best", framealpha=0.9)
+    ax1.legend(loc="best", framealpha=0.9, ncol=2)
 
     # Subplot 2: ADP (Average Difference Points)
     ax2 = axes[1]
     ax2.axhline(0.0, color="gray", linestyle=":", linewidth=1, label="0.0 baseline")
-    ax2.plot(x, adp, "s-", color="#9467bd", linewidth=2, markersize=5, label="Overall ADP")
-    ax2.plot(x, adp_l, "^--", color="#e377c2", linewidth=1.2, markersize=4, alpha=0.7, label="Landlord ADP")
-    ax2.plot(x, adp_p, "v--", color="#17becf", linewidth=1.2, markersize=4, alpha=0.7, label="Peasant ADP")
+
+    ax2.plot(x, adp_l, "^--", color="#e377c2", linewidth=1.0, markersize=3.5, alpha=0.45, label="Landlord ADP")
+    ax2.plot(x, adp_p, "v--", color="#17becf", linewidth=1.0, markersize=3.5, alpha=0.45, label="Peasant ADP")
+    ax2.plot(x, adp, "s-", color="#9467bd", linewidth=1.0, markersize=3.5, alpha=0.35, label="Overall ADP (Raw)")
 
     if len(x) >= 3:
-        deg = 1 if len(x) < 5 else min(2, len(x) - 1)
-        poly = np.polyfit(x, adp, deg)
-        xx = np.linspace(x.min(), x.max(), 100)
-        ax2.plot(xx, np.polyval(poly, xx), "--", color="#d62728", alpha=0.8, label=f"Trend (deg={deg})")
+        smooth_adp, std_adp = compute_smooth(adp, alpha=0.15)
+        ax2.plot(x, smooth_adp, "-", color="#d62728", linewidth=2.4, label="Overall ADP (Smoothed Trend)")
+        ax2.fill_between(x, smooth_adp - std_adp, smooth_adp + std_adp, color="#d62728", alpha=0.15, label="ADP ±1σ Band")
+        if len(x) >= 10:
+            smooth_al, _ = compute_smooth(adp_l, alpha=0.15)
+            smooth_ap, _ = compute_smooth(adp_p, alpha=0.15)
+            ax2.plot(x, smooth_al, "-", color="#e377c2", linewidth=1.6, alpha=0.9, label="Landlord ADP Trend")
+            ax2.plot(x, smooth_ap, "-", color="#17becf", linewidth=1.6, alpha=0.9, label="Peasant ADP Trend")
 
     x_label = "Training Update" if x_col == "update" else "Elapsed Time (minutes)"
     ax2.set_xlabel(x_label, fontsize=11)
     ax2.set_ylabel("ADP (Reward / Game)", fontsize=11)
     ax2.grid(True, linestyle="--", alpha=0.4)
-    ax2.legend(loc="best", framealpha=0.9)
+    ax2.legend(loc="best", framealpha=0.9, ncol=2)
 
     fig.tight_layout()
     out_png.parent.mkdir(parents=True, exist_ok=True)
@@ -146,27 +179,27 @@ def plot_comparison(datasets: list[tuple[str, list[dict]]], out_png: Path, x_col
         wp = np.array([p["wp"] for p in parsed], dtype=float)
         adp = np.array([p["adp"] for p in parsed], dtype=float)
 
-        ax1.plot(x, wp, marker=m, color=c, linewidth=1.8, markersize=5, label=f"{label} (WP)")
-        ax2.plot(x, adp, marker=m, color=c, linewidth=1.8, markersize=5, label=f"{label} (ADP)")
+        ax1.plot(x, wp, marker=m, color=c, linewidth=1.0, markersize=3.5, alpha=0.35, label=f"{label} (Raw)")
+        ax2.plot(x, adp, marker=m, color=c, linewidth=1.0, markersize=3.5, alpha=0.35, label=f"{label} (Raw)")
 
-        if len(x) >= 4:
-            deg = min(2, len(x) - 1)
-            poly_w = np.polyfit(x, wp, deg)
-            poly_a = np.polyfit(x, adp, deg)
-            xx = np.linspace(x.min(), x.max(), 100)
-            ax1.plot(xx, np.polyval(poly_w, xx), "--", color=c, alpha=0.5)
-            ax2.plot(xx, np.polyval(poly_a, xx), "--", color=c, alpha=0.5)
+        if len(x) >= 3:
+            smooth_wp, std_wp = compute_smooth(wp, alpha=0.15)
+            smooth_adp, std_adp = compute_smooth(adp, alpha=0.15)
+            ax1.plot(x, smooth_wp, "-", color=c, linewidth=2.2, label=f"{label} (Trend)")
+            ax2.plot(x, smooth_adp, "-", color=c, linewidth=2.2, label=f"{label} (Trend)")
+            ax1.fill_between(x, smooth_wp - std_wp, smooth_wp + std_wp, color=c, alpha=0.1)
+            ax2.fill_between(x, smooth_adp - std_adp, smooth_adp + std_adp, color=c, alpha=0.1)
 
     ax1.set_ylabel("Win Rate (WP)", fontsize=11)
     ax1.set_title("A/B Experiment Comparison vs DouZero", fontsize=13, fontweight="bold")
     ax1.grid(True, linestyle="--", alpha=0.4)
-    ax1.legend(loc="best", framealpha=0.9)
+    ax1.legend(loc="best", framealpha=0.9, ncol=2)
 
     x_label = "Training Update" if x_col == "update" else "Elapsed Time (minutes)"
     ax2.set_xlabel(x_label, fontsize=11)
     ax2.set_ylabel("ADP (Reward / Game)", fontsize=11)
     ax2.grid(True, linestyle="--", alpha=0.4)
-    ax2.legend(loc="best", framealpha=0.9)
+    ax2.legend(loc="best", framealpha=0.9, ncol=2)
 
     fig.tight_layout()
     out_png.parent.mkdir(parents=True, exist_ok=True)
