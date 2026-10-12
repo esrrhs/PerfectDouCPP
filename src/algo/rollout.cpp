@@ -1,9 +1,11 @@
 #include "algo/rollout.h"
 
 #include <algorithm>
+#include <condition_variable>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <mutex>
 #include <thread>
 
 #include "ddz/oracle.h"
@@ -505,6 +507,80 @@ void runWorker(const ModelSet& models, const RolloutConfig& cfg, int nGames,
         res.stats.transitions[s] = (long long)res.seats[s].size();
 }
 
+// MinGW implements C++ thread_local with emulated TLS. pthread_join then
+// frees that block from pthread_tls_init, and the Windows heap reports
+// 0xC0000374. Native TLS on other platforms does not. Rollout workers are
+// reused for the life of the process so training never joins them.
+void runOnPool(const ModelSet& models, const RolloutConfig& cfg,
+               const std::vector<int>& split, std::vector<ThreadResult>& results) {
+    struct State {
+        std::mutex mu;
+        std::condition_variable cv;
+        std::mutex api;
+        int generation = 0;
+        int finished = 0;
+        int active = 0;
+        const ModelSet* models = nullptr;
+        const RolloutConfig* cfg = nullptr;
+        const std::vector<int>* split = nullptr;
+        std::vector<ThreadResult>* results = nullptr;
+        std::vector<std::thread> threads;
+    };
+    static State* st = new State;
+    const int T = static_cast<int>(split.size());
+    std::lock_guard<std::mutex> api(st->api);
+    {
+        std::lock_guard<std::mutex> lk(st->mu);
+        while (static_cast<int>(st->threads.size()) < T) {
+            int index = static_cast<int>(st->threads.size());
+            st->threads.emplace_back([index] {
+                int seen = 0;
+                for (;;) {
+                    const ModelSet* jobModels = nullptr;
+                    const RolloutConfig* jobCfg = nullptr;
+                    int n = 0;
+                    uint64_t seed = 0;
+                    ThreadResult* res = nullptr;
+                    int gen = 0;
+                    {
+                        std::unique_lock<std::mutex> lk(st->mu);
+                        st->cv.wait(lk, [&] { return st->generation != seen; });
+                        gen = st->generation;
+                        if (index < st->active) {
+                            jobModels = st->models;
+                            jobCfg = st->cfg;
+                            n = (*st->split)[index];
+                            seed = jobCfg->seed +
+                                   0x9e3779b97f4a7c15ULL * uint64_t(index + 1);
+                            res = &(*st->results)[index];
+                        }
+                    }
+                    if (n > 0) runWorker(*jobModels, *jobCfg, n, seed, *res);
+                    {
+                        std::lock_guard<std::mutex> lk(st->mu);
+                        if (index < st->active && st->generation == gen) {
+                            if (++st->finished == st->active) st->cv.notify_all();
+                        }
+                        seen = gen;
+                    }
+                }
+            });
+        }
+    }
+    {
+        std::unique_lock<std::mutex> lk(st->mu);
+        st->models = &models;
+        st->cfg = &cfg;
+        st->split = &split;
+        st->results = &results;
+        st->finished = 0;
+        st->active = T;
+        ++st->generation;
+        st->cv.notify_all();
+        st->cv.wait(lk, [&] { return st->finished == T; });
+    }
+}
+
 }  // namespace
 
 void collectRollout(const ModelSet& models, const RolloutConfig& cfg,
@@ -515,18 +591,14 @@ void collectRollout(const ModelSet& models, const RolloutConfig& cfg,
     for (int i = 0; i < cfg.gamesPerUpdate % T; ++i) ++split[i];
 
     std::vector<ThreadResult> results(T);
-    std::vector<std::thread> threads;
-    for (int t = 0; t < T; ++t) {
-        if (split[t] == 0) continue;
-        uint64_t seed = cfg.seed + 0x9e3779b97f4a7c15ULL * uint64_t(t + 1);
-        if (T == 1) {
-            runWorker(models, cfg, split[t], seed, results[t]);
-            continue;
+    if (T == 1) {
+        if (split[0] > 0) {
+            uint64_t seed = cfg.seed + 0x9e3779b97f4a7c15ULL;
+            runWorker(models, cfg, split[0], seed, results[0]);
         }
-        threads.emplace_back(runWorker, std::cref(models), std::cref(cfg),
-                             split[t], seed, std::ref(results[t]));
+    } else {
+        runOnPool(models, cfg, split, results);
     }
-    for (auto& th : threads) th.join();
 
     stats = RolloutStats{};
     int gameOffset = 0;

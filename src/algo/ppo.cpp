@@ -144,6 +144,58 @@ void dumpRound(int batchNo, const std::vector<Transition*>& mb, const Batch& bat
 
 }  // namespace
 
+// One host-side batch builder per learner. Joining it after every update
+// trips the same MinGW pthread TLS teardown as the rollout workers
+// (0xC0000374 inside pthread_join). The helper stays alive.
+struct HostPrep {
+    std::mutex mu;
+    std::condition_variable cv;
+    std::function<void()> job;
+    bool has = false;
+    bool done = false;
+    std::thread th;
+    HostPrep() {
+        th = std::thread([this] {
+            nn::gemmSetThreadGpu(0);
+            for (;;) {
+                std::function<void()> run;
+                {
+                    std::unique_lock<std::mutex> lk(mu);
+                    cv.wait(lk, [&] { return has; });
+                    run = std::move(job);
+                    has = false;
+                }
+                run();
+                {
+                    std::lock_guard<std::mutex> lk(mu);
+                    done = true;
+                }
+                cv.notify_one();
+            }
+        });
+        th.detach();
+    }
+    void submit(std::function<void()> fn) {
+        {
+            std::lock_guard<std::mutex> lk(mu);
+            job = std::move(fn);
+            has = true;
+            done = false;
+        }
+        cv.notify_one();
+    }
+    void wait() {
+        std::unique_lock<std::mutex> lk(mu);
+        cv.wait(lk, [&] { return done; });
+    }
+};
+
+HostPrep& hostPrep() {
+    static thread_local HostPrep* p = nullptr;
+    if (!p) p = new HostPrep;
+    return *p;
+}
+
 bool ppoUpdate(nn::Actor& actor, nn::Critic& critic,
                std::vector<Transition>& tr, const PPOConfig& cfg,
                nn::Adam& actorOpt, nn::Adam& criticOpt, nn::Rng64& rng,
@@ -230,8 +282,7 @@ bool ppoUpdate(nn::Actor& actor, nn::Critic& critic,
     // time. The learner keeps ownership of its D3D context and only consumes
     // fully materialized host batches. Single-thread mode fills the next
     // batch on this same thread instead.
-    std::thread prepareThread;
-    if (!singleThread) prepareThread = std::thread([&] {
+    if (!singleThread) hostPrep().submit([&] {
         // Host only. A second command queue on this thread cannot be used
         // by the learner, and dropping a device cache here would free it
         // off the thread that created it.
@@ -518,7 +569,7 @@ bool ppoUpdate(nn::Actor& actor, nn::Critic& critic,
         stopProducer.store(true, std::memory_order_release);
     }
     slotCv.notify_all();
-    if (prepareThread.joinable()) prepareThread.join();
+    if (!singleThread) hostPrep().wait();
     if (!deviceOk) return false;
 
     onGpu([&] { nn::gpuPrintStats("ppo-update"); });
