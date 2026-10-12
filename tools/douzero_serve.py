@@ -113,11 +113,13 @@ def serve(port, ckpt_dir):
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     srv.bind(("127.0.0.1", port))
     srv.listen(5)
-    print("ready", flush=True)
+    print(f"[DouZeroServer] Listening on 127.0.0.1:{port}... Ready!", flush=True)
     try:
         while True:
-            conn, _ = srv.accept()
+            conn, addr = srv.accept()
+            print(f"[DouZeroServer] Accepted eval connection from {addr}, playing deck games...", flush=True)
             buf = b""
+            moves = 0
             try:
                 while True:
                     while b"\n" not in buf:
@@ -133,10 +135,12 @@ def serve(port, ckpt_dir):
                         break
                     action = choose(agents[text.split("\t", 1)[0]], build(text))
                     conn.sendall((encode(action) + "\n").encode())
+                    moves += 1
             except Exception as e:
                 pass
             finally:
                 conn.close()
+                print(f"[DouZeroServer] Finished eval session ({moves} moves handled)", flush=True)
     finally:
         srv.close()
 

@@ -46,14 +46,14 @@ namespace {
 struct Args {
     int updates = 100000;
     int startUpdate = 1;
-    int games = 512;
-    int threads = int(std::thread::hardware_concurrency());
+    int games = 768;
+    int threads = 16;
     int hidden = 1024;
     int lstmHidden = 256;
     int epochs = 2;
     int minibatch = 2048;
     int snapshotEvery = 50;
-    int buffer = 2;
+    int buffer = 4;
     float lr = 3e-4f;
     float clip = 0.2f;
     float ent = 0.03f;
@@ -77,7 +77,7 @@ struct Args {
     uint64_t seed = 1;
     std::string out = "ckpt_long";
     std::string resume;
-    std::string backend = "cuda";  // auto | cuda | cpu
+    std::string backend = "auto";  // auto | cuda | cpu
     int evalEvery = 200;           // eval vs DouZero every 200 updates
     int evalDecks = 1000;          // 1000 decks = 2000 games (swapped seats)
     int evalPort = 18765;          // DouZero TCP server port

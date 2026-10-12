@@ -234,7 +234,11 @@ def main() -> int:
         return plot_comparison(datasets, out_png, args.x)
 
     if args.watch > 0:
-        print(f"Monitoring {len(csv_paths)} CSV(s) every {args.watch}s -> {out_png}")
+        print(f"[EvalPlotter] Monitoring {len(csv_paths)} CSV(s) every {args.watch}s -> {out_png}", flush=True)
+        if any(p.is_file() for p in csv_paths):
+            render()
+        else:
+            print(f"[EvalPlotter] Waiting for first eval data in {csv_paths[0]}...", flush=True)
         last_mtimes = {}
         while True:
             changed = False
@@ -246,7 +250,7 @@ def main() -> int:
                         last_mtimes[str(p)] = mt
             if changed:
                 if render():
-                    print(f"[{time.strftime('%H:%M:%S')}] Updated {out_png}")
+                    print(f"[EvalPlotter] [{time.strftime('%H:%M:%S')}] Updated {out_png}", flush=True)
             time.sleep(args.watch)
     else:
         if render():
