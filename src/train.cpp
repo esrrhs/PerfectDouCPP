@@ -63,6 +63,8 @@ struct Args {
     bool clipVf = false;
     float vfClip = 32.0f;
     float shapingCap = 0.05f;
+    float landlordWinMul = 2.5f;
+    float landlordLossMul = 1.5f;
     bool lrDecay = true;
     bool entDecay = true;
     int poolSize = 16;
@@ -117,6 +119,8 @@ void parseArgs(int argc, char** argv, Args& a) {
     a.targetKL = float(std::atof(argValue(argc, argv, "--target-kl", "0.03")));
     a.vfClip = float(std::atof(argValue(argc, argv, "--vf-clip", "32.0")));
     a.shapingCap = float(std::atof(argValue(argc, argv, "--shaping-cap", "0.05")));
+    a.landlordWinMul = float(std::atof(argValue(argc, argv, "--landlord-win-mul", "2.5")));
+    a.landlordLossMul = float(std::atof(argValue(argc, argv, "--landlord-loss-mul", "1.5")));
     if (hasFlag(argc, argv, "--clip-vf")) a.clipVf = true;
     if (hasFlag(argc, argv, "--no-clip-vf")) a.clipVf = false;
     if (hasFlag(argc, argv, "--no-lr-decay")) a.lrDecay = false;
@@ -655,6 +659,8 @@ int main(int argc, char** argv) {
             rc.historicalProb = args.histProb;
             rc.ruleProb = args.ruleProb;
             rc.shapingCap = args.shapingCap;
+            rc.landlordWinMul = args.landlordWinMul;
+            rc.landlordLossMul = args.landlordLossMul;
             auto snapPool = std::atomic_load(&histPool);
             rc.historicalPool = snapPool.get();
             Sample sample;

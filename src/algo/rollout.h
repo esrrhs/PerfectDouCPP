@@ -79,6 +79,9 @@ struct RolloutConfig {
     const HistoricalPool* historicalPool = nullptr;
     // Terminal shaping cap (nudge towards fewer opponent cards/clearing hand, small to prevent distorting ADP)
     float shapingCap = 0.05f;
+    // Asymmetric reward shaping for landlord (Plan A: encourage active aggression and reduce conservative bias)
+    float landlordWinMul = 2.5f;   // default 2.5x base mult when landlord wins (up from 2.0x)
+    float landlordLossMul = 1.5f;  // default 1.5x base mult when landlord loses (down from 2.0x)
 };
 
 // Runs self-play / league games using the current models, historical pool, and rule agent.

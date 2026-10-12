@@ -336,7 +336,15 @@ void runWorker(const ModelSet& models, const RolloutConfig& cfg, int nGames,
             int idx = lastIdx[s][gi];
             if (idx >= 0) {
                 auto& t = res.seats[s][idx];
-                t.reward += float(g.payoff(s)) + g.shaping(s, cfg.shapingCap);
+                float r = 0.0f;
+                if (s == ddz::kLandlord) {
+                    bool landlordWon = (g.winner == 0);
+                    r = landlordWon ? (cfg.landlordWinMul * float(mult))
+                                    : (-cfg.landlordLossMul * float(mult));
+                } else {
+                    r = float(g.payoff(s));
+                }
+                t.reward += r + g.shaping(s, cfg.shapingCap);
                 t.terminal = true;
             }
         }
