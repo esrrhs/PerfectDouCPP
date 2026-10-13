@@ -87,38 +87,3 @@ TEST(TorchNNTest, PPOLearnerStep) {
     auto stats = learner.update(bt);
     ASSERT_GT(stats.epochsCompleted, 0);
 }
-
-#include "torch_nn/weight_sync.h"
-
-TEST(TorchNNTest, WeightSyncParity) {
-    torch_nn::ModelConfig cfg;
-    cfg.hidden = 64;
-    cfg.lstmHidden = 32;
-
-    torch_nn::Actor torchActor(cfg);
-    nn::NetConfig legacyCfg;
-    legacyCfg.hidden = 64;
-    legacyCfg.lstmHidden = 32;
-
-    nn::Actor legacyActor;
-    legacyActor.init(legacyCfg, 12345);
-
-    // Sync legacy to torch
-    torch_nn::syncLegacyToTorchActor(legacyActor, torchActor);
-
-    // Sync back
-    nn::Actor legacyActor2;
-    legacyActor2.init(legacyCfg, 9999);
-    torch_nn::syncTorchToLegacyActor(torchActor, legacyActor2);
-
-    // Compare params
-    auto p1 = legacyActor.params();
-    auto p2 = legacyActor2.params();
-    ASSERT_EQ(p1.size(), p2.size());
-    for (size_t i = 0; i < p1.size(); ++i) {
-        ASSERT_EQ(p1[i]->w.size(), p2[i]->w.size());
-        for (size_t j = 0; j < p1[i]->w.size(); ++j) {
-            ASSERT_NEAR(p1[i]->w[j], p2[i]->w[j], 1e-5f);
-        }
-    }
-}

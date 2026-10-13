@@ -13,7 +13,7 @@
 
 #include "ddz/features.h"
 #include "ddz/game.h"
-#include "nn/net.h"
+#include "torch_nn/models.h"
 
 namespace algo {
 
@@ -47,12 +47,12 @@ struct RolloutStats {
 };
 
 struct ModelSet {
-    std::array<nn::Actor*, 3> actor{};
-    std::array<nn::Critic*, 3> critic{};
+    std::array<torch_nn::Actor*, 3> actor{};
+    std::array<torch_nn::Critic*, 3> critic{};
 };
 
 struct HistoricalActorSnapshot {
-    std::array<nn::Actor, 3> actor;
+    std::array<torch_nn::Actor, 3> actor;
     int update = 0;  // Update index at which this snapshot was created
 };
 
@@ -92,25 +92,5 @@ struct RolloutConfig {
 void collectRollout(const ModelSet& models, const RolloutConfig& cfg,
                     std::array<std::vector<Transition>, 3>& out,
                     RolloutStats& stats);
-
-// Assembles the network input batch for a set of transitions.
-struct Batch {
-    nn::Mat xImp, seq, actionFeat, actionSample, actionId, actionOffset, extra;
-};
-// Float features for one stream, built once and reused across PPO epochs.
-void cacheTransitionFeatures(const std::vector<Transition>& tr,
-                             std::vector<float>& xImp, std::vector<float>& seq,
-                             std::vector<float>& extra);
-void buildBatch(const std::vector<Transition*>& tr, nn::Mat& xImp,
-                nn::Mat& seq, nn::Mat& actionFeat, nn::Mat& actionSample,
-                nn::Mat& actionId, nn::Mat& actionOffset, nn::Mat& extra);
-// `base` is the stream the cached rows were built from. Each pointer in
-// `tr` must address an element of that stream.
-void buildBatchFromCache(const std::vector<Transition*>& tr,
-                         const Transition* base, const float* xAll, int xStride,
-                         const float* seqAll, const float* eAll, int eStride,
-                         nn::Mat& xImp, nn::Mat& seq, nn::Mat& actionFeat,
-                         nn::Mat& actionSample, nn::Mat& actionId,
-                         nn::Mat& actionOffset, nn::Mat& extra);
 
 }  // namespace algo

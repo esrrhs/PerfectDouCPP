@@ -23,58 +23,18 @@ add_library(perfectdou STATIC
   src/ddz/oracle.cpp
   src/ddz/game.cpp
   src/ddz/features.cpp
-  src/nn/net.cpp
-  src/nn/gemm_cpu.cpp
-  src/nn/kernels.cpp
   src/algo/rollout.cpp
   src/algo/ppo.cpp
   src/algo/eval_douzero.cpp
   src/torch_nn/models.cpp
   src/torch_nn/ppo_learner.cpp
   src/torch_nn/tensor_bridge.cpp
-  src/torch_nn/weight_sync.cpp
 )
 target_include_directories(perfectdou PUBLIC src ${TORCH_INCLUDE_DIRS})
 target_link_libraries(perfectdou PUBLIC Threads::Threads ${TORCH_LIBRARIES})
 
-if(APPLE)
-  target_link_libraries(perfectdou PUBLIC "-framework Accelerate")
-  enable_language(OBJCXX)
-  target_sources(perfectdou PRIVATE src/nn/gemm_mps.mm)
-  set_source_files_properties(src/nn/gemm_mps.mm PROPERTIES COMPILE_FLAGS "-fobjc-arc")
-  target_compile_definitions(perfectdou PUBLIC PD_HAVE_MPS)
-  target_link_libraries(perfectdou PUBLIC
-    "-framework Metal" "-framework MetalPerformanceShaders" "-framework Foundation")
-endif()
-
-if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64" OR MSVC)
-  target_sources(perfectdou PRIVATE src/nn/gemm_avx2.cpp)
-  if(MSVC)
-    set_source_files_properties(src/nn/gemm_avx2.cpp PROPERTIES
-      COMPILE_OPTIONS "/arch:AVX2")
-  else()
-    set_source_files_properties(src/nn/gemm_avx2.cpp PROPERTIES
-      COMPILE_OPTIONS "-mavx2;-mfma")
-  endif()
-endif()
-
 if(WIN32)
-  target_sources(perfectdou PRIVATE
-    src/nn/gemm_d3d.cpp
-    src/nn/gemm_cuda_bridge.cpp)
-  target_compile_definitions(perfectdou PUBLIC PD_HAVE_D3D)
-  target_link_libraries(perfectdou PUBLIC d3d12 dxgi d3dcompiler ws2_32)
-  find_path(CUDA_TOOLKIT_INCLUDE cuda.h
-    HINTS "$ENV{CUDA_PATH}/include"
-          "C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v12.9/include"
-          "C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v12.8/include"
-          "C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v12.6/include"
-          "C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v13.4/include")
-  if(CUDA_TOOLKIT_INCLUDE)
-    target_include_directories(perfectdou PRIVATE "${CUDA_TOOLKIT_INCLUDE}")
-    target_compile_definitions(perfectdou PRIVATE PD_HAVE_CUBLAS)
-    message(STATUS "Optional cuBLAS D3D12 bridge enabled")
-  endif()
+  target_link_libraries(perfectdou PUBLIC ws2_32)
 endif()
 
 add_executable(perfectdou_train src/train.cpp)
@@ -102,14 +62,6 @@ add_executable(test_rules tests/test_rules.cpp)
 target_link_libraries(test_rules PRIVATE perfectdou GTest::gtest_main)
 gtest_discover_tests(test_rules)
 
-add_executable(test_grad tests/test_grad.cpp)
-target_link_libraries(test_grad PRIVATE perfectdou GTest::gtest_main)
-gtest_discover_tests(test_grad)
-
-add_executable(test_gemm tests/test_gemm.cpp)
-target_link_libraries(test_gemm PRIVATE perfectdou GTest::gtest_main)
-gtest_discover_tests(test_gemm)
-
 add_executable(test_algo tests/test_algo.cpp)
 target_link_libraries(test_algo PRIVATE perfectdou GTest::gtest_main)
 gtest_discover_tests(test_algo)
@@ -117,4 +69,3 @@ gtest_discover_tests(test_algo)
 add_executable(test_torch_nn tests/test_torch_nn.cpp)
 target_link_libraries(test_torch_nn PRIVATE perfectdou GTest::gtest_main)
 gtest_discover_tests(test_torch_nn)
-

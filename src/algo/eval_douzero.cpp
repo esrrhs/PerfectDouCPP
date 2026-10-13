@@ -37,8 +37,7 @@ typedef int socket_t;
 #include "algo/rollout.h"
 #include "ddz/game.h"
 #include "ddz/oracle.h"
-#include "nn/gemm.h"
-#include "nn/net.h"
+#include "torch_nn/models.h"
 
 namespace algo {
 
@@ -169,35 +168,52 @@ bool askDouZero(socket_t sock, const ddz::Game& g, const std::vector<ddz::CardSe
     return true;
 }
 
-ddz::CardSet ourMove(const nn::Actor& actor, nn::ActorInfer& w, const ddz::Game& g,
+ddz::CardSet ourMove(const torch_nn::Actor& actor, const ddz::Game& g,
                      const std::vector<ddz::LegalOption>& options) {
-    algo::Transition t;
+    torch::NoGradGuard no_grad;
+
+    int64_t L = static_cast<int64_t>(options.size());
+    torch::Tensor xImpT = torch::empty({1, torch_nn::kImpInput}, torch::kFloat32);
+    torch::Tensor seqT = torch::empty({1, torch_nn::kLstmSteps, torch_nn::kLstmIn}, torch::kFloat32);
+    torch::Tensor actFeatT = torch::empty({L, torch_nn::kActionInput}, torch::kFloat32);
+    torch::Tensor actSampleT = torch::zeros({L}, torch::kLong);
+    torch::Tensor actIdT = torch::empty({L}, torch::kLong);
+
     ddz::EncodedState e = ddz::encodeState(g);
-    t.imp = e.imp;
-    t.scalar = e.scalar;
-    t.extra = e.extra;
-    t.extraScalar = e.extraScalar;
-    for (const ddz::LegalOption& o : options) {
-        t.actions.emplace_back(o.abstractId, o.feature);
+    float* pXImp = xImpT.data_ptr<float>();
+    for (int j = 0; j < ddz::kNodeBin; ++j) pXImp[j] = float(e.imp[j]);
+    std::copy(e.scalar.begin(), e.scalar.end(), pXImp + ddz::kNodeBin);
+
+    float* pSeq = seqT.data_ptr<float>();
+    for (int k = 0; k < ddz::kHistoryLen; ++k) {
+        const uint8_t* src = e.imp.data() + (ddz::kStaticMatrices + k) * ddz::kCardMat;
+        float* dst = pSeq + k * ddz::kCardMat;
+        for (int j = 0; j < ddz::kCardMat; ++j) dst[j] = float(src[j]);
     }
-    std::vector<algo::Transition*> ptrs{&t};
-    nn::Mat xImp, seq, actionFeat, actionSample, actionId, actionOffset, extra;
-    algo::buildBatch(ptrs, xImp, seq, actionFeat, actionSample, actionId,
-                     actionOffset, extra);
-    const nn::Mat& logits =
-        nn::actorInferForward(actor, w, xImp, seq, actionFeat, actionSample,
-                              actionId, actionOffset);
+
+    float* pActFeat = actFeatT.data_ptr<float>();
+    int64_t* pActId = actIdT.data_ptr<int64_t>();
+    for (int64_t i = 0; i < L; ++i) {
+        std::memcpy(pActFeat + i * torch_nn::kActionInput, options[i].feature.data(),
+                    torch_nn::kActionInput * sizeof(float));
+        pActId[i] = options[i].abstractId;
+    }
+
+    torch::Tensor logitsT = actor->forward(xImpT, seqT, actFeatT, actSampleT, actIdT);
+    const float* pLogits = logitsT.data_ptr<float>();
+
     int best = options.front().abstractId;
-    float bestL = logits.row(0)[best];
+    float bestL = pLogits[best];
     for (const ddz::LegalOption& o : options) {
-        float v = logits.row(0)[o.abstractId];
+        float v = pLogits[o.abstractId];
         if (v > bestL) {
             bestL = v;
             best = o.abstractId;
         }
     }
-    for (const ddz::LegalOption& o : options)
+    for (const ddz::LegalOption& o : options) {
         if (o.abstractId == best) return o.concrete;
+    }
     return options.front().concrete;
 }
 
@@ -207,8 +223,8 @@ struct Tally {
     double score = 0;
 };
 
-bool playOne(ddz::Game g, bool ourLandlord, const std::array<nn::Actor, 3>& actors,
-             std::array<nn::ActorInfer, 3>& ws, socket_t sock, Tally& tally) {
+bool playOne(ddz::Game g, bool ourLandlord, const std::array<torch_nn::Actor, 3>& actors,
+             socket_t sock, Tally& tally) {
     int guard = 0;
     while (!g.over && guard++ < 400) {
         auto options = ddz::legalOptions(g);
@@ -218,7 +234,7 @@ bool playOne(ddz::Game g, bool ourLandlord, const std::array<nn::Actor, 3>& acto
         bool ours = ourLandlord ? g.turn == 0 : g.turn != 0;
         ddz::CardSet mv;
         if (ours) {
-            mv = ourMove(actors[g.turn], ws[g.turn], g, options);
+            mv = ourMove(actors[g.turn], g, options);
         } else {
             std::vector<ddz::CardSet> legal;
             legal.reserve(options.size());
@@ -240,16 +256,17 @@ bool playOne(ddz::Game g, bool ourLandlord, const std::array<nn::Actor, 3>& acto
 
 }  // namespace
 
-std::shared_ptr<ActorGroup> cloneActors(const std::array<nn::Actor, 3>& src) {
+std::shared_ptr<ActorGroup> cloneActors(const std::array<torch_nn::Actor, 3>& src) {
     auto dst = std::make_shared<ActorGroup>();
     for (int s = 0; s < 3; ++s) {
-        (*dst)[s].init(src[s].cfg, 1);
-        auto da = (*dst)[s].params();
-        auto sa = const_cast<nn::Actor&>(src[s]).params();
-        for (size_t i = 0; i < sa.size(); ++i) {
-            da[i]->w = sa[i]->w;
+        (*dst)[s] = torch_nn::Actor(src[s]->config);
+        // Copy parameters
+        torch::NoGradGuard no_grad;
+        auto srcParams = src[s]->parameters();
+        auto dstParams = (*dst)[s]->parameters();
+        for (size_t i = 0; i < srcParams.size(); ++i) {
+            dstParams[i].copy_(srcParams[i]);
         }
-        (*dst)[s].prepareInference();
     }
     return dst;
 }
@@ -264,11 +281,9 @@ DouZeroEvalResult evaluateAgainstDouZero(std::shared_ptr<const ActorGroup> actor
     return evaluateAgainstDouZero(*actors, cfg);
 }
 
-DouZeroEvalResult evaluateAgainstDouZero(const std::array<nn::Actor, 3>& actors,
+DouZeroEvalResult evaluateAgainstDouZero(const std::array<torch_nn::Actor, 3>& actors,
                                         const DouZeroEvalConfig& cfg) {
     DouZeroEvalResult res;
-    // Evaluation runs purely on CPU; ensure this thread does not attempt GPU GEMM.
-    nn::gemmSetThreadGpu(0);
 
     // Save cloned model weights and metadata to disk for traceability
     if (!cfg.saveDir.empty()) {
@@ -276,7 +291,7 @@ DouZeroEvalResult evaluateAgainstDouZero(const std::array<nn::Actor, 3>& actors,
         std::filesystem::create_directories(cfg.saveDir, ec);
         for (int s = 0; s < 3; ++s) {
             std::string path = cfg.saveDir + "/actor" + std::to_string(s) + ".bin";
-            actors[s].save(path.c_str());
+            actors[s]->save(path);
         }
         std::string metaPath = cfg.saveDir + "/meta.txt";
         FILE* mf = std::fopen(metaPath.c_str(), "w");
@@ -352,7 +367,6 @@ DouZeroEvalResult evaluateAgainstDouZero(const std::array<nn::Actor, 3>& actors,
         return res;
     }
 
-    std::array<nn::ActorInfer, 3> ws;
     uint64_t seed = cfg.seed;
     if (seed == 0) {
         seed = static_cast<uint64_t>(std::chrono::system_clock::now().time_since_epoch().count());
@@ -366,7 +380,7 @@ DouZeroEvalResult evaluateAgainstDouZero(const std::array<nn::Actor, 3>& actors,
         g.deal(rng);
         auto hands = g.hand;
         auto bottom = g.bottom;
-        if (!playOne(g, true, actors, ws, sock, asLandlord)) {
+        if (!playOne(g, true, actors, sock, asLandlord)) {
             res.error = "communication failed while playing as landlord";
             break;
         }
@@ -375,7 +389,7 @@ DouZeroEvalResult evaluateAgainstDouZero(const std::array<nn::Actor, 3>& actors,
         g2.bottom = bottom;
         g2.turn = 0;
         g2.lastPlayer = 0;
-        if (!playOne(g2, false, actors, ws, sock, asPeasant)) {
+        if (!playOne(g2, false, actors, sock, asPeasant)) {
             res.error = "communication failed while playing as peasant";
             break;
         }

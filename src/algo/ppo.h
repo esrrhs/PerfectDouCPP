@@ -1,11 +1,8 @@
-// PPO update. Supports GAE bootstrapped value targets (default lambda=0.95),
-// reducing to the seat's final Monte Carlo ADP when lambda=1.0.
 #pragma once
 
 #include <vector>
 
 #include "algo/rollout.h"
-#include "nn/net.h"
 
 namespace algo {
 
@@ -70,13 +67,5 @@ void assignEpisodeReturns(std::vector<Transition>& tr, float gamma = 1.0f,
 
 // Computes masked softmax over action logits, producing valid probabilities.
 void maskedSoftmax(const float* logits, int n, float* probs);
-
-// One PPO update of one seat's actor + critic over its rollout stream.
-// False means the GPU device was removed before Adam wrote host weights, so
-// the update can be repeated after the device is recreated.
-bool ppoUpdate(nn::Actor& actor, nn::Critic& critic,
-               std::vector<Transition>& tr, const PPOConfig& cfg,
-               nn::Adam& actorOpt, nn::Adam& criticOpt, nn::Rng64& rng,
-               PPOStats& stats);
 
 }  // namespace algo

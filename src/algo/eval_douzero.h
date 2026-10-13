@@ -4,11 +4,11 @@
 #include <memory>
 #include <string>
 
-#include "nn/net.h"
+#include "torch_nn/models.h"
 
 namespace algo {
 
-using ActorGroup = std::array<nn::Actor, 3>;
+using ActorGroup = std::array<torch_nn::Actor, 3>;
 
 struct DouZeroEvalConfig {
     std::string host = "127.0.0.1";
@@ -37,13 +37,11 @@ struct DouZeroEvalResult {
     std::string error;
 };
 
-// Deep copies 3 actor models into a heap-allocated ActorGroup and prepares inference.
-// Runs purely in memory in < 1ms.
-std::shared_ptr<ActorGroup> cloneActors(const std::array<nn::Actor, 3>& src);
+// Deep copies 3 actor models into a heap-allocated ActorGroup.
+std::shared_ptr<ActorGroup> cloneActors(const std::array<torch_nn::Actor, 3>& src);
 
 // Evaluates the given actors against DouZero TCP server.
-// Runs purely on CPU, thread-safe, and does not touch GPU or CUDA streams.
-DouZeroEvalResult evaluateAgainstDouZero(const std::array<nn::Actor, 3>& actors,
+DouZeroEvalResult evaluateAgainstDouZero(const std::array<torch_nn::Actor, 3>& actors,
                                         const DouZeroEvalConfig& cfg);
 
 DouZeroEvalResult evaluateAgainstDouZero(std::shared_ptr<const ActorGroup> actors,

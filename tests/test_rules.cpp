@@ -16,10 +16,13 @@
 #include "ddz/oracle.h"
 #include "ddz/rule_agent.h"
 #include "algo/ppo.h"
-#include "nn/net.h"
+#include "torch_nn/models.h"
 
 using namespace ddz;
 
+#ifdef CHECK
+#undef CHECK
+#endif
 #define CHECK(cond) ASSERT_TRUE(cond)
 
 static void testDetect() {
@@ -360,7 +363,7 @@ static void testFeatures() {
             for (int i = 0; i < (int)opts.size(); ++i) {
                 const LegalOption& o = opts[i];
                 CHECK(o.abstractId == i);
-                CHECK(o.abstractId < nn::kNumActions);
+                CHECK(o.abstractId < torch_nn::kNumActions);
                 CHECK(game.hand[game.turn].contains(o.concrete));
                 if (!o.concrete.empty())
                     CHECK(detectMove(o.concrete).type != MT_WRONG);

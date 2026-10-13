@@ -9,8 +9,7 @@
 #include <string>
 
 #include "algo/eval_douzero.h"
-#include "nn/gemm.h"
-#include "nn/net.h"
+#include "torch_nn/models.h"
 
 namespace {
 
@@ -37,14 +36,14 @@ int main(int argc, char** argv) {
         return 2;
     }
 
-    nn::gemmInit();
-    nn::gemmSetGpu(false);
-    nn::gemmSetThreadGpu(0);
-
-    std::array<nn::Actor, 3> actor;
+    torch_nn::ModelConfig mcfg;
+    std::array<torch_nn::Actor, 3> actor{
+        torch_nn::Actor(mcfg),
+        torch_nn::Actor(mcfg),
+        torch_nn::Actor(mcfg)
+    };
     for (int s = 0; s < 3; ++s) {
-        actor[s].load((models + "/actor" + std::to_string(s) + ".bin").c_str());
-        actor[s].prepareInference();
+        actor[s]->load(models + "/actor" + std::to_string(s) + ".bin");
     }
 
     algo::DouZeroEvalConfig cfg;

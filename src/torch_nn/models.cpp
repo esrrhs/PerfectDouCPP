@@ -25,7 +25,7 @@ torch::Tensor ActorImpl::forward(const torch::Tensor& xImp,
                                  const torch::Tensor& seq,
                                  const torch::Tensor& actionFeat,
                                  const torch::Tensor& actionSample,
-                                 const torch::Tensor& actionId) {
+                                 const torch::Tensor& actionId) const {
     // seq: [B, 10, 540]
     auto lstmOut = lstm->forward(seq);
     // get last hidden state h_n: std::get<0>(std::get<1>(lstmOut)) has shape [1, B, lstmHidden]
@@ -92,7 +92,7 @@ CriticImpl::CriticImpl(const ModelConfig& cfg) : config(cfg) {
 
 torch::Tensor CriticImpl::forward(const torch::Tensor& xImp,
                                   const torch::Tensor& seq,
-                                  const torch::Tensor& extra) {
+                                  const torch::Tensor& extra) const {
     auto lstmOut = lstm->forward(seq);
     torch::Tensor hLast = std::get<0>(std::get<1>(lstmOut)).squeeze(0);
 

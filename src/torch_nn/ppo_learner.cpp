@@ -1,5 +1,6 @@
 #include "torch_nn/ppo_learner.h"
 #include <cmath>
+#include <filesystem>
 
 namespace torch_nn {
 
@@ -163,6 +164,57 @@ PPOStats PPOLearner::update(BatchTensors& batch) {
     }
 
     return stats;
+}
+
+void PPOLearner::saveOptimizer(const std::string& path) const {
+    torch::serialize::OutputArchive archive;
+    torch::serialize::OutputArchive aArchive;
+    actorOpt->save(aArchive);
+    archive.write("actor_opt", aArchive);
+
+    torch::serialize::OutputArchive cArchive;
+    criticOpt->save(cArchive);
+    archive.write("critic_opt", cArchive);
+
+    archive.save_to(path);
+}
+
+void PPOLearner::loadOptimizer(const std::string& path) {
+    if (!std::filesystem::exists(path)) return;
+    torch::serialize::InputArchive archive;
+    archive.load_from(path);
+
+    torch::serialize::InputArchive aArchive;
+    if (archive.try_read("actor_opt", aArchive)) {
+        actorOpt->load(aArchive);
+    }
+    torch::serialize::InputArchive cArchive;
+    if (archive.try_read("critic_opt", cArchive)) {
+        criticOpt->load(cArchive);
+    }
+}
+
+void PPOLearner::saveOptimizer(const std::string& actorOptPath, const std::string& criticOptPath) const {
+    torch::serialize::OutputArchive aArchive;
+    actorOpt->save(aArchive);
+    aArchive.save_to(actorOptPath);
+
+    torch::serialize::OutputArchive cArchive;
+    criticOpt->save(cArchive);
+    cArchive.save_to(criticOptPath);
+}
+
+void PPOLearner::loadOptimizer(const std::string& actorOptPath, const std::string& criticOptPath) {
+    if (std::filesystem::exists(actorOptPath)) {
+        torch::serialize::InputArchive aArchive;
+        aArchive.load_from(actorOptPath);
+        actorOpt->load(aArchive);
+    }
+    if (std::filesystem::exists(criticOptPath)) {
+        torch::serialize::InputArchive cArchive;
+        cArchive.load_from(criticOptPath);
+        criticOpt->load(cArchive);
+    }
 }
 
 }  // namespace torch_nn

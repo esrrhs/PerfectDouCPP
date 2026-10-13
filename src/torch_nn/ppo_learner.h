@@ -51,6 +51,11 @@ public:
 
     PPOStats update(BatchTensors& batch);
 
+    void saveOptimizer(const std::string& path) const;
+    void loadOptimizer(const std::string& path);
+    void saveOptimizer(const std::string& actorOptPath, const std::string& criticOptPath) const;
+    void loadOptimizer(const std::string& actorOptPath, const std::string& criticOptPath);
+
     Actor actor;
     Critic critic;
     PPOConfig config;
