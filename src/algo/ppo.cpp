@@ -1,6 +1,7 @@
 #include "algo/ppo.h"
 
 #include <cmath>
+#include <unordered_map>
 #include <vector>
 
 namespace algo {
@@ -9,25 +10,30 @@ void assignEpisodeReturns(std::vector<Transition>& tr, float gamma,
                           float lambda) {
     int N = static_cast<int>(tr.size());
     if (N == 0) return;
-    int maxGameId = 0;
-    for (const auto& t : tr) {
-        if (t.gameId > maxGameId) maxGameId = t.gameId;
-    }
-    // Linked list per gameId: head[gameId] points to latest transition,
-    // nextTr[i] points to previous transition in that game.
-    // Zero dynamic allocations beyond two flat vectors.
-    std::vector<int> head(maxGameId + 1, -1);
-    std::vector<int> nextTr(N, -1);
+    std::unordered_map<int, int> gidMap;
+    std::vector<int> localGid(N, -1);
+    int numGames = 0;
     for (int i = 0; i < N; ++i) {
         int gid = tr[i].gameId;
         if (gid >= 0) {
-            nextTr[i] = head[gid];
-            head[gid] = i;
+            auto [it, inserted] = gidMap.try_emplace(gid, numGames);
+            if (inserted) ++numGames;
+            localGid[i] = it->second;
+        }
+    }
+
+    std::vector<int> head(numGames, -1);
+    std::vector<int> nextTr(N, -1);
+    for (int i = 0; i < N; ++i) {
+        int g = localGid[i];
+        if (g >= 0) {
+            nextTr[i] = head[g];
+            head[g] = i;
         }
     }
 
     const float gaeFactor = gamma * lambda;
-    for (int g = 0; g <= maxGameId; ++g) {
+    for (int g = 0; g < numGames; ++g) {
         int curr = head[g];
         if (curr < 0) continue;
         float gae = 0.0f;

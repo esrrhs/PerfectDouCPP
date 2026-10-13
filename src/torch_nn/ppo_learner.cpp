@@ -127,9 +127,9 @@ PPOStats PPOLearner::update(BatchTensors& batch) {
                 torch::Tensor vClipped = oldValueMb + torch::clamp(values - oldValueMb, -config.vfClip, config.vfClip);
                 torch::Tensor vLoss1 = (values - retMb).pow(2);
                 torch::Tensor vLoss2 = (vClipped - retMb).pow(2);
-                vLoss = 0.5f * torch::max(vLoss1, vLoss2).mean();
+                vLoss = config.vfCoef * 0.5f * torch::max(vLoss1, vLoss2).mean();
             } else {
-                vLoss = 0.5f * (values - retMb).pow(2).mean();
+                vLoss = config.vfCoef * 0.5f * (values - retMb).pow(2).mean();
             }
 
             // Critic update

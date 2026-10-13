@@ -11,7 +11,7 @@ struct PPOConfig {
     float entCoef = 0.03f;
     float vfCoef = 0.5f;
     float maxGradNorm = 0.5f;
-    float criticMaxGradNorm = 0.5f;
+    float criticMaxGradNorm = 5.0f;
     int epochs = 2;
     int minibatch = 2048;
     float targetKL = 0.03f;

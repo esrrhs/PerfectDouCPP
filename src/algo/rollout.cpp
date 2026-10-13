@@ -296,7 +296,8 @@ void runWorker(const ModelSet& models, const RolloutConfig& cfg, int nGames,
         ++res.stats.games;
         if (g.winner == 0) ++res.stats.landlordWins;
         double mult = std::pow(2.0, g.bombCount);
-        long long scoreLL = g.winner == 0 ? llround(2.0 * mult) : -llround(2.0 * mult);
+        long long scoreLL = g.winner == 0 ? llround(cfg.landlordWinMul * mult)
+                                          : -llround(cfg.landlordLossMul * mult);
         res.stats.landlordScore += scoreLL;
 
         bool isPure = (gameSeats[gi][0].type == PLAYER_LATEST &&

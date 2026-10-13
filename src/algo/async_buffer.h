@@ -5,84 +5,81 @@
 #include <atomic>
 #include <condition_variable>
 #include <cstddef>
+#include <deque>
 #include <mutex>
 #include <vector>
 
 namespace algo {
 
-// Thread-safe Async Ring Replay Buffer for decoupling CPU rollout from GPU training.
-// Workers continuously push completed episode trajectories without blocking.
-// Learner samples continuous chunks from the ring buffer.
+struct RolloutChunk {
+    std::array<std::vector<Transition>, 3> streams;
+    RolloutStats stats;
+};
+
+// Thread-safe Async Bounded Pipeline Buffer for decoupling CPU rollout from GPU training.
+// Rollout workers continuously push completed episode chunks without blocking.
+// Learner pops complete fresh chunks, ensuring every trajectory is trained once without stale spinning.
 class AsyncReplayBuffer {
 public:
-    explicit AsyncReplayBuffer(size_t capacityTransitions = 32768)
-        : capacity(std::max<size_t>(capacityTransitions, 2048)) {
+    explicit AsyncReplayBuffer(size_t maxChunks = 4)
+        : maxCapacity(std::max<size_t>(maxChunks, 1)) {}
+
+    void push(RolloutChunk&& chunk, std::atomic<bool>& stopFlag) {
+        std::unique_lock<std::mutex> lock(mu);
+        cvNotFull.wait(lock, [&] {
+            return stopFlag.load() || queue.size() < maxCapacity;
+        });
+        if (stopFlag.load()) return;
         for (int s = 0; s < 3; ++s) {
-            storage[s].resize(capacity);
+            totalPushedTransitions[s] += chunk.streams[s].size();
         }
+        queue.push_back(std::move(chunk));
+        cvNotEmpty.notify_one();
     }
 
-    // Push transitions for a specific seat
-    void push(int seat, const std::vector<Transition>& trs) {
-        if (trs.empty() || seat < 0 || seat >= 3) return;
+    bool pop(RolloutChunk& chunk, std::atomic<bool>& stopFlag) {
         std::unique_lock<std::mutex> lock(mu);
-        for (const auto& t : trs) {
-            storage[seat][head[seat]] = t;
-            head[seat] = (head[seat] + 1) % capacity;
-            if (count[seat] < capacity) {
-                ++count[seat];
-            }
-        }
-        totalPushed[seat] += trs.size();
-        cv.notify_all();
+        cvNotEmpty.wait(lock, [&] {
+            return stopFlag.load() || !queue.empty();
+        });
+        if (queue.empty()) return false;
+        chunk = std::move(queue.front());
+        queue.pop_front();
+        cvNotFull.notify_one();
+        return true;
     }
 
-    // Wait until buffer has at least minCount transitions for the given seat
-    bool waitMinSamples(int seat, size_t minCount, std::atomic<bool>& stopFlag) {
+    bool waitMinChunks(size_t minCount, std::atomic<bool>& stopFlag) {
         std::unique_lock<std::mutex> lock(mu);
-        cv.wait(lock, [&] {
-            return stopFlag.load() || count[seat] >= minCount;
+        cvNotEmpty.wait(lock, [&] {
+            return stopFlag.load() || queue.size() >= minCount;
         });
         return !stopFlag.load();
     }
 
-    // Get current available count in buffer for seat
-    size_t size(int seat) const {
+    size_t size() const {
         std::lock_guard<std::mutex> lock(mu);
-        return count[seat];
+        return queue.size();
     }
 
-    // Sample the most recent N transitions (with episode GAE boundary safety)
-    std::vector<Transition> sampleRecent(int seat, size_t n) {
-        std::vector<Transition> res;
+    long long getTotalPushed(int seat) const {
         std::lock_guard<std::mutex> lock(mu);
-        size_t available = count[seat];
-        if (available == 0) return res;
-        size_t take = std::min(n, available);
-        res.reserve(take);
-
-        // Read backwards from current head
-        size_t startIdx = (head[seat] + capacity - take) % capacity;
-        for (size_t i = 0; i < take; ++i) {
-            size_t idx = (startIdx + i) % capacity;
-            res.push_back(storage[seat][idx]);
-        }
-        return res;
+        return (seat >= 0 && seat < 3) ? totalPushedTransitions[seat] : 0;
     }
 
     void notifyAll() {
         std::lock_guard<std::mutex> lock(mu);
-        cv.notify_all();
+        cvNotEmpty.notify_all();
+        cvNotFull.notify_all();
     }
 
 private:
-    size_t capacity;
+    size_t maxCapacity;
     mutable std::mutex mu;
-    std::condition_variable cv;
-    std::array<std::vector<Transition>, 3> storage;
-    std::array<size_t, 3> head{0, 0, 0};
-    std::array<size_t, 3> count{0, 0, 0};
-    std::array<size_t, 3> totalPushed{0, 0, 0};
+    std::condition_variable cvNotEmpty;
+    std::condition_variable cvNotFull;
+    std::deque<RolloutChunk> queue;
+    std::array<long long, 3> totalPushedTransitions{0, 0, 0};
 };
 
 }  // namespace algo
