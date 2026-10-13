@@ -1,11 +1,10 @@
-// PerfectDou CPP — self-play PPO training entry point (LibTorch Engine).
+// PerfectDou CPP — self-play PPO training entry point (LibTorch Async Buffer Architecture).
 //
-// Modern LibTorch-based PPO training:
-//   * three seat models (landlord / landlord_down / landlord_up), self-play
-//   * imperfect-information actor over concrete legal plays
-//   * perfect-information critic (sees all hands, PTIE / perfect information distillation)
-//   * PPO with GAE bootstrapped value targets and terminal ADP reward
-//   * LibTorch C++ autograd, optimizers, and CUDA/CPU tensor acceleration
+// Asynchronous Replay Buffer architecture:
+//   * CPU Rollout workers stream episodes into a high-capacity ring replay buffer
+//   * GPU PPOLearner continuously consumes mini-batches from the buffer without blocking
+//   * Non-blocking snapshot mechanism updates worker actors periodically (controlled policy lag)
+//   * Completely decouples CPU simulation from GPU tensor training
 //
 // Example:
 //   perfectdou_train --updates 200 --games 256 --threads 8 --out ckpt
@@ -37,6 +36,7 @@
 #include <powrprof.h>
 #endif
 
+#include "algo/async_buffer.h"
 #include "algo/eval_douzero.h"
 #include "algo/ppo.h"
 #include "algo/rollout.h"
@@ -57,7 +57,8 @@ struct Args {
     int epochs = 2;
     int minibatch = 2048;
     int snapshotEvery = 50;
-    int buffer = 4;
+    int bufferCap = 65536;         // Async Ring Buffer capacity in transitions
+    int warmup = 4096;             // Minimum transitions before GPU training kicks off
     float lr = 3e-4f;
     float clip = 0.2f;
     float ent = 0.03f;
@@ -116,7 +117,8 @@ void parseArgs(int argc, char** argv, Args& a) {
     a.epochs = std::atoi(argValue(argc, argv, "--epochs", std::to_string(a.epochs).c_str()));
     a.minibatch = std::atoi(argValue(argc, argv, "--mb", std::to_string(a.minibatch).c_str()));
     a.snapshotEvery = std::atoi(argValue(argc, argv, "--snapshot-every", std::to_string(a.snapshotEvery).c_str()));
-    a.buffer = std::atoi(argValue(argc, argv, "--buffer", std::to_string(a.buffer).c_str()));
+    a.bufferCap = std::atoi(argValue(argc, argv, "--buffer-cap", std::to_string(a.bufferCap).c_str()));
+    a.warmup = std::atoi(argValue(argc, argv, "--warmup", std::to_string(a.warmup).c_str()));
     a.lr = float(std::atof(argValue(argc, argv, "--lr", "3e-4")));
     a.clip = float(std::atof(argValue(argc, argv, "--clip", "0.2")));
     a.ent = float(std::atof(argValue(argc, argv, "--ent", "0.03")));
@@ -183,7 +185,7 @@ int main(int argc, char** argv) {
         }
     }
 
-    std::cout << "PerfectDou CPP training (LibTorch Architecture)\n";
+    std::cout << "PerfectDou CPP training (Async Buffer Architecture)\n";
     std::cout << "  Compute Device: " << (torchDevice == torch::kCUDA ? "GPU (CUDA)" : "CPU") << "\n";
     if (!args.resume.empty() && !hasFlag(argc, argv, "--start-update")) {
         std::string metaPath = args.resume + "/meta.txt";
@@ -201,9 +203,10 @@ int main(int argc, char** argv) {
 
     std::cout << "  updates=" << args.updates
               << (args.startUpdate > 1 ? " (start=" + std::to_string(args.startUpdate) + ")" : "")
-              << " games/update=" << args.games
-              << " buffer=" << args.buffer
+              << " games/chunk=" << args.games
               << " threads=" << args.threads
+              << " async_buffer_cap=" << args.bufferCap
+              << " warmup=" << args.warmup
               << " mb=" << args.minibatch
               << " epochs=" << args.epochs
               << " hidden=" << args.hidden
@@ -348,7 +351,6 @@ int main(int argc, char** argv) {
         std::lock_guard<std::mutex> lock(histPoolMu);
         auto oldPool = std::atomic_load(&histPool);
         auto newPool = std::make_shared<algo::HistoricalPool>(oldPool ? *oldPool : algo::HistoricalPool{});
-        // 1. Check if snapshot qualifies for long-term geometric/exponential archive
         int k = args.poolEvery > 0 ? (currentUpdate / args.poolEvery) : 0;
         bool isPowerOfTwo = (k > 0) && ((k & (k - 1)) == 0);
         bool isCentennial = (currentUpdate % 100 == 0);
@@ -363,7 +365,6 @@ int main(int argc, char** argv) {
             newPool->archive.push_back(snap);
         }
 
-        // 2. Add to recent rolling FIFO pool
         if (args.poolSize > 0) {
             while ((int)newPool->recent.size() >= args.poolSize && !newPool->recent.empty()) {
                 newPool->recent.erase(newPool->recent.begin());
@@ -373,8 +374,6 @@ int main(int argc, char** argv) {
         std::atomic_store(&histPool, std::shared_ptr<const algo::HistoricalPool>(newPool));
     };
 
-    // Inference copies are published by pointer. Rollout holds one snapshot
-    // for a whole chunk; learner updates live training models.
     struct InferPack {
         std::array<torch_nn::Actor, 3> actor;
         std::array<torch_nn::Critic, 3> critic;
@@ -398,100 +397,75 @@ int main(int argc, char** argv) {
     };
     std::shared_ptr<InferPack> live = makePack();
 
-    struct Sample {
-        std::array<std::vector<algo::Transition>, 3> streams;
-        algo::RolloutStats stats{};
-        double rollSecs = 0;
-        int trainCamp = -1;
-    };
-    struct Buffer {
-        std::mutex mu;
-        std::condition_variable cv;
-        std::deque<Sample> q;
-        int cap = 2;
-        bool stop = false;
-    } buf;
-    buf.cap = std::max(1, args.buffer);
+    // Async Ring Replay Buffer
+    algo::AsyncReplayBuffer replayBuffer(args.bufferCap);
+    std::atomic<bool> stopProducer{false};
+    std::atomic<long long> totalProducedTransitions{0};
 
-    std::thread producer([&] {
-        for (int chunk = args.startUpdate - 1; chunk < args.updates; ++chunk) {
-            {
-                std::lock_guard<std::mutex> lock(buf.mu);
-                if (buf.stop) return;
-            }
+    // Rollout stats aggregate
+    std::mutex statsMu;
+    algo::RolloutStats aggregateStats{};
+
+    // CPU Rollout Generator Threads (Continuously streaming into the replayBuffer)
+    std::thread producerThread([&]() {
+        uint64_t chunkSeed = args.seed;
+        int chunkIdx = 0;
+        while (!stopProducer.load()) {
             auto snap = std::atomic_load(&live);
             algo::ModelSet models{{&snap->actor[0], &snap->actor[1], &snap->actor[2]},
                                   {&snap->critic[0], &snap->critic[1], &snap->critic[2]}};
             algo::RolloutConfig rc;
             rc.gamesPerUpdate = args.games;
             rc.threads = args.threads;
-            rc.seed = args.seed + uint64_t(chunk + 1) * 7919ULL;
+            rc.seed = chunkSeed + uint64_t(++chunkIdx) * 7919ULL;
             rc.historicalProb = args.histProb;
             rc.ruleProb = args.ruleProb;
             rc.shapingCap = args.shapingCap;
             rc.landlordWinMul = args.landlordWinMul;
-            int currentCamp = -1;
-            if (args.campMode == "landlord") {
-                currentCamp = 0;
-            } else if (args.campMode == "peasant") {
-                currentCamp = 1;
-            } else if (args.campMode == "alt") {
-                currentCamp = (chunk % 2);  // even = landlord (0), odd = peasant (1)
-            }
-            rc.trainCamp = currentCamp;
+
             auto snapPool = std::atomic_load(&histPool);
             rc.historicalPool = snapPool.get();
-            Sample sample;
-            sample.trainCamp = currentCamp;
-            auto t0 = std::chrono::steady_clock::now();
-            algo::collectRollout(models, rc, sample.streams, sample.stats);
-            sample.rollSecs = std::chrono::duration<double>(
-                                  std::chrono::steady_clock::now() - t0)
-                                  .count();
-            {
-                std::unique_lock<std::mutex> lock(buf.mu);
-                buf.cv.wait(lock, [&] {
-                    return buf.stop || (int)buf.q.size() < buf.cap;
-                });
-                if (buf.stop) return;
-                double rollSecs = sample.rollSecs;
-                auto n0 = sample.stats.transitions[0];
-                auto n1 = sample.stats.transitions[1];
-                auto n2 = sample.stats.transitions[2];
-                buf.q.push_back(std::move(sample));
-                int queued = (int)buf.q.size();
-                std::printf(
-                    "buf chunk %d | rollout %.1fs | q %d/%d | games %d | n %lld/%lld/%lld\n",
-                    chunk + 1, rollSecs, queued, buf.cap, args.games,
-                    n0, n1, n2);
-                std::fflush(stdout);
+
+            std::array<std::vector<algo::Transition>, 3> streams;
+            algo::RolloutStats chunkStats;
+            algo::collectRollout(models, rc, streams, chunkStats);
+
+            if (stopProducer.load()) break;
+
+            long long newSteps = 0;
+            for (int s = 0; s < 3; ++s) {
+                newSteps += streams[s].size();
+                replayBuffer.push(s, streams[s]);
             }
-            buf.cv.notify_all();
+            totalProducedTransitions.fetch_add(newSteps);
+
+            {
+                std::lock_guard<std::mutex> lk(statsMu);
+                aggregateStats.games += chunkStats.games;
+                aggregateStats.landlordWins += chunkStats.landlordWins;
+                aggregateStats.landlordScore += chunkStats.landlordScore;
+                aggregateStats.pureSelfPlayGames += chunkStats.pureSelfPlayGames;
+                aggregateStats.pureSelfPlayWins += chunkStats.pureSelfPlayWins;
+                aggregateStats.pureSelfPlayScore += chunkStats.pureSelfPlayScore;
+                aggregateStats.bombs += chunkStats.bombs;
+                aggregateStats.moves += chunkStats.moves;
+                for (int s = 0; s < 3; ++s) {
+                    aggregateStats.transitions[s] += chunkStats.transitions[s];
+                }
+            }
         }
     });
+
+    std::cout << "Waiting for Async Buffer warmup (" << args.warmup << " samples)..." << std::endl;
+    for (int s = 0; s < 3; ++s) {
+        replayBuffer.waitMinSamples(s, args.warmup / 3, stopProducer);
+    }
+    std::cout << "Async Buffer warmup complete! Starting GPU training loop." << std::endl;
 
     std::array<algo::PPOStats, 3> ps{};
 
     for (int upd = args.startUpdate; upd <= args.updates; ++upd) {
         auto wall0 = std::chrono::steady_clock::now();
-        Sample sample;
-        int qReady = 0;
-        int qLeft = 0;
-        {
-            std::unique_lock<std::mutex> lock(buf.mu);
-            buf.cv.wait(lock, [&] { return buf.stop || !buf.q.empty(); });
-            if (buf.q.empty()) break;
-            qReady = (int)buf.q.size();
-            sample = std::move(buf.q.front());
-            buf.q.pop_front();
-            qLeft = (int)buf.q.size();
-        }
-        buf.cv.notify_all();
-        auto streams = std::move(sample.streams);
-        algo::RolloutStats rs = sample.stats;
-        double rollSecs = sample.rollSecs;
-        auto t1 = std::chrono::steady_clock::now();
-
         float progress = args.updates > 1
                              ? float(upd - 1) / float(args.updates - 1)
                              : 0.0f;
@@ -510,17 +484,27 @@ int main(int argc, char** argv) {
 
         // Determine which seats to train this update
         unsigned targetMask = 7u;
-        if (sample.trainCamp == 0) {
-            targetMask = (1u << 0);  // Landlord only
-        } else if (sample.trainCamp == 1) {
-            targetMask = (1u << 1) | (1u << 2);  // Peasant only
+        if (args.campMode == "landlord") {
+            targetMask = (1u << 0);
+        } else if (args.campMode == "peasant") {
+            targetMask = (1u << 1) | (1u << 2);
+        } else if (args.campMode == "alt") {
+            targetMask = (upd % 2 == 1) ? (1u << 0) : ((1u << 1) | (1u << 2));
         }
 
+        size_t samplesPerSeat = static_cast<size_t>(args.minibatch);
+        std::array<size_t, 3> actualSamples{};
+
+        auto tLearn0 = std::chrono::steady_clock::now();
         for (int s = 0; s < 3; ++s) {
             if ((targetMask & (1u << s)) == 0) continue;
+            auto seatSamples = replayBuffer.sampleRecent(s, samplesPerSeat);
+            actualSamples[s] = seatSamples.size();
+            if (seatSamples.empty()) continue;
+
             try {
                 auto batchTensors = torch_nn::transitionsToBatch(
-                    streams[s], args.gamma, args.lambda, torchDevice);
+                    seatSamples, args.gamma, args.lambda, torchDevice);
                 learners[s]->setLr(currentLr);
                 learners[s]->setEntCoef(currentEnt);
 
@@ -535,21 +519,23 @@ int main(int argc, char** argv) {
                 std::fprintf(stderr, "Seat %d update error: %s\n", s, e.what());
             }
         }
+        double learnSecs = std::chrono::duration<double>(
+                               std::chrono::steady_clock::now() - tLearn0)
+                               .count();
 
-        // Update live snapshot for rollout workers
+        // Atomically publish newly trained weights for background rollout workers
         std::atomic_store(&live, makePack());
 
-        double learnSecs = std::chrono::duration<double>(
-                               std::chrono::steady_clock::now() - t1)
-                               .count();
         double wallSecs = std::chrono::duration<double>(
                               std::chrono::steady_clock::now() - wall0)
                               .count();
-        int qEnd = 0;
+
+        algo::RolloutStats rs;
         {
-            std::lock_guard<std::mutex> lock(buf.mu);
-            qEnd = (int)buf.q.size();
+            std::lock_guard<std::mutex> lk(statsMu);
+            rs = aggregateStats;
         }
+
         double wp = double(rs.landlordWins) / std::max(1, rs.games);
         double adp = double(rs.landlordScore) / std::max(1, rs.games);
         double bpg = double(rs.bombs) / std::max(1, rs.games);
@@ -563,21 +549,26 @@ int main(int argc, char** argv) {
                           rs.pureSelfPlayGames);
             pureStr = pbuf;
         }
+
+        size_t buf0 = replayBuffer.size(0);
+        size_t buf1 = replayBuffer.size(1);
+        size_t buf2 = replayBuffer.size(2);
+
         std::printf(
-            "upd %4d | q %d/%d left %d end %d | wall %.1fs rollout %.1fs learn %.1fs "
-            "games %d mb %d ep %d,%d,%d/%d threads %d | WP %.3f ADP %7.2f%s bomb/g %.2f "
+            "upd %4d | buf [%zu,%zu,%zu] | wall %.1fs learn %.2fs "
+            "games %d mb %d ep %d,%d,%d/%d | WP %.3f ADP %7.2f%s bomb/g %.2f "
             "moves/g %.1f | lr %.2e ent %5.3f/%5.3f/%5.3f vL %7.2f/%7.2f/%7.2f "
-            "kl %.4f/%.4f/%.4f cf %.2f/%.2f/%.2f | ret %7.1f/%7.1f/%7.1f | n %lld/%lld/%lld\n",
-            upd, qReady, buf.cap, qLeft, qEnd, wallSecs, rollSecs, learnSecs,
+            "kl %.4f/%.4f/%.4f cf %.2f/%.2f/%.2f | train_n %zu/%zu/%zu | total_pushed %lld\n",
+            upd, buf0, buf1, buf2, wallSecs, learnSecs,
             rs.games, args.minibatch,
             ps[0].epochsCompleted, ps[1].epochsCompleted, ps[2].epochsCompleted,
-            args.epochs, args.threads, wp, adp, pureStr.c_str(), bpg, mpg,
+            args.epochs, wp, adp, pureStr.c_str(), bpg, mpg,
             currentLr, ps[0].entropy, ps[1].entropy, ps[2].entropy,
             ps[0].vLoss, ps[1].vLoss, ps[2].vLoss,
             ps[0].lastEpochKL, ps[1].lastEpochKL, ps[2].lastEpochKL,
             ps[0].clipFraction, ps[1].clipFraction, ps[2].clipFraction,
-            ps[0].meanRet, ps[1].meanRet, ps[2].meanRet,
-            rs.transitions[0], rs.transitions[1], rs.transitions[2]);
+            actualSamples[0], actualSamples[1], actualSamples[2],
+            totalProducedTransitions.load());
         std::fflush(stdout);
 
         if (args.poolEvery > 0 && upd % args.poolEvery == 0) {
@@ -627,12 +618,9 @@ int main(int argc, char** argv) {
         }
     }
 
-    {
-        std::lock_guard<std::mutex> lock(buf.mu);
-        buf.stop = true;
-    }
-    buf.cv.notify_all();
-    if (producer.joinable()) producer.join();
+    stopProducer.store(true);
+    replayBuffer.notifyAll();
+    if (producerThread.joinable()) producerThread.join();
 
     if (evalThread.joinable()) evalThread.join();
 
