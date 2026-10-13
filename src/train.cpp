@@ -57,8 +57,7 @@ struct Args {
     int epochs = 2;
     int minibatch = 2048;
     int snapshotEvery = 50;
-    int bufferCap = 65536;         // Async Ring Buffer capacity in transitions
-    int warmup = 4096;             // Minimum transitions before GPU training kicks off
+    int bufferChunks = 2;          // Async Pipeline Buffer capacity in chunks (2 = double buffering)
     float lr = 3e-4f;
     float clip = 0.2f;
     float ent = 0.03f;
@@ -116,8 +115,13 @@ void parseArgs(int argc, char** argv, Args& a) {
     a.epochs = std::atoi(argValue(argc, argv, "--epochs", std::to_string(a.epochs).c_str()));
     a.minibatch = std::atoi(argValue(argc, argv, "--mb", std::to_string(a.minibatch).c_str()));
     a.snapshotEvery = std::atoi(argValue(argc, argv, "--snapshot-every", std::to_string(a.snapshotEvery).c_str()));
-    a.bufferCap = std::atoi(argValue(argc, argv, "--buffer-cap", std::to_string(a.bufferCap).c_str()));
-    a.warmup = std::atoi(argValue(argc, argv, "--warmup", std::to_string(a.warmup).c_str()));
+    a.bufferChunks = std::atoi(argValue(argc, argv, "--buffer-chunks", std::to_string(a.bufferChunks).c_str()));
+    if (hasFlag(argc, argv, "--buffer-cap")) {
+        int cap = std::atoi(argValue(argc, argv, "--buffer-cap", "0"));
+        if (cap > 0) {
+            a.bufferChunks = std::max<int>(2, cap / std::max(1, a.games * 8));
+        }
+    }
     a.lr = float(std::atof(argValue(argc, argv, "--lr", "3e-4")));
     a.clip = float(std::atof(argValue(argc, argv, "--clip", "0.2")));
     a.ent = float(std::atof(argValue(argc, argv, "--ent", "0.03")));
@@ -201,8 +205,7 @@ int main(int argc, char** argv) {
               << (args.startUpdate > 1 ? " (start=" + std::to_string(args.startUpdate) + ")" : "")
               << " games/chunk=" << args.games
               << " threads=" << args.threads
-              << " async_buffer_cap=" << args.bufferCap
-              << " warmup=" << args.warmup
+              << " buffer_chunks=" << args.bufferChunks
               << " mb=" << args.minibatch
               << " epochs=" << args.epochs
               << " hidden=" << args.hidden
@@ -394,8 +397,8 @@ int main(int argc, char** argv) {
     std::shared_ptr<InferPack> live = makePack();
     std::mutex liveMu;
 
-    // Async Pipeline Replay Buffer
-    size_t maxChunks = std::max<size_t>(2, args.bufferCap / std::max(1, args.games * 8));
+    // Async Pipeline Replay Buffer (double buffering by default to strictly bound policy staleness <= 1)
+    size_t maxChunks = std::max<size_t>(2, static_cast<size_t>(args.bufferChunks));
     algo::AsyncReplayBuffer replayBuffer(maxChunks);
     std::atomic<bool> stopProducer{false};
     std::atomic<long long> totalProducedTransitions{0};

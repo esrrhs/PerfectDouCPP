@@ -68,7 +68,7 @@ jobs:
           elif [ -f "./build/Release/perfectdou_train" ]; then
             TRAIN_BIN="./build/Release/perfectdou_train"
           fi
-          $TRAIN_BIN --updates 2 --games 16 --warmup 256 --mb 64 --epochs 2 --threads 2 --pool-every 1 \
+          $TRAIN_BIN --updates 2 --games 16 --mb 64 --epochs 2 --threads 2 --pool-every 1 \
             --eval-every 1 --eval-decks 1 --eval-port 19999 \
             --eval-save-dir build/ci_eval_snapshots --eval-csv build/ci_eval.csv
 
