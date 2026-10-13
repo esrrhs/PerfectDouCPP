@@ -266,7 +266,7 @@ void runWorker(const ModelSet& models, const RolloutConfig& cfg, int nGames,
                 } else {
                     r = float(g.payoff(s));
                 }
-                t.reward += r + g.shaping(s, cfg.shapingCap);
+                t.reward += r;
                 t.terminal = true;
             }
         }

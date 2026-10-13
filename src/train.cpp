@@ -66,7 +66,6 @@ struct Args {
     float targetKL = 0.03f;
     bool clipVf = false;
     float vfClip = 32.0f;
-    float shapingCap = 0.05f;
     float landlordWinMul = 2.0f;
     float landlordLossMul = 2.0f;
     bool lrDecay = true;
@@ -129,7 +128,6 @@ void parseArgs(int argc, char** argv, Args& a) {
     a.lambda = float(std::atof(argValue(argc, argv, "--lambda", "0.95")));
     a.targetKL = float(std::atof(argValue(argc, argv, "--target-kl", "0.03")));
     a.vfClip = float(std::atof(argValue(argc, argv, "--vf-clip", "32.0")));
-    a.shapingCap = float(std::atof(argValue(argc, argv, "--shaping-cap", "0.05")));
     a.landlordWinMul = float(std::atof(argValue(argc, argv, "--landlord-win-mul", "2.0")));
     a.landlordLossMul = float(std::atof(argValue(argc, argv, "--landlord-loss-mul", "2.0")));
     if (hasFlag(argc, argv, "--clip-vf")) a.clipVf = true;
@@ -439,7 +437,6 @@ int main(int argc, char** argv) {
             rc.seed = chunkSeed + uint64_t(++chunkIdx) * 7919ULL;
             rc.historicalProb = args.histProb;
             rc.ruleProb = args.ruleProb;
-            rc.shapingCap = args.shapingCap;
             rc.landlordWinMul = args.landlordWinMul;
             rc.landlordLossMul = args.landlordLossMul;
 
