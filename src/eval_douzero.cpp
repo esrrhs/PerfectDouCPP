@@ -6,6 +6,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <string>
 
 #include "algo/eval_douzero.h"
@@ -45,7 +46,14 @@ int main(int argc, char** argv) {
         torch_nn::Actor(mcfg)
     };
     for (int s = 0; s < 3; ++s) {
-        actor[s]->load(models + "/actor" + std::to_string(s) + ".bin");
+        std::string pt = models + "/actor" + std::to_string(s) + ".pt";
+        std::string bin = models + "/actor" + std::to_string(s) + ".bin";
+        std::error_code ec;
+        if (std::filesystem::exists(pt, ec)) {
+            actor[s]->load(pt);
+        } else {
+            actor[s]->load(bin);
+        }
     }
 
     algo::DouZeroEvalConfig cfg;
