@@ -52,8 +52,8 @@ struct Args {
     int startUpdate = 1;
     int games = 768;
     int threads = std::clamp(static_cast<int>(std::thread::hardware_concurrency()), 1, 16);
-    int hidden = 1024;
-    int lstmHidden = 256;
+    int hidden = 256;
+    int lstmHidden = 128;
     int epochs = 2;
     int minibatch = 2048;
     int snapshotEvery = 50;
@@ -79,7 +79,7 @@ struct Args {
     uint64_t seed = 1;
     std::string out = "ckpt_long";
     std::string resume;
-    std::string backend = "auto";  // auto | cuda | cpu
+    std::string backend = "cpu";   // cuda | mps | cpu (explicit, no auto-detection)
     int evalEvery = 200;           // eval vs DouZero every 200 updates
     int evalDecks = 1000;          // 1000 decks = 2000 games (swapped seats)
     int evalPort = 18765;          // DouZero TCP server port
@@ -173,20 +173,38 @@ int main(int argc, char** argv) {
     if (args.threads <= 0) args.threads = 1;
 
     torch::Device torchDevice = torch::kCPU;
+    std::string deviceName = "CPU";
     if (args.backend == "cuda") {
         if (!torch::cuda::is_available()) {
-            std::fprintf(stderr, "CUDA requested but not available in LibTorch! Falling back to CPU.\n");
-        } else {
-            torchDevice = torch::kCUDA;
+            std::fprintf(stderr,
+                         "Backend 'cuda' requested but CUDA is not available in this LibTorch build. "
+                         "Pass --backend mps or --backend cpu explicitly.\n");
+            return 1;
         }
-    } else if (args.backend == "auto") {
-        if (torch::cuda::is_available()) {
-            torchDevice = torch::kCUDA;
+        torchDevice = torch::kCUDA;
+        deviceName = "GPU (CUDA)";
+    } else if (args.backend == "mps") {
+        if (!torch::mps::is_available()) {
+            std::fprintf(stderr,
+                         "Backend 'mps' requested but MPS is not available (requires macOS 12.3+ on "
+                         "Apple Silicon with an MPS-enabled LibTorch). Pass --backend cpu explicitly.\n");
+            return 1;
         }
+        torchDevice = torch::kMPS;
+        deviceName = "GPU (MPS)";
+    } else if (args.backend == "cpu") {
+        torchDevice = torch::kCPU;
+        deviceName = "CPU";
+    } else {
+        std::fprintf(stderr,
+                     "Unknown or unsupported backend '%s'. Valid values: cuda | mps | cpu "
+                     "(no auto-detection).\n",
+                     args.backend.c_str());
+        return 1;
     }
 
     std::cout << "PerfectDou CPP training (Async Buffer Architecture)\n";
-    std::cout << "  Compute Device: " << (torchDevice == torch::kCUDA ? "GPU (CUDA)" : "CPU") << "\n";
+    std::cout << "  Compute Device: " << deviceName << "\n";
     if (!args.resume.empty() && !hasFlag(argc, argv, "--start-update")) {
         std::string metaPath = args.resume + "/meta.txt";
         std::ifstream metaFile(metaPath);

@@ -142,9 +142,9 @@ python tools/douzero_serve.py --port 18765 --ckpt-dir baselines/douzero_ADP
     --hidden 128 --epochs 2 --out ckpt
 ```
 
-> **硬件加速后端说明**：
-> - **Apple Silicon (macOS)**：默认走 Accelerate / AMX 硬件加速矩阵乘，LSTM 走 vForce；
-> - **Windows / Linux**：`--backend auto` 优先检测并使用 CUDA（cuBLAS GEMM），无 GPU 时自动回退至高优化 CPU 向量化路径；
+> **硬件加速后端说明**（`--backend` 必须显式指定，不做自动探测；设备不可用直接报错退出）：
+> - **Apple Silicon (macOS)**：`--backend mps` 使用 Metal/MPS GPU；`--backend cpu` 使用 CPU；
+> - **Windows / Linux + NVIDIA**：`--backend cuda` 使用 cuBLAS 等 CUDA 算子；无 GPU 或非 NVIDIA 平台请显式使用 `--backend cpu`；
 > - 自对弈采样在 x86-64 上固定走 AVX2/FMA 指令集，兼顾高吞吐与多核并发。
 
 ### 3. 训练日志与监控指标

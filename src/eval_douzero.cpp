@@ -35,11 +35,14 @@ int main(int argc, char** argv) {
     if (models.empty() || decks <= 0) {
         std::fprintf(stderr,
                      "usage: perfectdou_eval --models DIR --decks N [--port P] [--host H] "
+                     "[--hidden H] [--lstm-hidden L] "
                      "[--eval-data FILE] [--csv FILE] [--label L] [--seed S]\n");
         return 2;
     }
 
     torch_nn::ModelConfig mcfg;
+    mcfg.hidden = std::atoi(argValue(argc, argv, "--hidden", std::to_string(mcfg.hidden).c_str()).c_str());
+    mcfg.lstmHidden = std::atoi(argValue(argc, argv, "--lstm-hidden", std::to_string(mcfg.lstmHidden).c_str()).c_str());
     std::array<torch_nn::Actor, 3> actor{
         torch_nn::Actor(mcfg),
         torch_nn::Actor(mcfg),

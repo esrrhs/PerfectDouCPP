@@ -14,8 +14,8 @@ constexpr int64_t kNumActions = 2048;
 constexpr int64_t kActionInput = 186;
 
 struct ModelConfig {
-    int64_t hidden = 1024;
-    int64_t lstmHidden = 256;
+    int64_t hidden = 256;
+    int64_t lstmHidden = 128;
 };
 
 // Actor (Imperfect Information Policy Network)
