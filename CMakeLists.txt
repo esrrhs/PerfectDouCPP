@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.12)
 project(PerfectDouCPP LANGUAGES CXX)
 
-set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
@@ -12,6 +12,9 @@ endif()
 set(CMAKE_CXX_FLAGS_RELEASE "-O2 -DNDEBUG")
 
 find_package(Threads REQUIRED)
+
+find_package(Torch REQUIRED)
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${TORCH_CXX_FLAGS}")
 
 add_library(perfectdou STATIC
   src/ddz/cards.cpp
@@ -26,9 +29,13 @@ add_library(perfectdou STATIC
   src/algo/rollout.cpp
   src/algo/ppo.cpp
   src/algo/eval_douzero.cpp
+  src/torch_nn/models.cpp
+  src/torch_nn/ppo_learner.cpp
+  src/torch_nn/tensor_bridge.cpp
+  src/torch_nn/weight_sync.cpp
 )
-target_include_directories(perfectdou PUBLIC src)
-target_link_libraries(perfectdou PUBLIC Threads::Threads)
+target_include_directories(perfectdou PUBLIC src ${TORCH_INCLUDE_DIRS})
+target_link_libraries(perfectdou PUBLIC Threads::Threads ${TORCH_LIBRARIES})
 
 if(APPLE)
   target_link_libraries(perfectdou PUBLIC "-framework Accelerate")
@@ -106,4 +113,8 @@ gtest_discover_tests(test_gemm)
 add_executable(test_algo tests/test_algo.cpp)
 target_link_libraries(test_algo PRIVATE perfectdou GTest::gtest_main)
 gtest_discover_tests(test_algo)
+
+add_executable(test_torch_nn tests/test_torch_nn.cpp)
+target_link_libraries(test_torch_nn PRIVATE perfectdou GTest::gtest_main)
+gtest_discover_tests(test_torch_nn)
 

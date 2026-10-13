@@ -40,6 +40,10 @@
 #include "algo/ppo.h"
 #include "algo/rollout.h"
 #include "ddz/oracle.h"
+#include "torch_nn/models.h"
+#include "torch_nn/ppo_learner.h"
+#include "torch_nn/tensor_bridge.h"
+#include "torch_nn/weight_sync.h"
 
 namespace {
 
@@ -172,51 +176,21 @@ int main(int argc, char** argv) {
                      "NVIDIA drivers). Use --backend cuda or --backend cpu.\n");
         return 1;
     }
-    if (args.backend != "auto" && args.backend != "cuda" &&
-        args.backend != "cpu") {
-        std::fprintf(stderr,
-                     "unknown --backend %s (expected auto|cuda|cpu)\n",
-                     args.backend.c_str());
-        return 1;
-    }
-
-    nn::gemmInit();
-#if defined(_WIN32)
-    // Windows GPU path is CUDA-only. auto falls back to CPU when cuBLAS is
-    // unavailable (no toolkit / not built with PD_HAVE_CUBLAS).
-    const bool wantCuda = args.backend == "cuda" || args.backend == "auto";
-    if (args.backend == "cpu") {
-        nn::gemmSetGpu(false);
-    } else if (wantCuda) {
-        _putenv_s("PD_CUBLAS", "1");
-        nn::gemmSetGpu(true);
-        if (!nn::gemmGpuEnabled()) {
-            if (args.backend == "cuda") {
-                std::fprintf(stderr,
-                             "--backend cuda unavailable: %s\n"
-                             "Install CUDA Toolkit, reconfigure/rebuild, then "
-                             "retry (or use --backend cpu).\n",
-                             nn::gemmCudaError());
-                return 1;
-            }
-            nn::gemmSetGpu(false);
+    torch::Device torchDevice = torch::kCPU;
+    if (args.backend == "cuda") {
+        if (!torch::cuda::is_available()) {
+            std::fprintf(stderr, "CUDA requested but not available in LibTorch! Falling back to CPU.\n");
+        } else {
+            torchDevice = torch::kCUDA;
+        }
+    } else if (args.backend == "auto") {
+        if (torch::cuda::is_available()) {
+            torchDevice = torch::kCUDA;
         }
     }
-#else
-    if (args.backend == "cuda") {
-        std::fprintf(stderr, "--backend cuda is Windows-only; use --backend cpu\n");
-        return 1;
-    }
-    nn::gemmSetGpu(false);
-#endif
-    std::cout << "PerfectDou CPP training\n";
-    const char* backend = nn::gemmGpuEnabled() ? nn::gemmGpuLabel() :
-#ifdef __APPLE__
-                          "CPU (Accelerate)";
-#else
-                          "CPU";
-#endif
-    std::cout << "  GEMM backend: " << backend << "\n";
+
+    std::cout << "PerfectDou CPP training (LibTorch Architecture)\n";
+    std::cout << "  Compute Device: " << (torchDevice == torch::kCUDA ? "GPU (CUDA)" : "CPU") << "\n";
     if (!args.resume.empty() && !hasFlag(argc, argv, "--start-update")) {
         std::string metaPath = args.resume + "/meta.txt";
         std::ifstream metaFile(metaPath);
@@ -308,6 +282,38 @@ int main(int argc, char** argv) {
     ppo.targetKL = args.targetKL;
     ppo.clipVf = args.clipVf;
     ppo.vfClip = args.vfClip;
+
+    torch_nn::ModelConfig torchModelCfg;
+    torchModelCfg.hidden = args.hidden;
+    torchModelCfg.lstmHidden = args.lstmHidden;
+
+    torch_nn::PPOConfig torchPpoCfg;
+    torchPpoCfg.lr = args.lr;
+    torchPpoCfg.clip = args.clip;
+    torchPpoCfg.entCoef = args.ent;
+    torchPpoCfg.epochs = args.epochs;
+    torchPpoCfg.minibatch = args.minibatch;
+    torchPpoCfg.targetKL = args.targetKL;
+    torchPpoCfg.clipVf = args.clipVf;
+    torchPpoCfg.vfClip = args.vfClip;
+
+    std::array<torch_nn::Actor, 3> torchActor{
+        torch_nn::Actor(torchModelCfg),
+        torch_nn::Actor(torchModelCfg),
+        torch_nn::Actor(torchModelCfg)
+    };
+    std::array<torch_nn::Critic, 3> torchCritic{
+        torch_nn::Critic(torchModelCfg),
+        torch_nn::Critic(torchModelCfg),
+        torch_nn::Critic(torchModelCfg)
+    };
+    std::vector<std::unique_ptr<torch_nn::PPOLearner>> torchLearners;
+    for (int s = 0; s < 3; ++s) {
+        torch_nn::syncLegacyToTorchActor(actor[s], torchActor[s]);
+        torch_nn::syncLegacyToTorchCritic(critic[s], torchCritic[s]);
+        torchLearners.push_back(std::make_unique<torch_nn::PPOLearner>(
+            torchActor[s], torchCritic[s], torchPpoCfg, torchDevice));
+    }
 
     auto saveAll = [&](const std::string& dir, int currentUpd = 0) {
         std::filesystem::create_directories(dir);
@@ -448,10 +454,24 @@ int main(int argc, char** argv) {
                     if ((mask & (1u << s)) == 0) continue;
                     std::fprintf(stderr, "seat %d update %d\n", s, upd);
                     std::fflush(stderr);
-                    nn::Rng64 ur(args.seed * 100000 + upd * 31 + s);
-                    if (!algo::ppoUpdate(actor[s], critic[s], streams[s], ppo,
-                                         aOpt[s], cOpt[s], ur, ps[s]))
+                    try {
+                        auto batchTensors = torch_nn::transitionsToBatch(
+                            streams[s], ppo.gamma, ppo.lambda, torchDevice);
+                        torchLearners[s]->setLr(aOpt[s].lr);
+                        torchLearners[s]->setEntCoef(ppo.entCoef);
+
+                        auto torchStats = torchLearners[s]->update(batchTensors);
+                        ps[s].epochsCompleted = torchStats.epochsCompleted;
+                        ps[s].entropy = torchStats.entropy;
+                        ps[s].lastEpochKL = torchStats.kl;
+                        ps[s].clipFraction = torchStats.clipFraction;
+
+                        torch_nn::syncTorchToLegacyActor(torchActor[s], actor[s]);
+                        torch_nn::syncTorchToLegacyCritic(torchCritic[s], critic[s]);
+                    } catch (const std::exception& e) {
+                        std::fprintf(stderr, "seat %d error: %s\n", s, e.what());
                         failed |= 1u << s;
+                    }
                 }
                 return failed;
             };
@@ -560,10 +580,24 @@ int main(int argc, char** argv) {
                 if (phase == 1) {
                     nn::gpuReleaseThread();
                 } else if (mask & (1u << s)) {
-                    nn::Rng64 ur(args.seed * 100000 + upd * 31 + s);
-                    bool ok = algo::ppoUpdate(actor[s], critic[s], streams[s],
-                                              ppo, aOpt[s], cOpt[s], ur, ps[s]);
-                    if (!ok) {
+                    try {
+                        auto batchTensors = torch_nn::transitionsToBatch(
+                            streams[s], ppo.gamma, ppo.lambda, torchDevice);
+                        torchLearners[s]->setLr(aOpt[s].lr);
+                        torchLearners[s]->setEntCoef(ppo.entCoef);
+
+                        auto torchStats = torchLearners[s]->update(batchTensors);
+                        ps[s].epochsCompleted = torchStats.epochsCompleted;
+                        ps[s].entropy = torchStats.entropy;
+                        ps[s].lastEpochKL = torchStats.kl;
+                        ps[s].clipFraction = torchStats.clipFraction;
+
+                        // Synchronize trained LibTorch weights back to actor[s] and critic[s]
+                        // for Rollout workers and League snapshot pools
+                        torch_nn::syncTorchToLegacyActor(torchActor[s], actor[s]);
+                        torch_nn::syncTorchToLegacyCritic(torchCritic[s], critic[s]);
+                    } catch (const std::exception& e) {
+                        std::fprintf(stderr, "Seat %d update error: %s\n", s, e.what());
                         std::lock_guard<std::mutex> lock(job.mu);
                         job.failed |= 1u << s;
                     }
