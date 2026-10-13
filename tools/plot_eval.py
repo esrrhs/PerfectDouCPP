@@ -99,7 +99,42 @@ def compute_smooth(y: np.ndarray, base_alpha: float = 0.3) -> tuple[np.ndarray, 
     return smoothed, stds
 
 
+def save_figure_safely(fig, out_png: Path) -> bool:
+    """Safely save figure handling Windows file locking (e.g. image open in viewer)."""
+    out_png.parent.mkdir(parents=True, exist_ok=True)
+    temp_png = out_png.with_suffix(".tmp.png")
+    for attempt in range(4):
+        try:
+            fig.savefig(temp_png, dpi=140)
+            if out_png.exists():
+                try:
+                    temp_png.replace(out_png)
+                except OSError:
+                    # On Windows, replace may fail if destination is locked
+                    time.sleep(0.5)
+                    temp_png.replace(out_png)
+            else:
+                temp_png.replace(out_png)
+            return True
+        except (PermissionError, OSError) as e:
+            if attempt < 3:
+                time.sleep(0.6)
+            else:
+                print(f"[EvalPlotter] Warning: {out_png.name} is currently locked by another program. Will retry next check.", flush=True)
+        except Exception as e:
+            print(f"[EvalPlotter] Save error: {e}", flush=True)
+            break
+        finally:
+            if temp_png.is_file():
+                try:
+                    temp_png.unlink(missing_ok=True)
+                except Exception:
+                    pass
+    return False
+
+
 def plot_single(parsed: list[dict], out_png: Path, x_col: str = "update") -> bool:
+
     if not parsed:
         return False
     x = np.array([p["x"] for p in parsed], dtype=float)
@@ -163,10 +198,11 @@ def plot_single(parsed: list[dict], out_png: Path, x_col: str = "update") -> boo
     ax2.legend(loc="best", framealpha=0.9, ncol=2)
 
     fig.tight_layout()
-    out_png.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(out_png, dpi=140)
-    plt.close(fig)
-    return True
+    try:
+        saved = save_figure_safely(fig, out_png)
+    finally:
+        plt.close(fig)
+    return saved
 
 
 def plot_comparison(datasets: list[tuple[str, list[dict]]], out_png: Path, x_col: str = "update") -> bool:
@@ -216,10 +252,11 @@ def plot_comparison(datasets: list[tuple[str, list[dict]]], out_png: Path, x_col
     ax2.legend(loc="best", framealpha=0.9, ncol=2)
 
     fig.tight_layout()
-    out_png.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(out_png, dpi=140)
-    plt.close(fig)
-    return True
+    try:
+        saved = save_figure_safely(fig, out_png)
+    finally:
+        plt.close(fig)
+    return saved
 
 
 def main() -> int:
@@ -239,13 +276,17 @@ def main() -> int:
         labels = [p.parent.name if p.parent.name else p.stem for p in csv_paths]
 
     def render() -> bool:
-        datasets = []
-        for label, p in zip(labels, csv_paths):
-            if p.is_file():
-                datasets.append((label, read_eval_csv(p)))
-        if not datasets:
+        try:
+            datasets = []
+            for label, p in zip(labels, csv_paths):
+                if p.is_file():
+                    datasets.append((label, read_eval_csv(p)))
+            if not datasets:
+                return False
+            return plot_comparison(datasets, out_png, args.x)
+        except Exception as e:
+            print(f"[EvalPlotter] Render error: {e}", flush=True)
             return False
-        return plot_comparison(datasets, out_png, args.x)
 
     if args.watch > 0:
         print(f"[EvalPlotter] Monitoring {len(csv_paths)} CSV(s) every {args.watch}s -> {out_png}", flush=True)
@@ -257,20 +298,25 @@ def main() -> int:
         this_script = Path(__file__).resolve()
         script_mtime = this_script.stat().st_mtime
         while True:
-            changed = False
-            for p in csv_paths:
-                if p.is_file():
-                    mt = p.stat().st_mtime
-                    if last_mtimes.get(str(p)) != mt:
-                        changed = True
-                        last_mtimes[str(p)] = mt
-            if this_script.stat().st_mtime != script_mtime:
-                # If script was edited, exit watch loop so supervisor can restart or user gets new behavior
-                break
-            if changed:
-                if render():
-                    print(f"[EvalPlotter] [{time.strftime('%H:%M:%S')}] Updated {out_png}", flush=True)
-            time.sleep(args.watch)
+            try:
+                changed = False
+                for p in csv_paths:
+                    if p.is_file():
+                        mt = p.stat().st_mtime
+                        if last_mtimes.get(str(p)) != mt:
+                            changed = True
+                            last_mtimes[str(p)] = mt
+                if this_script.stat().st_mtime != script_mtime:
+                    # If script was edited, exit watch loop so supervisor can restart or user gets new behavior
+                    break
+                if changed:
+                    if render():
+                        print(f"[EvalPlotter] [{time.strftime('%H:%M:%S')}] Updated {out_png}", flush=True)
+                time.sleep(args.watch)
+            except Exception as e:
+                print(f"[EvalPlotter] Loop error: {e}", flush=True)
+                time.sleep(args.watch)
+
     else:
         if render():
             print(f"Successfully generated plot at {out_png}")
