@@ -68,8 +68,8 @@ struct Args {
     bool clipVf = false;
     float vfClip = 32.0f;
     float shapingCap = 0.05f;
-    float landlordWinMul = 2.5f;
-    float landlordLossMul = 1.5f;
+    float landlordWinMul = 2.0f;
+    float landlordLossMul = 2.0f;
     bool independentPeasants = true;
     std::string campMode = "all";  // "all" = train all together, "alt" = alternate landlord/peasant, "landlord" = landlord only, "peasant" = peasant only
     bool lrDecay = true;
@@ -128,8 +128,8 @@ void parseArgs(int argc, char** argv, Args& a) {
     a.targetKL = float(std::atof(argValue(argc, argv, "--target-kl", "0.03")));
     a.vfClip = float(std::atof(argValue(argc, argv, "--vf-clip", "32.0")));
     a.shapingCap = float(std::atof(argValue(argc, argv, "--shaping-cap", "0.05")));
-    a.landlordWinMul = float(std::atof(argValue(argc, argv, "--landlord-win-mul", "2.5")));
-    a.landlordLossMul = float(std::atof(argValue(argc, argv, "--landlord-loss-mul", "1.5")));
+    a.landlordWinMul = float(std::atof(argValue(argc, argv, "--landlord-win-mul", "2.0")));
+    a.landlordLossMul = float(std::atof(argValue(argc, argv, "--landlord-loss-mul", "2.0")));
     if (hasFlag(argc, argv, "--no-independent-peasants") || hasFlag(argc, argv, "--coupled-peasants")) {
         a.independentPeasants = false;
     }
