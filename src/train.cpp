@@ -430,6 +430,9 @@ int main(int argc, char** argv) {
             rc.landlordWinMul = args.landlordWinMul;
             rc.landlordLossMul = args.landlordLossMul;
             rc.independentPeasants = args.independentPeasants;
+            if (args.campMode == "landlord") rc.trainCamp = 0;
+            else if (args.campMode == "peasant") rc.trainCamp = 1;
+            else rc.trainCamp = -1;
 
             std::shared_ptr<const algo::HistoricalPool> snapPool;
             {
@@ -491,8 +494,28 @@ int main(int argc, char** argv) {
             targetMask = (upd % 2 == 1) ? (1u << 0) : ((1u << 1) | (1u << 2));
         }
 
+        static algo::RolloutChunk altCachedChunk;
+        static bool hasAltChunk = false;
+
         algo::RolloutChunk currentChunk;
-        if (!replayBuffer.pop(currentChunk, stopProducer)) break;
+        if (args.campMode == "alt") {
+            if (upd % 2 == 1) {
+                // Odd update: fetch fresh chunk, train landlord, preserve chunk for peasants
+                if (!replayBuffer.pop(altCachedChunk, stopProducer)) break;
+                hasAltChunk = true;
+                currentChunk = altCachedChunk;
+            } else {
+                // Even update: train peasants on the preserved chunk
+                if (hasAltChunk) {
+                    currentChunk = std::move(altCachedChunk);
+                    hasAltChunk = false;
+                } else {
+                    if (!replayBuffer.pop(currentChunk, stopProducer)) break;
+                }
+            }
+        } else {
+            if (!replayBuffer.pop(currentChunk, stopProducer)) break;
+        }
 
         std::array<size_t, 3> actualSamples{};
         auto tLearn0 = std::chrono::steady_clock::now();
