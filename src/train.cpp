@@ -71,7 +71,7 @@ struct Args {
     float landlordWinMul = 2.5f;
     float landlordLossMul = 1.5f;
     bool independentPeasants = true;
-    std::string campMode = "alt";  // "all" = train all together, "alt" = alternate landlord/peasant, "landlord" = landlord only, "peasant" = peasant only
+    std::string campMode = "all";  // "all" = train all together, "alt" = alternate landlord/peasant, "landlord" = landlord only, "peasant" = peasant only
     bool lrDecay = true;
     bool entDecay = true;
     int poolSize = 16;
@@ -89,6 +89,7 @@ struct Args {
     std::string evalHost = "127.0.0.1";
     std::string evalCsv;           // empty = default to <out>/eval_vs_douzero.csv
     std::string evalSaveDir;       // empty = default to <out>/eval_snapshots
+    std::string evalData = "data/eval_data.bin"; // path to eval_data.bin or eval_data.pkl
     bool evalSave = true;          // whether to save evaluated models to disk
     int evalMaxSnapshots = 0;      // 0 = keep all, > 0 = keep at most N recent snapshots on disk
     bool evalAsync = true;         // evaluate in background thread
@@ -156,6 +157,7 @@ void parseArgs(int argc, char** argv, Args& a) {
     a.evalHost = argValue(argc, argv, "--eval-host", "127.0.0.1");
     a.evalCsv = argValue(argc, argv, "--eval-csv", "");
     a.evalSaveDir = argValue(argc, argv, "--eval-save-dir", "");
+    a.evalData = argValue(argc, argv, "--eval-data", a.evalData.c_str());
     a.evalMaxSnapshots = std::atoi(argValue(argc, argv, "--eval-max-snapshots", "0"));
     if (hasFlag(argc, argv, "--no-eval-save")) {
         a.evalSave = false;
@@ -235,6 +237,7 @@ int main(int argc, char** argv) {
                   << " decks=" << args.evalDecks << " (" << (args.evalDecks * 2) << " games)"
                   << " target=" << args.evalHost << ":" << args.evalPort
                   << " mode=" << (args.evalAsync ? "async" : "sync")
+                  << " data=" << (args.evalData.empty() ? "random" : args.evalData)
                   << " csv=" << args.evalCsv;
         if (args.evalSave) {
             std::cout << " snapshots=" << args.evalSaveDir;
@@ -604,6 +607,7 @@ int main(int argc, char** argv) {
             evalCfg.decks = args.evalDecks;
             evalCfg.seed = static_cast<uint64_t>(upd * 10007 + 1);
             evalCfg.csvPath = args.evalCsv;
+            evalCfg.dataPath = args.evalData;
             evalCfg.label = "u" + std::to_string(upd);
             evalCfg.saveDir = args.evalSave ? (args.evalSaveDir + "/" + evalCfg.label) : "";
             evalCfg.maxSnapshots = args.evalMaxSnapshots;

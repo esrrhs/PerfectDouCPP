@@ -482,6 +482,29 @@ static void testMockDouZeroEvalAndDiskSnapshot() {
     std::filesystem::remove_all(testDir, ec);
 }
 
+void testLoadEvalDecks() {
+    std::string p = "data/eval_data.bin";
+    std::error_code ec;
+    if (!std::filesystem::exists(p, ec) && std::filesystem::exists("../" + p, ec)) {
+        p = "../" + p;
+    }
+    auto decks = algo::loadEvalDecks(p, 5);
+    EXPECT_EQ(decks.size(), 5);
+    for (const auto& d : decks) {
+        EXPECT_EQ(d.landlord.total(), 20);
+        EXPECT_EQ(d.landlordDown.total(), 17);
+        EXPECT_EQ(d.landlordUp.total(), 17);
+        EXPECT_EQ(d.bottom.total(), 3);
+        EXPECT_TRUE(d.landlord.contains(d.bottom));
+
+        ddz::CardSet all;
+        for (int r = 0; r < ddz::kRanks; ++r) {
+            all.add(r, d.landlord.c[r] + d.landlordDown.c[r] + d.landlordUp.c[r]);
+        }
+        EXPECT_EQ(all.total(), 54);
+    }
+}
+
 TEST(AlgoTest, AdvantageNormAndGAE) { testAdvantageNormAndGAE(); }
 TEST(AlgoTest, ValueClipping) { testValueClipping(); }
 TEST(AlgoTest, KLDivergence) { testKLDivergence(); }
@@ -494,3 +517,4 @@ TEST(AlgoTest, MaskedSoftmaxNaNProtection) { testMaskedSoftmaxNaNProtection(); }
 TEST(AlgoTest, KLDivergenceNaNProtection) { testKLDivergenceNaNProtection(); }
 TEST(AlgoTest, ActorCloningAndEvalFailSafe) { testActorCloningAndEvalFailSafe(); }
 TEST(AlgoTest, MockDouZeroEvalAndDiskSnapshot) { testMockDouZeroEvalAndDiskSnapshot(); }
+TEST(AlgoTest, LoadEvalDecks) { testLoadEvalDecks(); }

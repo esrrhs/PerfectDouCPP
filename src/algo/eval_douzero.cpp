@@ -256,6 +256,70 @@ bool playOne(ddz::Game g, bool ourLandlord, const std::array<torch_nn::Actor, 3>
 
 }  // namespace
 
+std::vector<EvalDeck> loadEvalDecks(const std::string& path, int maxDecks) {
+    std::string resolvedPath = path;
+    std::error_code ec;
+    if (!std::filesystem::exists(resolvedPath, ec) && std::filesystem::exists("../" + path, ec)) {
+        resolvedPath = "../" + path;
+    }
+
+    std::string binPath = resolvedPath;
+    if (resolvedPath.size() >= 4 && resolvedPath.substr(resolvedPath.size() - 4) == ".pkl") {
+        binPath = resolvedPath.substr(0, resolvedPath.size() - 4) + ".bin";
+        if (!std::filesystem::exists(binPath, ec)) {
+            std::string script = std::filesystem::exists("tools/convert_eval_data.py", ec)
+                                     ? "tools/convert_eval_data.py"
+                                     : "../tools/convert_eval_data.py";
+            std::string cmd = "python3 " + script + " \"" + resolvedPath + "\" \"" + binPath + "\"";
+            int ret = std::system(cmd.c_str());
+            (void)ret;
+        }
+    }
+
+    std::vector<EvalDeck> decks;
+    FILE* f = std::fopen(binPath.c_str(), "rb");
+    if (!f) return decks;
+
+    char magic[4];
+    if (std::fread(magic, 1, 4, f) != 4 || std::memcmp(magic, "EVAL", 4) != 0) {
+        std::fclose(f);
+        return decks;
+    }
+
+    uint32_t numDecks = 0;
+    if (std::fread(&numDecks, sizeof(uint32_t), 1, f) != 1) {
+        std::fclose(f);
+        return decks;
+    }
+
+    uint32_t toRead = numDecks;
+    if (maxDecks > 0 && static_cast<uint32_t>(maxDecks) < toRead) {
+        toRead = static_cast<uint32_t>(maxDecks);
+    }
+
+    decks.reserve(toRead);
+    struct RawDeck {
+        uint8_t landlord[20];
+        uint8_t landlordDown[17];
+        uint8_t landlordUp[17];
+        uint8_t bottom[3];
+    };
+
+    std::vector<RawDeck> raw(toRead);
+    size_t n = std::fread(raw.data(), sizeof(RawDeck), toRead, f);
+    std::fclose(f);
+
+    for (size_t i = 0; i < n; ++i) {
+        EvalDeck d;
+        for (int j = 0; j < 20; ++j) d.landlord.add(raw[i].landlord[j]);
+        for (int j = 0; j < 17; ++j) d.landlordDown.add(raw[i].landlordDown[j]);
+        for (int j = 0; j < 17; ++j) d.landlordUp.add(raw[i].landlordUp[j]);
+        for (int j = 0; j < 3; ++j) d.bottom.add(raw[i].bottom[j]);
+        decks.push_back(std::move(d));
+    }
+    return decks;
+}
+
 std::shared_ptr<ActorGroup> cloneActors(const std::array<torch_nn::Actor, 3>& src) {
     auto dst = std::make_shared<ActorGroup>();
     for (int s = 0; s < 3; ++s) {
@@ -373,17 +437,56 @@ DouZeroEvalResult evaluateAgainstDouZero(const std::array<torch_nn::Actor, 3>& a
     }
     ddz::Rng rng(seed);
 
+    std::vector<EvalDeck> loadedDecks;
+    if (!cfg.dataPath.empty()) {
+        loadedDecks = loadEvalDecks(cfg.dataPath, cfg.decks);
+    }
+    if (loadedDecks.empty()) {
+        std::error_code ec;
+        for (const std::string& candidate : {"data/eval_data.bin", "../data/eval_data.bin",
+                                             "data/eval_data.pkl", "../data/eval_data.pkl"}) {
+            if (std::filesystem::exists(candidate, ec)) {
+                loadedDecks = loadEvalDecks(candidate, cfg.decks);
+                if (!loadedDecks.empty()) break;
+            }
+        }
+    }
+
+    int targetDecks = cfg.decks;
+    if (!loadedDecks.empty()) {
+        targetDecks = std::min(cfg.decks, static_cast<int>(loadedDecks.size()));
+        if (cfg.verbose) {
+            std::printf("Using %d official evaluation decks from dataset\n", targetDecks);
+        }
+    } else {
+        if (cfg.verbose) {
+            std::printf("No evaluation dataset found, dealing random decks with PRNG\n");
+        }
+    }
+
     Tally asLandlord, asPeasant;
     int decksPlayed = 0;
-    for (int i = 0; i < cfg.decks; ++i) {
+    for (int i = 0; i < targetDecks; ++i) {
         ddz::Game g;
-        g.deal(rng);
+        if (!loadedDecks.empty()) {
+            const auto& ed = loadedDecks[i];
+            g.hand[0] = ed.landlord;
+            g.hand[1] = ed.landlordDown;
+            g.hand[2] = ed.landlordUp;
+            g.bottom = ed.bottom;
+            g.turn = 0;
+            g.lastPlayer = 0;
+        } else {
+            g.deal(rng);
+        }
         auto hands = g.hand;
         auto bottom = g.bottom;
+        // 1. 上半场：我方当地主，DouZero 当农民
         if (!playOne(g, true, actors, sock, asLandlord)) {
             res.error = "communication failed while playing as landlord";
             break;
         }
+        // 2. 下半场：阵营互换，DouZero 当地主，我方当农民（不换牌，只换人）
         ddz::Game g2;
         g2.hand = hands;
         g2.bottom = bottom;
@@ -396,7 +499,7 @@ DouZeroEvalResult evaluateAgainstDouZero(const std::array<torch_nn::Actor, 3>& a
         decksPlayed++;
         if (cfg.verbose && (i + 1) % 20 == 0) {
             int curGames = asLandlord.games + asPeasant.games;
-            std::printf("deck %d/%d  WP %.3f ADP %.3f\n", i + 1, cfg.decks,
+            std::printf("deck %d/%d  WP %.3f ADP %.3f\n", i + 1, targetDecks,
                         curGames ? double(asLandlord.wins + asPeasant.wins) / curGames : 0.0,
                         curGames ? (asLandlord.score + asPeasant.score) / curGames : 0.0);
             std::fflush(stdout);

@@ -28,11 +28,13 @@ int main(int argc, char** argv) {
     int port = std::atoi(argValue(argc, argv, "--port", "18765").c_str());
     std::string label = argValue(argc, argv, "--label", "snap");
     std::string csv = argValue(argc, argv, "--csv", "build-win/curve/curve.csv");
+    std::string evalData = argValue(argc, argv, "--eval-data", "");
+    if (evalData.empty()) evalData = argValue(argc, argv, "--data", "");
     uint64_t seed = std::strtoull(argValue(argc, argv, "--seed", "1").c_str(), nullptr, 10);
     if (models.empty() || decks <= 0) {
         std::fprintf(stderr,
                      "usage: perfectdou_eval --models DIR --decks N [--port P] [--host H] "
-                     "[--csv FILE] [--label L] [--seed S]\n");
+                     "[--eval-data FILE] [--csv FILE] [--label L] [--seed S]\n");
         return 2;
     }
 
@@ -53,6 +55,7 @@ int main(int argc, char** argv) {
     cfg.seed = seed;
     cfg.csvPath = csv;
     cfg.label = label;
+    cfg.dataPath = evalData;
     cfg.verbose = true;
 
     auto res = algo::evaluateAgainstDouZero(actor, cfg);

@@ -3,7 +3,9 @@
 #include <array>
 #include <memory>
 #include <string>
+#include <vector>
 
+#include "ddz/cards.h"
 #include "torch_nn/models.h"
 
 namespace algo {
@@ -17,12 +19,23 @@ struct DouZeroEvalConfig {
     uint64_t seed = 0;           // 0 means auto seed
     std::string csvPath = "";    // if not empty, append to CSV
     std::string saveDir = "";    // if not empty, save cloned models to disk for backtracking
+    std::string dataPath = "";   // path to eval_data.bin or eval_data.pkl; if empty, uses default or random
     int maxSnapshots = 0;        // 0 = keep all, >0 = retain most recent N snapshots to protect disk space
     std::string label = "";      // label or tag
     int update = 0;              // training update step
     double elapsedMinutes = 0.0; // elapsed minutes since training start
     bool verbose = false;        // print progress during play
 };
+
+struct EvalDeck {
+    ddz::CardSet landlord;
+    ddz::CardSet landlordDown;
+    ddz::CardSet landlordUp;
+    ddz::CardSet bottom;
+};
+
+// Loads pre-generated decks from a binary dataset file (or auto-converts from .pkl if needed).
+std::vector<EvalDeck> loadEvalDecks(const std::string& path, int maxDecks = 0);
 
 struct DouZeroEvalResult {
     bool ok = false;
