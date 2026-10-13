@@ -70,7 +70,6 @@ struct Args {
     float shapingCap = 0.05f;
     float landlordWinMul = 2.0f;
     float landlordLossMul = 2.0f;
-    bool independentPeasants = true;
     bool lrDecay = true;
     bool entDecay = true;
     int poolSize = 16;
@@ -129,9 +128,6 @@ void parseArgs(int argc, char** argv, Args& a) {
     a.shapingCap = float(std::atof(argValue(argc, argv, "--shaping-cap", "0.05")));
     a.landlordWinMul = float(std::atof(argValue(argc, argv, "--landlord-win-mul", "2.0")));
     a.landlordLossMul = float(std::atof(argValue(argc, argv, "--landlord-loss-mul", "2.0")));
-    if (hasFlag(argc, argv, "--no-independent-peasants") || hasFlag(argc, argv, "--coupled-peasants")) {
-        a.independentPeasants = false;
-    }
     if (hasFlag(argc, argv, "--clip-vf")) a.clipVf = true;
     if (hasFlag(argc, argv, "--no-clip-vf")) a.clipVf = false;
     if (hasFlag(argc, argv, "--no-lr-decay")) a.lrDecay = false;
@@ -218,8 +214,7 @@ int main(int argc, char** argv) {
               << " targetKL=" << args.targetKL << (args.clipVf ? " clipVf" : "")
               << " league(recent=" << args.poolSize << ",archive=" << args.archiveSize
               << ",every=" << args.poolEvery
-              << ",hist=" << args.histProb << ",rule=" << args.ruleProb
-              << (args.independentPeasants ? ",indepPeasants" : ",coupledPeasants") << ")"
+              << ",hist=" << args.histProb << ",rule=" << args.ruleProb << ")"
               << " target=terminal-adp"
               << " seed=" << args.seed << std::endl;
 
@@ -426,7 +421,6 @@ int main(int argc, char** argv) {
             rc.shapingCap = args.shapingCap;
             rc.landlordWinMul = args.landlordWinMul;
             rc.landlordLossMul = args.landlordLossMul;
-            rc.independentPeasants = args.independentPeasants;
 
             std::shared_ptr<const algo::HistoricalPool> snapPool;
             {

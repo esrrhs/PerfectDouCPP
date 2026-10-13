@@ -155,41 +155,25 @@ void runWorker(const ModelSet& models, const RolloutConfig& cfg, int nGames,
         gameSeats[gi][0].type = lType;
         gameSeats[gi][0].histRef = lHistRef;
 
-        // 2. Peasant camp (Seat 1 & 2)
-        if (cfg.independentPeasants) {
-            auto [p1Type, p1HistRef] = sampleSeatPlayer();
-            gameSeats[gi][1].type = p1Type;
-            gameSeats[gi][1].histRef = p1HistRef;
-
-            auto [p2Type, p2HistRef] = sampleSeatPlayer();
-            gameSeats[gi][2].type = p2Type;
-            gameSeats[gi][2].histRef = p2HistRef;
-        } else {
-            auto [pType, pHistRef] = sampleSeatPlayer();
-            gameSeats[gi][1].type = pType;
-            gameSeats[gi][1].histRef = pHistRef;
-            gameSeats[gi][2].type = pType;
-            gameSeats[gi][2].histRef = pHistRef;
-        }
+        // 2. Peasant camp (Seat 1 & 2): coupled teammate sampling
+        auto [pType, pHistRef] = sampleSeatPlayer();
+        gameSeats[gi][1].type = pType;
+        gameSeats[gi][1].histRef = pHistRef;
+        gameSeats[gi][2].type = pType;
+        gameSeats[gi][2].histRef = pHistRef;
 
         // Guarantee at least one seat is learning (PLAYER_LATEST)
         if (gameSeats[gi][0].type != PLAYER_LATEST &&
             gameSeats[gi][1].type != PLAYER_LATEST &&
             gameSeats[gi][2].type != PLAYER_LATEST) {
-            if (cfg.independentPeasants) {
-                int pickSeat = int(dealRng.nextU64() % 3);
-                gameSeats[gi][pickSeat].type = PLAYER_LATEST;
-                gameSeats[gi][pickSeat].histRef = HistModelRef{};
+            if ((dealRng.nextU64() & 1) == 0) {
+                gameSeats[gi][0].type = PLAYER_LATEST;
+                gameSeats[gi][0].histRef = HistModelRef{};
             } else {
-                if ((dealRng.nextU64() & 1) == 0) {
-                    gameSeats[gi][0].type = PLAYER_LATEST;
-                    gameSeats[gi][0].histRef = HistModelRef{};
-                } else {
-                    gameSeats[gi][1].type = PLAYER_LATEST;
-                    gameSeats[gi][1].histRef = HistModelRef{};
-                    gameSeats[gi][2].type = PLAYER_LATEST;
-                    gameSeats[gi][2].histRef = HistModelRef{};
-                }
+                gameSeats[gi][1].type = PLAYER_LATEST;
+                gameSeats[gi][1].histRef = HistModelRef{};
+                gameSeats[gi][2].type = PLAYER_LATEST;
+                gameSeats[gi][2].histRef = HistModelRef{};
             }
         }
     }

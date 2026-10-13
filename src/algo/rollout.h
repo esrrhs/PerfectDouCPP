@@ -82,8 +82,6 @@ struct RolloutConfig {
     // Standard symmetric ADP payoff for landlord (2.0x base mult for zero-sum game)
     float landlordWinMul = 2.0f;
     float landlordLossMul = 2.0f;
-    // Sample peasant players independently (Seat 1 and Seat 2 can have different models/rules)
-    bool independentPeasants = true;
 };
 
 // Runs self-play / league games using the current models, historical pool, and rule agent.
