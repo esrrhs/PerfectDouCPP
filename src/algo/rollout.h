@@ -84,8 +84,6 @@ struct RolloutConfig {
     float landlordLossMul = 2.0f;
     // Sample peasant players independently (Seat 1 and Seat 2 can have different models/rules)
     bool independentPeasants = true;
-    // Camp training focus: -1 = all seats, 0 = landlord focus (Seat 0), 1 = peasant focus (Seats 1 & 2)
-    int trainCamp = -1;
 };
 
 // Runs self-play / league games using the current models, historical pool, and rule agent.

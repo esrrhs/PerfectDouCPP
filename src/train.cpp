@@ -71,7 +71,6 @@ struct Args {
     float landlordWinMul = 2.0f;
     float landlordLossMul = 2.0f;
     bool independentPeasants = true;
-    std::string campMode = "all";  // "all" = train all together, "alt" = alternate landlord/peasant, "landlord" = landlord only, "peasant" = peasant only
     bool lrDecay = true;
     bool entDecay = true;
     int poolSize = 16;
@@ -133,7 +132,6 @@ void parseArgs(int argc, char** argv, Args& a) {
     if (hasFlag(argc, argv, "--no-independent-peasants") || hasFlag(argc, argv, "--coupled-peasants")) {
         a.independentPeasants = false;
     }
-    a.campMode = argValue(argc, argv, "--camp-mode", a.campMode.c_str());
     if (hasFlag(argc, argv, "--clip-vf")) a.clipVf = true;
     if (hasFlag(argc, argv, "--no-clip-vf")) a.clipVf = false;
     if (hasFlag(argc, argv, "--no-lr-decay")) a.lrDecay = false;
@@ -222,7 +220,6 @@ int main(int argc, char** argv) {
               << ",every=" << args.poolEvery
               << ",hist=" << args.histProb << ",rule=" << args.ruleProb
               << (args.independentPeasants ? ",indepPeasants" : ",coupledPeasants") << ")"
-              << " campMode=" << args.campMode
               << " target=terminal-adp"
               << " seed=" << args.seed << std::endl;
 
@@ -430,9 +427,6 @@ int main(int argc, char** argv) {
             rc.landlordWinMul = args.landlordWinMul;
             rc.landlordLossMul = args.landlordLossMul;
             rc.independentPeasants = args.independentPeasants;
-            if (args.campMode == "landlord") rc.trainCamp = 0;
-            else if (args.campMode == "peasant") rc.trainCamp = 1;
-            else rc.trainCamp = -1;
 
             std::shared_ptr<const algo::HistoricalPool> snapPool;
             {
@@ -484,43 +478,12 @@ int main(int argc, char** argv) {
                                        (1.0f + std::cos(progress * 3.141592653589793f));
         }
 
-        // Determine which seats to train this update
-        unsigned targetMask = 7u;
-        if (args.campMode == "landlord") {
-            targetMask = (1u << 0);
-        } else if (args.campMode == "peasant") {
-            targetMask = (1u << 1) | (1u << 2);
-        } else if (args.campMode == "alt") {
-            targetMask = (upd % 2 == 1) ? (1u << 0) : ((1u << 1) | (1u << 2));
-        }
-
-        static algo::RolloutChunk altCachedChunk;
-        static bool hasAltChunk = false;
-
         algo::RolloutChunk currentChunk;
-        if (args.campMode == "alt") {
-            if (upd % 2 == 1) {
-                // Odd update: fetch fresh chunk, train landlord, preserve chunk for peasants
-                if (!replayBuffer.pop(altCachedChunk, stopProducer)) break;
-                hasAltChunk = true;
-                currentChunk = altCachedChunk;
-            } else {
-                // Even update: train peasants on the preserved chunk
-                if (hasAltChunk) {
-                    currentChunk = std::move(altCachedChunk);
-                    hasAltChunk = false;
-                } else {
-                    if (!replayBuffer.pop(currentChunk, stopProducer)) break;
-                }
-            }
-        } else {
-            if (!replayBuffer.pop(currentChunk, stopProducer)) break;
-        }
+        if (!replayBuffer.pop(currentChunk, stopProducer)) break;
 
         std::array<size_t, 3> actualSamples{};
         auto tLearn0 = std::chrono::steady_clock::now();
         for (int s = 0; s < 3; ++s) {
-            if ((targetMask & (1u << s)) == 0) continue;
             const auto& seatSamples = currentChunk.streams[s];
             actualSamples[s] = seatSamples.size();
             if (seatSamples.empty()) continue;
