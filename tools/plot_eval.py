@@ -65,18 +65,32 @@ def parse_rows(rows: list[dict], x_col: str = "update") -> list[dict]:
     return parsed
 
 
-def compute_smooth(y: np.ndarray, alpha: float = 0.15) -> tuple[np.ndarray, np.ndarray]:
-    """Compute Exponential Moving Average (EMA) and rolling standard deviation."""
+def compute_smooth(y: np.ndarray, base_alpha: float = 0.3) -> tuple[np.ndarray, np.ndarray]:
+    """Compute Bias-Corrected Exponential Moving Average (EMA) and rolling std deviation.
+
+    Proper standard EMA bias-correction:
+      v_0 = 0
+      v_t = beta * v_{t-1} + (1 - beta) * y_t
+      v_hat_t = v_t / (1 - beta^t)
+    """
     n = len(y)
     if n == 0:
         return y.copy(), np.zeros_like(y)
-    smoothed = np.empty(n, dtype=float)
-    smoothed[0] = y[0]
-    for i in range(1, n):
-        smoothed[i] = alpha * y[i] + (1.0 - alpha) * smoothed[i - 1]
+    if n < 3:
+        return y.copy(), np.zeros_like(y)
 
-    # Rolling standard deviation over a small window to reflect eval variance
-    win = max(3, min(15, n // 4))
+    # For few points, low smoothing (beta=0.4); for many points, smooth more (beta=0.75)
+    beta = min(0.75, max(0.4, 1.0 - (2.0 / (n + 1))))
+
+    v = 0.0
+    smoothed = np.empty(n, dtype=float)
+    for i in range(n):
+        v = beta * v + (1.0 - beta) * y[i]
+        correction = 1.0 - (beta ** (i + 1))
+        smoothed[i] = v / max(correction, 1e-6)
+
+    # Rolling standard deviation over adaptive window to reflect eval variance
+    win = max(2, min(8, n // 2))
     stds = np.empty(n, dtype=float)
     for i in range(n):
         i_start = max(0, i - win + 1)
@@ -109,13 +123,13 @@ def plot_single(parsed: list[dict], out_png: Path, x_col: str = "update") -> boo
 
     # Smoothed robust trend line + confidence envelope
     if len(x) >= 3:
-        smooth_wp, std_wp = compute_smooth(wp, alpha=0.15)
+        smooth_wp, std_wp = compute_smooth(wp)
         ax1.plot(x, smooth_wp, "-", color="#d62728", linewidth=2.4, label="Overall WP (Smoothed Trend)")
         ax1.fill_between(x, smooth_wp - std_wp, smooth_wp + std_wp, color="#d62728", alpha=0.15, label="WP ±1σ Band")
         # Also smooth Landlord & Peasant if plenty of data
-        if len(x) >= 10:
-            smooth_l, _ = compute_smooth(wp_l, alpha=0.15)
-            smooth_p, _ = compute_smooth(wp_p, alpha=0.15)
+        if len(x) >= 6:
+            smooth_l, _ = compute_smooth(wp_l)
+            smooth_p, _ = compute_smooth(wp_p)
             ax1.plot(x, smooth_l, "-", color="#ff7f0e", linewidth=1.6, alpha=0.9, label="Landlord Trend")
             ax1.plot(x, smooth_p, "-", color="#2ca02c", linewidth=1.6, alpha=0.9, label="Peasant Trend")
 
@@ -133,12 +147,12 @@ def plot_single(parsed: list[dict], out_png: Path, x_col: str = "update") -> boo
     ax2.plot(x, adp, "s-", color="#9467bd", linewidth=1.0, markersize=3.5, alpha=0.35, label="Overall ADP (Raw)")
 
     if len(x) >= 3:
-        smooth_adp, std_adp = compute_smooth(adp, alpha=0.15)
+        smooth_adp, std_adp = compute_smooth(adp)
         ax2.plot(x, smooth_adp, "-", color="#d62728", linewidth=2.4, label="Overall ADP (Smoothed Trend)")
         ax2.fill_between(x, smooth_adp - std_adp, smooth_adp + std_adp, color="#d62728", alpha=0.15, label="ADP ±1σ Band")
-        if len(x) >= 10:
-            smooth_al, _ = compute_smooth(adp_l, alpha=0.15)
-            smooth_ap, _ = compute_smooth(adp_p, alpha=0.15)
+        if len(x) >= 6:
+            smooth_al, _ = compute_smooth(adp_l)
+            smooth_ap, _ = compute_smooth(adp_p)
             ax2.plot(x, smooth_al, "-", color="#e377c2", linewidth=1.6, alpha=0.9, label="Landlord ADP Trend")
             ax2.plot(x, smooth_ap, "-", color="#17becf", linewidth=1.6, alpha=0.9, label="Peasant ADP Trend")
 
@@ -183,8 +197,8 @@ def plot_comparison(datasets: list[tuple[str, list[dict]]], out_png: Path, x_col
         ax2.plot(x, adp, marker=m, color=c, linewidth=1.0, markersize=3.5, alpha=0.35, label=f"{label} (Raw)")
 
         if len(x) >= 3:
-            smooth_wp, std_wp = compute_smooth(wp, alpha=0.15)
-            smooth_adp, std_adp = compute_smooth(adp, alpha=0.15)
+            smooth_wp, std_wp = compute_smooth(wp)
+            smooth_adp, std_adp = compute_smooth(adp)
             ax1.plot(x, smooth_wp, "-", color=c, linewidth=2.2, label=f"{label} (Trend)")
             ax2.plot(x, smooth_adp, "-", color=c, linewidth=2.2, label=f"{label} (Trend)")
             ax1.fill_between(x, smooth_wp - std_wp, smooth_wp + std_wp, color=c, alpha=0.1)
@@ -240,6 +254,8 @@ def main() -> int:
         else:
             print(f"[EvalPlotter] Waiting for first eval data in {csv_paths[0]}...", flush=True)
         last_mtimes = {}
+        this_script = Path(__file__).resolve()
+        script_mtime = this_script.stat().st_mtime
         while True:
             changed = False
             for p in csv_paths:
@@ -248,6 +264,9 @@ def main() -> int:
                     if last_mtimes.get(str(p)) != mt:
                         changed = True
                         last_mtimes[str(p)] = mt
+            if this_script.stat().st_mtime != script_mtime:
+                # If script was edited, exit watch loop so supervisor can restart or user gets new behavior
+                break
             if changed:
                 if render():
                     print(f"[EvalPlotter] [{time.strftime('%H:%M:%S')}] Updated {out_png}", flush=True)
