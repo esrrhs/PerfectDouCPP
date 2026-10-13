@@ -51,7 +51,7 @@ struct Args {
     int updates = 100000;
     int startUpdate = 1;
     int games = 768;
-    int threads = 16;
+    int threads = std::clamp(static_cast<int>(std::thread::hardware_concurrency()), 1, 16);
     int hidden = 1024;
     int lstmHidden = 256;
     int epochs = 2;
@@ -333,7 +333,7 @@ int main(int argc, char** argv) {
                             ES_AWAYMODE_REQUIRED);
 #endif
 
-    std::shared_ptr<const algo::HistoricalPool> histPool = std::make_shared<algo::HistoricalPool>();
+    std::atomic<std::shared_ptr<const algo::HistoricalPool>> histPool{std::make_shared<algo::HistoricalPool>()};
     std::mutex histPoolMu;
     auto pushHistPool = [&](std::array<torch_nn::Actor, 3>& srcActor, int currentUpdate) {
         auto snap = std::make_shared<algo::HistoricalActorSnapshot>();
@@ -349,7 +349,7 @@ int main(int argc, char** argv) {
             snap->actor[s]->eval();
         }
         std::lock_guard<std::mutex> lock(histPoolMu);
-        auto oldPool = std::atomic_load(&histPool);
+        auto oldPool = histPool.load();
         auto newPool = std::make_shared<algo::HistoricalPool>(oldPool ? *oldPool : algo::HistoricalPool{});
         int k = args.poolEvery > 0 ? (currentUpdate / args.poolEvery) : 0;
         bool isPowerOfTwo = (k > 0) && ((k & (k - 1)) == 0);
@@ -371,7 +371,7 @@ int main(int argc, char** argv) {
             }
             newPool->recent.push_back(std::move(snap));
         }
-        std::atomic_store(&histPool, std::shared_ptr<const algo::HistoricalPool>(newPool));
+        histPool.store(std::shared_ptr<const algo::HistoricalPool>(newPool));
     };
 
     struct InferPack {
@@ -395,7 +395,7 @@ int main(int argc, char** argv) {
         }
         return p;
     };
-    std::shared_ptr<InferPack> live = makePack();
+    std::atomic<std::shared_ptr<InferPack>> live{makePack()};
 
     // Async Ring Replay Buffer
     algo::AsyncReplayBuffer replayBuffer(args.bufferCap);
@@ -411,7 +411,7 @@ int main(int argc, char** argv) {
         uint64_t chunkSeed = args.seed;
         int chunkIdx = 0;
         while (!stopProducer.load()) {
-            auto snap = std::atomic_load(&live);
+            auto snap = live.load();
             algo::ModelSet models{{&snap->actor[0], &snap->actor[1], &snap->actor[2]},
                                   {&snap->critic[0], &snap->critic[1], &snap->critic[2]}};
             algo::RolloutConfig rc;
@@ -423,7 +423,7 @@ int main(int argc, char** argv) {
             rc.shapingCap = args.shapingCap;
             rc.landlordWinMul = args.landlordWinMul;
 
-            auto snapPool = std::atomic_load(&histPool);
+            auto snapPool = histPool.load();
             rc.historicalPool = snapPool.get();
 
             std::array<std::vector<algo::Transition>, 3> streams;
@@ -524,7 +524,7 @@ int main(int argc, char** argv) {
                                .count();
 
         // Atomically publish newly trained weights for background rollout workers
-        std::atomic_store(&live, makePack());
+        live.store(makePack());
 
         double wallSecs = std::chrono::duration<double>(
                               std::chrono::steady_clock::now() - wall0)
