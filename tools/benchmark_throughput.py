@@ -4,14 +4,15 @@ import re
 import os
 from pathlib import Path
 
-# Candidates to benchmark
+# Candidates to benchmark on CUDA GPU
 CONFIGS = [
-    {"name": "C1: baseline (games=256, th=8, mb=1024, buf=2)", "games": 256, "threads": 8, "mb": 1024, "buffer_chunks": 2},
-    {"name": "C2: larger mb (games=256, th=8, mb=2048, buf=2)", "games": 256, "threads": 8, "mb": 2048, "buffer_chunks": 2},
-    {"name": "C3: max mb (games=256, th=8, mb=4096, buf=2)", "games": 256, "threads": 8, "mb": 4096, "buffer_chunks": 2},
-    {"name": "C4: balanced th (games=256, th=4, mb=2048, buf=2)", "games": 256, "threads": 4, "mb": 2048, "buffer_chunks": 2},
-    {"name": "C5: deep buf (games=256, th=8, mb=2048, buf=4)", "games": 256, "threads": 8, "mb": 2048, "buffer_chunks": 4},
-    {"name": "C6: larger batch (games=512, th=8, mb=2048, buf=2)", "games": 512, "threads": 8, "mb": 2048, "buffer_chunks": 2},
+    {"name": "G1: games=256, th=8, mb=1024, buf=2", "games": 256, "threads": 8, "mb": 1024, "buffer_chunks": 2},
+    {"name": "G2: games=256, th=8, mb=2048, buf=2", "games": 256, "threads": 8, "mb": 2048, "buffer_chunks": 2},
+    {"name": "G3: games=512, th=8, mb=2048, buf=2", "games": 512, "threads": 8, "mb": 2048, "buffer_chunks": 2},
+    {"name": "G4: games=512, th=12, mb=2048, buf=2", "games": 512, "threads": 12, "mb": 2048, "buffer_chunks": 2},
+    {"name": "G5: games=512, th=16, mb=2048, buf=2", "games": 512, "threads": 16, "mb": 2048, "buffer_chunks": 2},
+    {"name": "G6: games=768, th=16, mb=2048, buf=2", "games": 768, "threads": 16, "mb": 2048, "buffer_chunks": 2},
+    {"name": "G7: games=768, th=16, mb=2048, buf=4", "games": 768, "threads": 16, "mb": 2048, "buffer_chunks": 4},
 ]
 
 TORCH_LIB = r"C:\Users\zx\AppData\Roaming\Python\Python314\site-packages\torch\lib"
@@ -23,6 +24,7 @@ def run_bench(cfg, updates=2):
     out_dir = Path(f"ckpt_bench_tmp_{cfg['games']}_{cfg['threads']}_{cfg['mb']}_{cfg['buffer_chunks']}")
     cmd = [
         r".\build\perfectdou_train.exe",
+        "--backend", "cuda",
         "--updates", str(updates),
         "--games", str(cfg["games"]),
         "--threads", str(cfg["threads"]),
@@ -68,7 +70,7 @@ def run_bench(cfg, updates=2):
 
 def main():
     print("=" * 80)
-    print("Starting Training Throughput Benchmark Suite (LibTorch Architecture)")
+    print("Starting CUDA GPU Training Throughput Benchmark Suite")
     print("=" * 80)
     results = []
     for i, cfg in enumerate(CONFIGS, 1):
@@ -79,13 +81,13 @@ def main():
             results.append(r)
             
     print("\n" + "=" * 80)
-    print("BENCHMARK SUMMARY & COMPARISON")
+    print("CUDA BENCHMARK SUMMARY & COMPARISON")
     print("=" * 80)
-    print(f"{'Config Name':<45} | {'Wall/Upd':<10} | {'Learn':<10} | {'Throughput (games/s)'}")
+    print(f"{'Config Name':<42} | {'Wall/Upd':<10} | {'Learn':<10} | {'Throughput (games/s)'}")
     print("-" * 80)
     best = None
     for r in results:
-        print(f"{r['cfg']['name']:<45} | {r['avg_wall']:>8.2f}s | {r['avg_learn']:>8.2f}s | {r['games_per_sec']:>12.2f} games/s")
+        print(f"{r['cfg']['name']:<42} | {r['avg_wall']:>8.2f}s | {r['avg_learn']:>8.2f}s | {r['games_per_sec']:>12.2f} games/s")
         if best is None or r['games_per_sec'] > best['games_per_sec']:
             best = r
             
