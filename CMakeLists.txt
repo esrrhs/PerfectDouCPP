@@ -9,7 +9,15 @@ if(NOT CMAKE_BUILD_TYPE)
   set(CMAKE_BUILD_TYPE Release)
 endif()
 
-set(CMAKE_CXX_FLAGS_RELEASE "-O3 -march=native -DNDEBUG")
+if(MSVC)
+  add_compile_options(/bigobj /utf-8)
+else()
+  if(CMAKE_SYSTEM_PROCESSOR MATCHES "(x86_64|AMD64)")
+    set(CMAKE_CXX_FLAGS_RELEASE "-O3 -march=native -DNDEBUG")
+  else()
+    set(CMAKE_CXX_FLAGS_RELEASE "-O3 -DNDEBUG")
+  endif()
+endif()
 
 find_package(Threads REQUIRED)
 

@@ -16,13 +16,39 @@ jobs:
         include:
           - name: Ubuntu Linux (GCC)
             os: ubuntu-latest
-          - name: macOS (Clang / Accelerate)
+          - name: macOS (AppleClang / CPU)
             os: macos-latest
-          - name: Windows (MSVC / CUDA-or-CPU)
+          - name: Windows (MSVC / CPU)
             os: windows-latest
 
     steps:
       - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install PyTorch (LibTorch)
+        shell: bash
+        run: |
+          if [[ "${{ runner.os }}" == "Linux" || "${{ runner.os }}" == "Windows" ]]; then
+            pip install torch --index-url https://download.pytorch.org/whl/cpu
+          else
+            pip install torch
+          fi
+          TORCH_DIR=$(python -c "import torch; print(torch.utils.cmake_prefix_path)")
+          echo "CMAKE_PREFIX_PATH=$TORCH_DIR" >> $GITHUB_ENV
+          echo "Torch cmake path: $TORCH_DIR"
+
+          TORCH_LIB=$(python -c "import os, torch; print(os.path.join(os.path.dirname(torch.__file__), 'lib'))")
+          if [[ "${{ runner.os }}" == "Windows" ]]; then
+            echo "$TORCH_LIB" >> $GITHUB_PATH
+          elif [[ "${{ runner.os }}" == "Linux" ]]; then
+            echo "LD_LIBRARY_PATH=$TORCH_LIB:${LD_LIBRARY_PATH:-}" >> $GITHUB_ENV
+          elif [[ "${{ runner.os }}" == "macOS" ]]; then
+            echo "DYLD_LIBRARY_PATH=$TORCH_LIB:${DYLD_LIBRARY_PATH:-}" >> $GITHUB_ENV
+          fi
 
       - name: Configure CMake
         run: cmake -B build -DCMAKE_BUILD_TYPE=Release
@@ -42,7 +68,7 @@ jobs:
           elif [ -f "./build/Release/perfectdou_train" ]; then
             TRAIN_BIN="./build/Release/perfectdou_train"
           fi
-          $TRAIN_BIN --updates 2 --games 16 --mb 64 --epochs 2 --threads 2 --pool-every 1 \
+          $TRAIN_BIN --updates 2 --games 16 --warmup 256 --mb 64 --epochs 2 --threads 2 --pool-every 1 \
             --eval-every 1 --eval-decks 1 --eval-port 19999 \
             --eval-save-dir build/ci_eval_snapshots --eval-csv build/ci_eval.csv
 
