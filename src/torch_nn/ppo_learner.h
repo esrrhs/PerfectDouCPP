@@ -15,8 +15,6 @@ struct PPOConfig {
     int epochs = 2;
     int minibatch = 2048;
     float targetKL = 0.03f;
-    bool clipVf = false;
-    float vfClip = 32.0f;
 };
 
 struct BatchTensors {

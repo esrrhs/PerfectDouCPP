@@ -122,15 +122,7 @@ PPOStats PPOLearner::update(BatchTensors& batch) {
 
             // 2. Critic Forward & Loss
             torch::Tensor values = critic->forward(xImpMb, seqMb, extraMb).squeeze(-1);
-            torch::Tensor vLoss;
-            if (config.clipVf) {
-                torch::Tensor vClipped = oldValueMb + torch::clamp(values - oldValueMb, -config.vfClip, config.vfClip);
-                torch::Tensor vLoss1 = (values - retMb).pow(2);
-                torch::Tensor vLoss2 = (vClipped - retMb).pow(2);
-                vLoss = config.vfCoef * 0.5f * torch::max(vLoss1, vLoss2).mean();
-            } else {
-                vLoss = config.vfCoef * 0.5f * (values - retMb).pow(2).mean();
-            }
+            torch::Tensor vLoss = config.vfCoef * 0.5f * (values - retMb).pow(2).mean();
 
             // Critic update
             criticOpt->zero_grad();

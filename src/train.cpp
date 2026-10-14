@@ -36,7 +36,6 @@
 #include <powrprof.h>
 #endif
 
-#include "algo/async_buffer.h"
 #include "algo/eval_douzero.h"
 #include "algo/ppo.h"
 #include "algo/rollout.h"
@@ -57,24 +56,20 @@ struct Args {
     int epochs = 2;
     int minibatch = 2048;
     int snapshotEvery = 50;
-    int bufferChunks = 2;          // Async Pipeline Buffer capacity in chunks (2 = double buffering)
     float lr = 3e-4f;
     float clip = 0.2f;
     float ent = 0.03f;
     float gamma = 1.0f;
     float lambda = 0.95f;
     float targetKL = 0.03f;
-    bool clipVf = false;
-    float vfClip = 32.0f;
+    bool oracleReward = true;      // Paper Sec 4.4 Oracle step difference reward
+    float oracleCoef = 0.2f;
     float landlordWinMul = 2.0f;
     float landlordLossMul = 2.0f;
-    bool lrDecay = true;
-    bool entDecay = true;
     int poolSize = 16;
     int archiveSize = 16;
     int poolEvery = 20;
     float histProb = 0.2f;
-    float ruleProb = 0.1f;
     uint64_t seed = 1;
     std::string out = "ckpt_long";
     std::string resume;
@@ -114,31 +109,21 @@ void parseArgs(int argc, char** argv, Args& a) {
     a.epochs = std::atoi(argValue(argc, argv, "--epochs", std::to_string(a.epochs).c_str()));
     a.minibatch = std::atoi(argValue(argc, argv, "--mb", std::to_string(a.minibatch).c_str()));
     a.snapshotEvery = std::atoi(argValue(argc, argv, "--snapshot-every", std::to_string(a.snapshotEvery).c_str()));
-    a.bufferChunks = std::atoi(argValue(argc, argv, "--buffer-chunks", std::to_string(a.bufferChunks).c_str()));
-    if (hasFlag(argc, argv, "--buffer-cap")) {
-        int cap = std::atoi(argValue(argc, argv, "--buffer-cap", "0"));
-        if (cap > 0) {
-            a.bufferChunks = std::max<int>(2, cap / std::max(1, a.games * 8));
-        }
-    }
     a.lr = float(std::atof(argValue(argc, argv, "--lr", "3e-4")));
     a.clip = float(std::atof(argValue(argc, argv, "--clip", "0.2")));
     a.ent = float(std::atof(argValue(argc, argv, "--ent", "0.03")));
     a.gamma = float(std::atof(argValue(argc, argv, "--gamma", "1.0")));
     a.lambda = float(std::atof(argValue(argc, argv, "--lambda", "0.95")));
     a.targetKL = float(std::atof(argValue(argc, argv, "--target-kl", "0.03")));
-    a.vfClip = float(std::atof(argValue(argc, argv, "--vf-clip", "32.0")));
+    if (hasFlag(argc, argv, "--oracle-reward")) a.oracleReward = true;
+    if (hasFlag(argc, argv, "--no-oracle-reward")) a.oracleReward = false;
+    a.oracleCoef = float(std::atof(argValue(argc, argv, "--oracle-coef", "0.2")));
     a.landlordWinMul = float(std::atof(argValue(argc, argv, "--landlord-win-mul", "2.0")));
     a.landlordLossMul = float(std::atof(argValue(argc, argv, "--landlord-loss-mul", "2.0")));
-    if (hasFlag(argc, argv, "--clip-vf")) a.clipVf = true;
-    if (hasFlag(argc, argv, "--no-clip-vf")) a.clipVf = false;
-    if (hasFlag(argc, argv, "--no-lr-decay")) a.lrDecay = false;
-    if (hasFlag(argc, argv, "--no-ent-decay")) a.entDecay = false;
     a.poolSize = std::atoi(argValue(argc, argv, "--pool-size", "16"));
     a.archiveSize = std::atoi(argValue(argc, argv, "--archive-size", "16"));
     a.poolEvery = std::atoi(argValue(argc, argv, "--pool-every", "20"));
     a.histProb = float(std::atof(argValue(argc, argv, "--historical-prob", "0.2")));
-    a.ruleProb = float(std::atof(argValue(argc, argv, "--rule-prob", "0.1")));
     a.seed = std::atoll(argValue(argc, argv, "--seed", "1"));
     a.out = argValue(argc, argv, "--out", a.out.c_str());
     a.backend = argValue(argc, argv, "--backend", a.backend.c_str());
@@ -221,19 +206,19 @@ int main(int argc, char** argv) {
               << (args.startUpdate > 1 ? " (start=" + std::to_string(args.startUpdate) + ")" : "")
               << " games/chunk=" << args.games
               << " threads=" << args.threads
-              << " buffer_chunks=" << args.bufferChunks
               << " mb=" << args.minibatch
               << " epochs=" << args.epochs
               << " hidden=" << args.hidden
               << " lstm=" << args.lstmHidden
-              << " lr=" << args.lr << (args.lrDecay ? " (cosine)" : " (fixed)")
+              << " lr=" << args.lr << " (fixed)"
               << " clip=" << args.clip
-              << " ent=" << args.ent << (args.entDecay ? " (cosine)" : " (fixed)")
+              << " ent=" << args.ent << " (fixed)"
               << " gae(gamma=" << args.gamma << ",lambda=" << args.lambda << ")"
-              << " targetKL=" << args.targetKL << (args.clipVf ? " clipVf" : "")
+              << " oracle=" << (args.oracleReward ? ("yes(coef=" + std::to_string(args.oracleCoef) + ")") : "no")
+              << " targetKL=" << args.targetKL
               << " league(recent=" << args.poolSize << ",archive=" << args.archiveSize
               << ",every=" << args.poolEvery
-              << ",hist=" << args.histProb << ",rule=" << args.ruleProb << ")"
+              << ",hist=" << args.histProb << ")"
               << " target=terminal-adp"
               << " seed=" << args.seed << std::endl;
 
@@ -271,8 +256,6 @@ int main(int argc, char** argv) {
     torchPpoCfg.epochs = args.epochs;
     torchPpoCfg.minibatch = args.minibatch;
     torchPpoCfg.targetKL = args.targetKL;
-    torchPpoCfg.clipVf = args.clipVf;
-    torchPpoCfg.vfClip = args.vfClip;
     torchPpoCfg.criticMaxGradNorm = 5.0f;
 
     std::array<torch_nn::Actor, 3> actor{
@@ -311,6 +294,119 @@ int main(int argc, char** argv) {
         }
     }
 
+    std::shared_ptr<algo::HistoricalPool> histPool = std::make_shared<algo::HistoricalPool>();
+
+    auto pushHistPool = [&](std::array<torch_nn::Actor, 3>& srcActor, int currentUpdate) {
+        auto snap = std::make_shared<algo::HistoricalActorSnapshot>();
+        snap->update = currentUpdate;
+        for (int s = 0; s < 3; ++s) {
+            snap->actor[s] = torch_nn::Actor(torchModelCfg);
+            torch::NoGradGuard no_grad;
+            auto srcParams = srcActor[s]->parameters();
+            auto dstParams = snap->actor[s]->parameters();
+            for (size_t i = 0; i < srcParams.size(); ++i) {
+                dstParams[i].copy_(srcParams[i]);
+            }
+            snap->actor[s]->eval();
+        }
+        int k = args.poolEvery > 0 ? (currentUpdate / args.poolEvery) : 0;
+        bool isPowerOfTwo = (k > 0) && ((k & (k - 1)) == 0);
+        bool isCentennial = (currentUpdate % 100 == 0);
+        if (args.archiveSize > 0 && (isPowerOfTwo || isCentennial || histPool->archive.empty())) {
+            while ((int)histPool->archive.size() >= args.archiveSize && !histPool->archive.empty()) {
+                if (histPool->archive.size() > 2) {
+                    histPool->archive.erase(histPool->archive.begin() + 1);
+                } else {
+                    histPool->archive.erase(histPool->archive.begin());
+                }
+            }
+            histPool->archive.push_back(snap);
+        }
+
+        if (args.poolSize > 0) {
+            while ((int)histPool->recent.size() >= args.poolSize && !histPool->recent.empty()) {
+                histPool->recent.erase(histPool->recent.begin());
+            }
+            histPool->recent.push_back(std::move(snap));
+        }
+    };
+
+    auto saveHistoricalPool = [&](const std::string& dir) {
+        if (!histPool || histPool->empty()) return;
+        std::string poolDir = dir + "/hist_pool";
+        std::filesystem::create_directories(poolDir);
+        std::ofstream meta(poolDir + "/pool_meta.txt");
+        if (!meta.is_open()) return;
+
+        meta << "recent_count " << histPool->recent.size() << "\n";
+        for (size_t i = 0; i < histPool->recent.size(); ++i) {
+            const auto& snap = histPool->recent[i];
+            meta << "recent " << i << " " << snap->update << "\n";
+            for (int s = 0; s < 3; ++s) {
+                snap->actor[s]->save(poolDir + "/recent_" + std::to_string(i) + "_actor" + std::to_string(s) + ".pt");
+            }
+        }
+
+        meta << "archive_count " << histPool->archive.size() << "\n";
+        for (size_t i = 0; i < histPool->archive.size(); ++i) {
+            const auto& snap = histPool->archive[i];
+            meta << "archive " << i << " " << snap->update << "\n";
+            for (int s = 0; s < 3; ++s) {
+                snap->actor[s]->save(poolDir + "/archive_" + std::to_string(i) + "_actor" + std::to_string(s) + ".pt");
+            }
+        }
+    };
+
+    auto loadHistoricalPool = [&](const std::string& dir) {
+        std::string metaPath = dir + "/hist_pool/pool_meta.txt";
+        std::ifstream meta(metaPath);
+        if (!meta.is_open()) return;
+
+        std::string tag;
+        while (meta >> tag) {
+            if (tag == "recent") {
+                size_t idx = 0;
+                int snapUpd = 0;
+                meta >> idx >> snapUpd;
+                auto snap = std::make_shared<algo::HistoricalActorSnapshot>();
+                snap->update = snapUpd;
+                for (int s = 0; s < 3; ++s) {
+                    snap->actor[s] = torch_nn::Actor(torchModelCfg);
+                    std::string actPath = dir + "/hist_pool/recent_" + std::to_string(idx) + "_actor" + std::to_string(s) + ".pt";
+                    if (std::filesystem::exists(actPath)) {
+                        snap->actor[s]->load(actPath);
+                    }
+                    snap->actor[s]->eval();
+                }
+                histPool->recent.push_back(snap);
+            } else if (tag == "archive") {
+                size_t idx = 0;
+                int snapUpd = 0;
+                meta >> idx >> snapUpd;
+                auto snap = std::make_shared<algo::HistoricalActorSnapshot>();
+                snap->update = snapUpd;
+                for (int s = 0; s < 3; ++s) {
+                    snap->actor[s] = torch_nn::Actor(torchModelCfg);
+                    std::string actPath = dir + "/hist_pool/archive_" + std::to_string(idx) + "_actor" + std::to_string(s) + ".pt";
+                    if (std::filesystem::exists(actPath)) {
+                        snap->actor[s]->load(actPath);
+                    }
+                    snap->actor[s]->eval();
+                }
+                histPool->archive.push_back(snap);
+            } else {
+                int dummy = 0;
+                meta >> dummy;
+            }
+        }
+        std::cout << "  Restored historical pool: recent=" << histPool->recent.size()
+                  << " archive=" << histPool->archive.size() << "\n";
+    };
+
+    if (!args.resume.empty()) {
+        loadHistoricalPool(args.resume);
+    }
+
     auto saveAll = [&](const std::string& dir, int currentUpd = 0) {
         std::filesystem::create_directories(dir);
         for (int s = 0; s < 3; ++s) {
@@ -321,8 +417,14 @@ int main(int argc, char** argv) {
         if (currentUpd > 0) {
             std::ofstream metaFile(dir + "/meta.txt");
             if (metaFile.is_open()) {
-                metaFile << "update " << currentUpd << "\n";
+                metaFile << "update " << currentUpd << "\n"
+                         << "seed " << args.seed << "\n"
+                         << "lr " << args.lr << "\n"
+                         << "ent " << args.ent << "\n"
+                         << "oracle_reward " << (args.oracleReward ? 1 : 0) << "\n"
+                         << "oracle_coef " << args.oracleCoef << "\n";
             }
+            saveHistoricalPool(dir);
         }
     };
 
@@ -348,163 +450,42 @@ int main(int argc, char** argv) {
                             ES_AWAYMODE_REQUIRED);
 #endif
 
-    std::shared_ptr<const algo::HistoricalPool> histPool = std::make_shared<algo::HistoricalPool>();
-    std::mutex histPoolMu;
-    auto pushHistPool = [&](std::array<torch_nn::Actor, 3>& srcActor, int currentUpdate) {
-        auto snap = std::make_shared<algo::HistoricalActorSnapshot>();
-        snap->update = currentUpdate;
-        for (int s = 0; s < 3; ++s) {
-            snap->actor[s] = torch_nn::Actor(torchModelCfg);
-            torch::NoGradGuard no_grad;
-            auto srcParams = srcActor[s]->parameters();
-            auto dstParams = snap->actor[s]->parameters();
-            for (size_t i = 0; i < srcParams.size(); ++i) {
-                dstParams[i].copy_(srcParams[i]);
-            }
-            snap->actor[s]->eval();
-        }
-        std::lock_guard<std::mutex> lock(histPoolMu);
-        auto oldPool = histPool;
-        auto newPool = std::make_shared<algo::HistoricalPool>(oldPool ? *oldPool : algo::HistoricalPool{});
-        int k = args.poolEvery > 0 ? (currentUpdate / args.poolEvery) : 0;
-        bool isPowerOfTwo = (k > 0) && ((k & (k - 1)) == 0);
-        bool isCentennial = (currentUpdate % 100 == 0);
-        if (args.archiveSize > 0 && (isPowerOfTwo || isCentennial || newPool->archive.empty())) {
-            while ((int)newPool->archive.size() >= args.archiveSize && !newPool->archive.empty()) {
-                if (newPool->archive.size() > 2) {
-                    newPool->archive.erase(newPool->archive.begin() + 1);
-                } else {
-                    newPool->archive.erase(newPool->archive.begin());
-                }
-            }
-            newPool->archive.push_back(snap);
-        }
-
-        if (args.poolSize > 0) {
-            while ((int)newPool->recent.size() >= args.poolSize && !newPool->recent.empty()) {
-                newPool->recent.erase(newPool->recent.begin());
-            }
-            newPool->recent.push_back(std::move(snap));
-        }
-        histPool = std::shared_ptr<const algo::HistoricalPool>(newPool);
-    };
-
-    struct InferPack {
-        std::array<torch_nn::Actor, 3> actor;
-        std::array<torch_nn::Critic, 3> critic;
-    };
-    auto makePack = [&]() {
-        auto p = std::make_shared<InferPack>();
-        torch::NoGradGuard no_grad;
-        for (int s = 0; s < 3; ++s) {
-            p->actor[s] = torch_nn::Actor(torchModelCfg);
-            p->critic[s] = torch_nn::Critic(torchModelCfg);
-            auto sa = actor[s]->parameters();
-            auto da = p->actor[s]->parameters();
-            for (size_t i = 0; i < sa.size(); ++i) da[i].copy_(sa[i]);
-            auto sc = critic[s]->parameters();
-            auto dc = p->critic[s]->parameters();
-            for (size_t i = 0; i < sc.size(); ++i) dc[i].copy_(sc[i]);
-            p->actor[s]->eval();
-            p->critic[s]->eval();
-        }
-        return p;
-    };
-    std::shared_ptr<InferPack> live = makePack();
-    std::mutex liveMu;
-
-    // Async Pipeline Replay Buffer (double buffering by default to strictly bound policy staleness <= 1)
-    size_t maxChunks = std::max<size_t>(2, static_cast<size_t>(args.bufferChunks));
-    algo::AsyncReplayBuffer replayBuffer(maxChunks);
-    std::atomic<bool> stopProducer{false};
-    std::atomic<long long> totalProducedTransitions{0};
-
-    // CPU Rollout Generator Threads (Continuously streaming into the replayBuffer)
-    std::thread producerThread([&]() {
-        uint64_t chunkSeed = args.seed;
-        int chunkIdx = 0;
-        while (!stopProducer.load()) {
-            std::shared_ptr<InferPack> snap;
-            {
-                std::lock_guard<std::mutex> lock(liveMu);
-                snap = live;
-            }
-            algo::ModelSet models{{&snap->actor[0], &snap->actor[1], &snap->actor[2]},
-                                  {&snap->critic[0], &snap->critic[1], &snap->critic[2]}};
-            algo::RolloutConfig rc;
-            rc.gamesPerUpdate = args.games;
-            rc.threads = args.threads;
-            rc.seed = chunkSeed + uint64_t(++chunkIdx) * 7919ULL;
-            rc.historicalProb = args.histProb;
-            rc.ruleProb = args.ruleProb;
-            rc.landlordWinMul = args.landlordWinMul;
-            rc.landlordLossMul = args.landlordLossMul;
-
-            std::shared_ptr<const algo::HistoricalPool> snapPool;
-            {
-                std::lock_guard<std::mutex> lock(histPoolMu);
-                snapPool = histPool;
-            }
-            rc.historicalPool = snapPool.get();
-
-            std::array<std::vector<algo::Transition>, 3> streams;
-            algo::RolloutStats chunkStats;
-            algo::collectRollout(models, rc, streams, chunkStats);
-
-            if (stopProducer.load()) break;
-
-            long long newSteps = 0;
-            for (int s = 0; s < 3; ++s) {
-                newSteps += streams[s].size();
-            }
-            totalProducedTransitions.fetch_add(newSteps);
-
-            algo::RolloutChunk chunk;
-            chunk.streams = std::move(streams);
-            chunk.stats = chunkStats;
-            replayBuffer.push(std::move(chunk), stopProducer);
-        }
-    });
-
-    std::cout << "Waiting for Async Buffer warmup (pre-buffering 1 chunk of " << args.games << " games)..." << std::endl;
-    replayBuffer.waitMinChunks(1, stopProducer);
-    std::cout << "Async Buffer warmup complete! Starting GPU training loop." << std::endl;
-
     std::array<algo::PPOStats, 3> ps{};
 
     for (int upd = args.startUpdate; upd <= args.updates; ++upd) {
         auto wall0 = std::chrono::steady_clock::now();
-        float progress = args.updates > 1
-                             ? float(upd - 1) / float(args.updates - 1)
-                             : 0.0f;
-        float currentLr = args.lr;
-        if (args.lrDecay) {
-            const float minLr = 1e-5f;
-            currentLr = minLr + 0.5f * (args.lr - minLr) *
-                                    (1.0f + std::cos(progress * 3.141592653589793f));
-        }
-        float currentEnt = args.ent;
-        if (args.entDecay) {
-            const float minEnt = 0.01f;
-            currentEnt = minEnt + 0.5f * (args.ent - minEnt) *
-                                       (1.0f + std::cos(progress * 3.141592653589793f));
-        }
 
-        algo::RolloutChunk currentChunk;
-        if (!replayBuffer.pop(currentChunk, stopProducer)) break;
+        // 1. Synchronous CPU self-play rollout with current models and league pool
+        algo::ModelSet models{{&actor[0], &actor[1], &actor[2]},
+                              {&critic[0], &critic[1], &critic[2]}};
+        algo::RolloutConfig rc;
+        rc.gamesPerUpdate = args.games;
+        rc.threads = args.threads;
+        rc.seed = args.seed + uint64_t(upd) * 7919ULL;
+        rc.historicalProb = args.histProb;
+        rc.historicalPool = histPool.get();
+        rc.oracleReward = args.oracleReward;
+        rc.oracleCoef = args.oracleCoef;
+        rc.landlordWinMul = args.landlordWinMul;
+        rc.landlordLossMul = args.landlordLossMul;
 
+        std::array<std::vector<algo::Transition>, 3> streams;
+        algo::RolloutStats rs;
+        algo::collectRollout(models, rc, streams, rs);
+
+        // 2. Synchronous GPU training updates
         std::array<size_t, 3> actualSamples{};
         auto tLearn0 = std::chrono::steady_clock::now();
         for (int s = 0; s < 3; ++s) {
-            const auto& seatSamples = currentChunk.streams[s];
+            const auto& seatSamples = streams[s];
             actualSamples[s] = seatSamples.size();
             if (seatSamples.empty()) continue;
 
             try {
                 auto batchTensors = torch_nn::transitionsToBatch(
                     seatSamples, args.gamma, args.lambda, torchDevice);
-                learners[s]->setLr(currentLr);
-                learners[s]->setEntCoef(currentEnt);
+                learners[s]->setLr(args.lr);
+                learners[s]->setEntCoef(args.ent);
 
                 auto torchStats = learners[s]->update(batchTensors);
                 ps[s].epochsCompleted = torchStats.epochsCompleted;
@@ -521,18 +502,10 @@ int main(int argc, char** argv) {
                                std::chrono::steady_clock::now() - tLearn0)
                                .count();
 
-        // Publish newly trained weights for background rollout workers
-        {
-            auto newPack = makePack();
-            std::lock_guard<std::mutex> lock(liveMu);
-            live = std::move(newPack);
-        }
-
         double wallSecs = std::chrono::duration<double>(
                               std::chrono::steady_clock::now() - wall0)
                               .count();
 
-        const auto& rs = currentChunk.stats;
         double wp = double(rs.landlordWins) / std::max(1, rs.games);
         double adp = double(rs.landlordScore) / std::max(1, rs.games);
         double bpg = double(rs.bombs) / std::max(1, rs.games);
@@ -547,23 +520,20 @@ int main(int argc, char** argv) {
             pureStr = pbuf;
         }
 
-        size_t qChunks = replayBuffer.size();
-
         std::printf(
-            "upd %4d | q_chunks %zu | wall %.1fs learn %.2fs "
+            "upd %4d | wall %.1fs learn %.2fs "
             "games %d mb %d ep %d,%d,%d/%d | WP %.3f ADP %7.2f%s bomb/g %.2f "
             "moves/g %.1f | lr %.2e ent %5.3f/%5.3f/%5.3f vL %7.2f/%7.2f/%7.2f "
-            "kl %.4f/%.4f/%.4f cf %.2f/%.2f/%.2f | train_n %zu/%zu/%zu | total_pushed %lld\n",
-            upd, qChunks, wallSecs, learnSecs,
+            "kl %.4f/%.4f/%.4f cf %.2f/%.2f/%.2f | train_n %zu/%zu/%zu\n",
+            upd, wallSecs, learnSecs,
             rs.games, args.minibatch,
             ps[0].epochsCompleted, ps[1].epochsCompleted, ps[2].epochsCompleted,
             args.epochs, wp, adp, pureStr.c_str(), bpg, mpg,
-            currentLr, ps[0].entropy, ps[1].entropy, ps[2].entropy,
+            args.lr, ps[0].entropy, ps[1].entropy, ps[2].entropy,
             ps[0].vLoss, ps[1].vLoss, ps[2].vLoss,
             ps[0].lastEpochKL, ps[1].lastEpochKL, ps[2].lastEpochKL,
             ps[0].clipFraction, ps[1].clipFraction, ps[2].clipFraction,
-            actualSamples[0], actualSamples[1], actualSamples[2],
-            totalProducedTransitions.load());
+            actualSamples[0], actualSamples[1], actualSamples[2]);
         std::fflush(stdout);
 
         if (args.poolEvery > 0 && upd % args.poolEvery == 0) {
@@ -613,10 +583,6 @@ int main(int argc, char** argv) {
             }
         }
     }
-
-    stopProducer.store(true);
-    replayBuffer.notifyAll();
-    if (producerThread.joinable()) producerThread.join();
 
     if (evalThread.joinable()) evalThread.join();
 

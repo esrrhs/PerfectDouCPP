@@ -74,9 +74,12 @@ struct RolloutConfig {
     uint64_t seed = 1;
     // League opponent ratios
     float historicalProb = 0.2f;  // Probability of facing a historical model snapshot
-    float ruleProb = 0.1f;        // Probability of facing heuristic rule agent
     // Pointer to read-only historical pool (if available)
     const HistoricalPool* historicalPool = nullptr;
+    // Paper Sec 4.4 Oracle step-wise dense difference reward
+    bool oracleReward = true;
+    float oracleCoef = 0.2f;
+    float shapingCap = 0.0f;      // Terminal card-count shaping (disabled by default)
     // Standard symmetric ADP payoff for landlord (2.0x base mult for zero-sum game)
     float landlordWinMul = 2.0f;
     float landlordLossMul = 2.0f;

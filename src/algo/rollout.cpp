@@ -9,7 +9,6 @@
 #include <thread>
 
 #include "ddz/oracle.h"
-#include "ddz/rule_agent.h"
 #include "torch_nn/models.h"
 
 namespace algo {
@@ -72,8 +71,7 @@ struct ThreadResult {
 
 enum PlayerType : uint8_t {
     PLAYER_LATEST = 0,
-    PLAYER_HISTORICAL = 1,
-    PLAYER_RULE = 2
+    PLAYER_HISTORICAL = 1
 };
 
 struct HistModelRef {
@@ -140,14 +138,13 @@ void runWorker(const ModelSet& models, const RolloutConfig& cfg, int nGames,
         };
 
         auto sampleSeatPlayer = [&]() -> std::pair<PlayerType, HistModelRef> {
-            float r = float((dealRng.nextU64() >> 11) / double(1ULL << 53));
-            if (r < cfg.ruleProb) {
-                return {PLAYER_RULE, HistModelRef{}};
-            } else if (hasHistPool && r < (cfg.ruleProb + cfg.historicalProb)) {
-                return {PLAYER_HISTORICAL, sampleHistRef()};
-            } else {
-                return {PLAYER_LATEST, HistModelRef{}};
+            if (hasHistPool) {
+                float r = float((dealRng.nextU64() >> 11) / double(1ULL << 53));
+                if (r < cfg.historicalProb) {
+                    return {PLAYER_HISTORICAL, sampleHistRef()};
+                }
             }
+            return {PLAYER_LATEST, HistModelRef{}};
         };
 
         // 1. Landlord camp (Seat 0)
@@ -180,8 +177,6 @@ void runWorker(const ModelSet& models, const RolloutConfig& cfg, int nGames,
 
     std::vector<int> latestGis;
     latestGis.reserve(nGames);
-    std::vector<int> ruleGis;
-    ruleGis.reserve(nGames);
     std::vector<std::pair<int, HistModelRef>> histGis;
     histGis.reserve(nGames);
 
@@ -267,15 +262,31 @@ void runWorker(const ModelSet& models, const RolloutConfig& cfg, int nGames,
                     r = float(g.payoff(s));
                 }
                 t.reward += r;
+                if (cfg.shapingCap > 0.0f) {
+                    t.reward += g.shaping(s, cfg.shapingCap);
+                }
                 t.terminal = true;
             }
         }
     };
 
+    auto oracleAdvantage = [](const Game& g) -> int {
+        int nL = minSteps(g.hand[0]);
+        int nDown = minSteps(g.hand[1]);
+        int nUp = minSteps(g.hand[2]);
+        return nL - std::min(nDown, nUp);
+    };
+
+    std::vector<int> lastAdv(nGames, 0);
+    if (cfg.oracleReward) {
+        for (int gi = 0; gi < nGames; ++gi) {
+            lastAdv[gi] = oracleAdvantage(games[gi]);
+        }
+    }
+
     while (remaining > 0) {
         for (int seat = 0; seat < 3; ++seat) {
             latestGis.clear();
-            ruleGis.clear();
             histGis.clear();
 
             for (int gi = 0; gi < nGames; ++gi) {
@@ -283,8 +294,6 @@ void runWorker(const ModelSet& models, const RolloutConfig& cfg, int nGames,
                     PlayerType pt = gameSeats[gi][seat].type;
                     if (pt == PLAYER_LATEST) {
                         latestGis.push_back(gi);
-                    } else if (pt == PLAYER_RULE) {
-                        ruleGis.push_back(gi);
                     } else {
                         histGis.emplace_back(gi, gameSeats[gi][seat].histRef);
                     }
@@ -363,6 +372,16 @@ void runWorker(const ModelSet& models, const RolloutConfig& cfg, int nGames,
                     res.stats.moves += 1;
                     if (isBombLike(concrete)) res.stats.bombs += 1;
 
+                    if (cfg.oracleReward) {
+                        int curAdv = oracleAdvantage(g);
+                        int deltaAdv = curAdv - lastAdv[gi];
+                        lastAdv[gi] = curAdv;
+                        float stepR = (seat == ddz::kLandlord)
+                                          ? (-float(deltaAdv) * cfg.oracleCoef)
+                                          : (0.5f * float(deltaAdv) * cfg.oracleCoef);
+                        res.seats[seat][storedIndex].reward += stepR;
+                    }
+
                     if (g.over) {
                         handleGameOver(gi, g);
                     }
@@ -438,26 +457,15 @@ void runWorker(const ModelSet& models, const RolloutConfig& cfg, int nGames,
                         res.stats.moves += 1;
                         if (isBombLike(concrete)) res.stats.bombs += 1;
 
+                        if (cfg.oracleReward) {
+                            lastAdv[gi] = oracleAdvantage(g);
+                        }
+
                         if (g.over) {
                             handleGameOver(gi, g);
                         }
                     }
                     start = end;
-                }
-            }
-
-            // 3. Process heuristic rule agents
-            for (int gi : ruleGis) {
-                Game& g = games[gi];
-                std::vector<CardSet> legalMoves = g.legal();
-                CardSet concrete = RuleAgent::selectMove(g, seat, legalMoves);
-
-                g.step(concrete);
-                res.stats.moves += 1;
-                if (isBombLike(concrete)) res.stats.bombs += 1;
-
-                if (g.over) {
-                    handleGameOver(gi, g);
                 }
             }
         }

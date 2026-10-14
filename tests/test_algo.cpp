@@ -505,6 +505,42 @@ void testLoadEvalDecks() {
     }
 }
 
+void testOracleDifferenceReward() {
+    torch_nn::ModelConfig mCfg{32, 16};
+    std::array<torch_nn::Actor, 3> actors{
+        torch_nn::Actor(mCfg), torch_nn::Actor(mCfg), torch_nn::Actor(mCfg)
+    };
+    std::array<torch_nn::Critic, 3> critics{
+        torch_nn::Critic(mCfg), torch_nn::Critic(mCfg), torch_nn::Critic(mCfg)
+    };
+    algo::ModelSet models{{&actors[0], &actors[1], &actors[2]},
+                          {&critics[0], &critics[1], &critics[2]}};
+
+    algo::RolloutConfig cfg;
+    cfg.gamesPerUpdate = 16;
+    cfg.threads = 2;
+    cfg.seed = 42;
+    cfg.oracleReward = true;
+    cfg.oracleCoef = 0.2f;
+
+    std::array<std::vector<algo::Transition>, 3> streams;
+    algo::RolloutStats stats;
+    algo::collectRollout(models, cfg, streams, stats);
+
+    EXPECT_GT(stats.games, 0);
+    bool hasNonZeroStepReward = false;
+    for (int s = 0; s < 3; ++s) {
+        for (const auto& t : streams[s]) {
+            if (!t.terminal && t.reward != 0.0f) {
+                hasNonZeroStepReward = true;
+                break;
+            }
+        }
+        if (hasNonZeroStepReward) break;
+    }
+    EXPECT_TRUE(hasNonZeroStepReward);
+}
+
 TEST(AlgoTest, AdvantageNormAndGAE) { testAdvantageNormAndGAE(); }
 TEST(AlgoTest, ValueClipping) { testValueClipping(); }
 TEST(AlgoTest, KLDivergence) { testKLDivergence(); }
@@ -518,3 +554,4 @@ TEST(AlgoTest, KLDivergenceNaNProtection) { testKLDivergenceNaNProtection(); }
 TEST(AlgoTest, ActorCloningAndEvalFailSafe) { testActorCloningAndEvalFailSafe(); }
 TEST(AlgoTest, MockDouZeroEvalAndDiskSnapshot) { testMockDouZeroEvalAndDiskSnapshot(); }
 TEST(AlgoTest, LoadEvalDecks) { testLoadEvalDecks(); }
+TEST(AlgoTest, OracleDifferenceReward) { testOracleDifferenceReward(); }
