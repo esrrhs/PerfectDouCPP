@@ -2,17 +2,20 @@ import subprocess
 import time
 import re
 import os
+import shutil
 from pathlib import Path
 
-# Candidates to benchmark on CUDA GPU
+# Candidates to benchmark on CUDA GPU with default model size (hidden=256, lstm=128)
+# Environment: Intel i7-6700K (4 cores, 8 threads), NVIDIA GTX 1070
 CONFIGS = [
-    {"name": "G1: games=256, th=8, mb=1024, buf=2", "games": 256, "threads": 8, "mb": 1024, "buffer_chunks": 2},
-    {"name": "G2: games=256, th=8, mb=2048, buf=2", "games": 256, "threads": 8, "mb": 2048, "buffer_chunks": 2},
-    {"name": "G3: games=512, th=8, mb=2048, buf=2", "games": 512, "threads": 8, "mb": 2048, "buffer_chunks": 2},
-    {"name": "G4: games=512, th=12, mb=2048, buf=2", "games": 512, "threads": 12, "mb": 2048, "buffer_chunks": 2},
-    {"name": "G5: games=512, th=16, mb=2048, buf=2", "games": 512, "threads": 16, "mb": 2048, "buffer_chunks": 2},
-    {"name": "G6: games=768, th=16, mb=2048, buf=2", "games": 768, "threads": 16, "mb": 2048, "buffer_chunks": 2},
-    {"name": "G7: games=768, th=16, mb=2048, buf=4", "games": 768, "threads": 16, "mb": 2048, "buffer_chunks": 4},
+    {"name": "M1: games=256, th=4, mb=2048",  "games": 256,  "threads": 4,  "mb": 2048},
+    {"name": "M2: games=256, th=8, mb=2048",  "games": 256,  "threads": 8,  "mb": 2048},
+    {"name": "M3: games=512, th=6, mb=2048",  "games": 512,  "threads": 6,  "mb": 2048},
+    {"name": "M4: games=512, th=8, mb=2048",  "games": 512,  "threads": 8,  "mb": 2048},
+    {"name": "M5: games=512, th=8, mb=4096",  "games": 512,  "threads": 8,  "mb": 4096},
+    {"name": "M6: games=768, th=6, mb=2048",  "games": 768,  "threads": 6,  "mb": 2048},
+    {"name": "M7: games=768, th=8, mb=2048",  "games": 768,  "threads": 8,  "mb": 2048},
+    {"name": "M8: games=1024, th=8, mb=2048", "games": 1024, "threads": 8,  "mb": 2048},
 ]
 
 TORCH_LIB = r"C:\Users\zx\AppData\Roaming\Python\Python314\site-packages\torch\lib"
@@ -21,7 +24,7 @@ env = os.environ.copy()
 env["PATH"] = f"{TORCH_LIB};{CUDA_BIN};" + env.get("PATH", "")
 
 def run_bench(cfg, updates=2):
-    out_dir = Path(f"ckpt_bench_tmp_{cfg['games']}_{cfg['threads']}_{cfg['mb']}_{cfg['buffer_chunks']}")
+    out_dir = Path(f"ckpt_bench_tmp_{cfg['games']}_{cfg['threads']}_{cfg['mb']}")
     cmd = [
         r".\build\perfectdou_train.exe",
         "--backend", "cuda",
@@ -29,7 +32,6 @@ def run_bench(cfg, updates=2):
         "--games", str(cfg["games"]),
         "--threads", str(cfg["threads"]),
         "--mb", str(cfg["mb"]),
-        "--buffer-chunks", str(cfg["buffer_chunks"]),
         "--epochs", "2",
         "--out", str(out_dir),
         "--no-eval"
@@ -40,7 +42,6 @@ def run_bench(cfg, updates=2):
     
     # Clean up checkpoint
     if out_dir.exists():
-        import shutil
         shutil.rmtree(out_dir, ignore_errors=True)
         
     # Parse wall time and learn time from log
@@ -70,7 +71,7 @@ def run_bench(cfg, updates=2):
 
 def main():
     print("=" * 80)
-    print("Starting CUDA GPU Training Throughput Benchmark Suite")
+    print("Clean-Room CUDA Benchmark Suite (Default Model: hidden=256, lstm=128)")
     print("=" * 80)
     results = []
     for i, cfg in enumerate(CONFIGS, 1):
@@ -81,19 +82,20 @@ def main():
             results.append(r)
             
     print("\n" + "=" * 80)
-    print("CUDA BENCHMARK SUMMARY & COMPARISON")
+    print("BENCHMARK FINAL SUMMARY & COMPARISON")
     print("=" * 80)
-    print(f"{'Config Name':<42} | {'Wall/Upd':<10} | {'Learn':<10} | {'Throughput (games/s)'}")
+    print(f"{'Config Name':<38} | {'Wall/Upd':<10} | {'Learn':<10} | {'Throughput (games/s)'}")
     print("-" * 80)
     best = None
     for r in results:
-        print(f"{r['cfg']['name']:<42} | {r['avg_wall']:>8.2f}s | {r['avg_learn']:>8.2f}s | {r['games_per_sec']:>12.2f} games/s")
+        print(f"{r['cfg']['name']:<38} | {r['avg_wall']:>8.2f}s | {r['avg_learn']:>8.2f}s | {r['games_per_sec']:>12.2f} games/s")
         if best is None or r['games_per_sec'] > best['games_per_sec']:
             best = r
             
     print("=" * 80)
     print(f"Optimal Configuration: {best['cfg']['name']}")
     print(f"Maximum Throughput:    {best['games_per_sec']:.2f} games/second")
+    print(f"Optimal Wall Time/Upd: {best['avg_wall']:.2f} seconds")
     print("=" * 80)
 
 if __name__ == "__main__":
