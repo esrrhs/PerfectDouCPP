@@ -84,8 +84,10 @@ def load_model(pos, path):
     spec = importlib.util.spec_from_file_location("dz_models", root)
     models = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(models)
-    model = models.model_dict[pos]()
-    pretrained = torch.load(path, map_location="cpu", weights_only=False)
+    try:
+        pretrained = torch.load(path, map_location="cpu", weights_only=False)
+    except TypeError:
+        pretrained = torch.load(path, map_location="cpu")
     state = model.state_dict()
     state.update({k: v for k, v in pretrained.items() if k in state})
     model.load_state_dict(state)
