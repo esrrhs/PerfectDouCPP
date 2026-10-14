@@ -43,6 +43,7 @@
 #include "torch_nn/models.h"
 #include "torch_nn/ppo_learner.h"
 #include "torch_nn/tensor_bridge.h"
+#include <torch/version.h>
 
 namespace {
 
@@ -167,6 +168,7 @@ int main(int argc, char** argv) {
         torchDevice = torch::kCUDA;
         deviceName = "GPU (CUDA)";
     } else if (args.backend == "mps") {
+#if defined(__APPLE__) && (TORCH_VERSION_MAJOR > 1 || (TORCH_VERSION_MAJOR == 1 && TORCH_VERSION_MINOR >= 12))
         if (!torch::mps::is_available()) {
             std::fprintf(stderr,
                          "Backend 'mps' requested but MPS is not available (requires macOS 12.3+ on "
@@ -175,6 +177,12 @@ int main(int argc, char** argv) {
         }
         torchDevice = torch::kMPS;
         deviceName = "GPU (MPS)";
+#else
+        std::fprintf(stderr,
+                     "Backend 'mps' requested but MPS is not supported on this platform/LibTorch build "
+                     "(requires macOS 12.3+ and LibTorch >= 1.12). Pass --backend cpu explicitly.\n");
+        return 1;
+#endif
     } else if (args.backend == "cpu") {
         torchDevice = torch::kCPU;
         deviceName = "CPU";
