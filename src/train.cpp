@@ -186,7 +186,7 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    std::cout << "PerfectDou CPP training (Async Buffer Architecture)\n";
+    std::cout << "PerfectDou CPP training (Synchronous On-Policy Architecture)\n";
     std::cout << "  Compute Device: " << deviceName << "\n";
     if (!args.resume.empty() && !hasFlag(argc, argv, "--start-update")) {
         std::string metaPath = args.resume + "/meta.txt";
@@ -269,6 +269,32 @@ int main(int argc, char** argv) {
         torch_nn::Critic(torchModelCfg)
     };
 
+    // Dedicated CPU model instances for multithreaded CPU rollout simulation
+    std::array<torch_nn::Actor, 3> cpuActor{
+        torch_nn::Actor(torchModelCfg),
+        torch_nn::Actor(torchModelCfg),
+        torch_nn::Actor(torchModelCfg)
+    };
+    std::array<torch_nn::Critic, 3> cpuCritic{
+        torch_nn::Critic(torchModelCfg),
+        torch_nn::Critic(torchModelCfg),
+        torch_nn::Critic(torchModelCfg)
+    };
+
+    auto syncWeightsToCpu = [&]() {
+        torch::NoGradGuard no_grad;
+        for (int s = 0; s < 3; ++s) {
+            auto sa = actor[s]->parameters();
+            auto da = cpuActor[s]->parameters();
+            for (size_t i = 0; i < sa.size(); ++i) da[i].copy_(sa[i]);
+            auto sc = critic[s]->parameters();
+            auto dc = cpuCritic[s]->parameters();
+            for (size_t i = 0; i < sc.size(); ++i) dc[i].copy_(sc[i]);
+            cpuActor[s]->eval();
+            cpuCritic[s]->eval();
+        }
+    };
+
     if (!args.resume.empty()) {
         for (int s = 0; s < 3; ++s) {
             std::string actPath = args.resume + "/actor" + std::to_string(s) + ".pt";
@@ -293,6 +319,8 @@ int main(int argc, char** argv) {
             }
         }
     }
+
+    syncWeightsToCpu();
 
     std::shared_ptr<algo::HistoricalPool> histPool = std::make_shared<algo::HistoricalPool>();
 
@@ -456,8 +484,8 @@ int main(int argc, char** argv) {
         auto wall0 = std::chrono::steady_clock::now();
 
         // 1. Synchronous CPU self-play rollout with current models and league pool
-        algo::ModelSet models{{&actor[0], &actor[1], &actor[2]},
-                              {&critic[0], &critic[1], &critic[2]}};
+        algo::ModelSet models{{&cpuActor[0], &cpuActor[1], &cpuActor[2]},
+                              {&cpuCritic[0], &cpuCritic[1], &cpuCritic[2]}};
         algo::RolloutConfig rc;
         rc.gamesPerUpdate = args.games;
         rc.threads = args.threads;
@@ -502,6 +530,9 @@ int main(int argc, char** argv) {
                                std::chrono::steady_clock::now() - tLearn0)
                                .count();
 
+        // 3. Sync freshly trained weights from GPU/learner back to CPU models for rollout
+        syncWeightsToCpu();
+
         double wallSecs = std::chrono::duration<double>(
                               std::chrono::steady_clock::now() - wall0)
                               .count();
@@ -537,7 +568,7 @@ int main(int argc, char** argv) {
         std::fflush(stdout);
 
         if (args.poolEvery > 0 && upd % args.poolEvery == 0) {
-            pushHistPool(actor, upd);
+            pushHistPool(cpuActor, upd);
         }
         if (args.snapshotEvery > 0 &&
             (upd % args.snapshotEvery == 0 || upd == args.updates)) {
@@ -549,7 +580,7 @@ int main(int argc, char** argv) {
             if (evalThread.joinable()) {
                 evalThread.join();
             }
-            auto cloned = algo::cloneActors(actor);
+            auto cloned = algo::cloneActors(cpuActor);
             algo::DouZeroEvalConfig evalCfg;
             evalCfg.host = args.evalHost;
             evalCfg.port = args.evalPort;
