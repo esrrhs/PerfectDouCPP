@@ -84,6 +84,7 @@ def load_model(pos, path):
     spec = importlib.util.spec_from_file_location("dz_models", root)
     models = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(models)
+    model = models.model_dict[pos]()
     try:
         pretrained = torch.load(path, map_location="cpu", weights_only=False)
     except TypeError:
