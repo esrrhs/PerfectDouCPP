@@ -128,7 +128,10 @@ ctest --test-dir build --output-on-failure
 如需在训练过程中定期与官方 DouZero-ADP 进行基准对抗评测，先启动基于 TCP 的 DouZero 推理服务（纯 CPU 即可运行，不占用训练 GPU）：
 
 ```bash
-# 准备 third_party/DouZero 与 baselines/douzero_ADP/*.ckpt
+# 方式 A（推荐，一键封装脚本，自动配置环境与纯 CPU 隔离）：
+python tools/run_douzero_serve.py
+
+# 方式 B（手动配置环境变量与参数）：
 export PYTHONPATH=third_party/DouZero   # Windows: set PYTHONPATH=...
 python tools/douzero_serve.py --port 18765 --ckpt-dir baselines/douzero_ADP
 ```
@@ -152,7 +155,29 @@ python tools/douzero_serve.py --port 18765 --ckpt-dir baselines/douzero_ADP
 > - **Apple Silicon (macOS)**：使用 `--backend mps` 调用 Metal GPU 加速；
 > - **纯 CPU 平台**：使用 `--backend cpu`。
 
-### 3. 训练日志与监控指标
+### 3. 一键后台全自动化运行与停止（推荐）
+
+项目在 `scripts/` 下内置了多进程后台运行、日志重定向、自适应断点续训与自动化监控脚本（跨平台支持 Linux 与 Windows）：
+
+```bash
+# Linux 平台：
+# 自动启动 DouZero 服务端 + 启动胜率监视绘图 + 自动探测 meta.txt 断点续训 / 启动训练
+bash scripts/run_all_linux.sh
+
+# 查看实时训练日志
+tail -f train.log
+
+# 一键安全停止全部关联服务与训练进程
+bash scripts/stop_all_linux.sh
+```
+
+```bat
+:: Windows 平台：
+scripts\run_all_detached.bat   :: 后台脱机拉起所有服务
+scripts\stop_all.bat            :: 一键停止
+```
+
+### 4. 训练日志与监控指标
 
 训练过程中每轮输出结构化监控日志：
 
@@ -167,7 +192,7 @@ upd  500 | wall 3.8s learn 0.42s games 768 mb 2048 ep 2,2,2/2 | WP 0.532 ADP   0
 - **kl / cf**：近似 KL 散度与 PPO 策略裁剪触发比例；
 - **[eval uX]**：后台 DouZero 评测的对局统计，包含总胜率、地主胜率与农民胜率。
 
-### 4. 胜率趋势图实时渲染与 A/B 对照
+### 5. 胜率趋势图实时渲染与 A/B 对照
 
 使用绘图脚本随时根据评测追加的 CSV 渲染胜率与 ADP 变化曲线：
 
@@ -217,6 +242,26 @@ python tools/plot_eval.py \
 ### 4. 保持固定的探索性与平稳学习率
 * 斗地主自对弈博弈空间极大，取消硬编码的余弦退火、保持适度的策略熵系数（默认 `0.03`）能防止策略过早收敛到局部僵化的打法；配合分层历史联赛池（20% 概率抽查历史模型），有效避免策略循环相克。
 
+### 5. 规范的断点续训姿势（Checkpoint Resumption Tips）
+代码在最新同步 On-Policy 架构下，底层状态持久化与恢复机制已非常完备。在实际使用和命令行调用时，遵循以下规范能确保 100% 无缝续接：
+* **核心黄金法则**：  
+  > **断点续训时，使用当初启动训练的完全相同的参数，仅在末尾追加 `--resume <DIR>`。**
+  ```bash
+  # 示例：初次训练命令
+  ./build/perfectdou_train --backend cuda --updates 100000 --threads 6 --games 768 --out ckpt_long
+
+  # 示例：断点无缝续训命令（保持相同参数，仅追加 --resume）
+  ./build/perfectdou_train --backend cuda --updates 100000 --threads 6 --games 768 --out ckpt_long --resume ckpt_long
+  ```
+* **为什么需要显式保持命令行参数一致？**  
+  检查点元数据文件 `meta.txt` 记录了当前轮次，续训时会自动解析出真实的恢复轮次（例如上次在 100 轮落盘，本次自动从 `startUpdate = 101` 启动）。**代码故意没有用存档强行锁死其他超参数**，以保留用户根据实验进展动态调参的自由度（如微调 `--lr` 或将总轮次 `--updates` 从 1000 延长到 50000）。因此若不传递原参数，未显式指定的参数会回退为代码默认值（例如未指定 `--out` 会落回默认目录 `ckpt_long`；未指定 `--updates` 若当前步数已达默认值则会立刻退出）。
+* **发牌序列与对弈一致性已彻底对齐**：  
+  在最新同步架构中，发牌随机种子严格按当前轮次确定性推导（`rc.seed = seed + upd * 7919ULL`）。只要保持 `--seed` 和 `--threads` 不变，断点续训第 1 轮所随机发出的牌，与“不中断、一路连续训练”到该轮所发的牌**完全一致**（彻底消除了旧版本异步缓冲架构下续训重复第 1 轮旧牌的问题）。
+* **全要素状态无损衔接**：  
+  断点加载时会自动读取 3 座位的 Actor/Critic 权重、Adam 优化器一阶/二阶动量（`opt` 文件）以及自博弈历史对手池（`hist_pool/`）；同时 DouZero 评测日志 `eval_vs_douzero.csv` 会以追加模式（append）持续记录，训练与评测曲线完全无缝连接。
+* **自适应开箱即用**：  
+  项目内置的后台脚本 `scripts/run_all_linux.sh` 已集成了自适应断点检测：当检测到目标输出目录下存在 `meta.txt` 时，会自动注入 `--resume` 标识，无需手动改动脚本。
+
 ---
 
 ## 常用训练参数参考
@@ -224,9 +269,11 @@ python tools/plot_eval.py \
 | 参数 | 默认值 | 作用与建议 |
 | :--- | :--- | :--- |
 | `--backend <B>` | `cpu` | **硬件加速后端（可选 `cuda` / `mps` / `cpu`）** |
+| `--out <DIR>` | `ckpt_long` | **训练产物输出路径（模型权重、优化器动量、历史池与评测日志）** |
 | `--updates N` | 100000 | 训练总更新步数 |
 | `--games N` | 768 | 每次更新多线程收集的对局数（推荐 512～1024） |
 | `--threads N` | CPU核数 | 自对弈并发采样线程数 |
+| `--seed <S>` | 1 | 全局随机种子（保持一致可确保发牌与采样序列确定性重现） |
 | `--hidden H` | 256 | MLP 隐层神经元宽度（标准 PerfectDou 规模） |
 | `--lstm-hidden H`| 128 | LSTM 隐层时序特征维度 |
 | `--epochs N` | 2 | 每次更新每批数据的 PPO 迭代轮数 |
@@ -254,11 +301,12 @@ python tools/plot_eval.py \
 ## 目录结构
 
 ```
+scripts/       一键后台运行、停止与评测监视自动化脚本 (Linux: run_all_linux.sh, stop_all_linux.sh | Windows: run_all_detached.bat, stop_all.bat)
 src/ddz/       出牌规则、15 种牌型判定/生成、621 维抽象动作空间、Oracle 记忆化求解器、特征工程
 src/torch_nn/  基于 LibTorch 的神经网络（LSTM、Actor、Critic）、PPO 学习器、张量桥接与参数持久化
 src/algo/      自对弈 Rollout 采集器、GAE 优势估计、分层对手池管理、内置 DouZero 对战评测驱动
 src/           训练主入口 train.cpp、独立评测入口 eval_douzero.cpp
-tools/         DouZero TCP 服务端 douzero_serve.py、胜率曲线绘制 plot_eval.py、评测牌堆转换 convert_eval_data.py
+tools/         DouZero TCP 服务端 douzero_serve.py (及封装脚本 run_douzero_serve.py)、胜率曲线绘制 plot_eval.py、吞吐基准测试 benchmark_throughput.py、评测牌堆转换 convert_eval_data.py
 tests/         Google Test 单元测试套件（规则、自对弈、前后向计算、PPO 算法、防爆熔断、Mock 评测）
 ```
 
