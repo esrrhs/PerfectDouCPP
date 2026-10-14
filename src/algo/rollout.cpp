@@ -137,41 +137,37 @@ void runWorker(const ModelSet& models, const RolloutConfig& cfg, int nGames,
             }
         };
 
-        auto sampleSeatPlayer = [&]() -> std::pair<PlayerType, HistModelRef> {
-            if (hasHistPool) {
-                float r = float((dealRng.nextU64() >> 11) / double(1ULL << 53));
-                if (r < cfg.historicalProb) {
-                    return {PLAYER_HISTORICAL, sampleHistRef()};
+        // Explicitly decide if this game faces a historical opponent.
+        // Guarantees exact historicalProb distribution and ensures at least one learning camp in every game.
+        if (hasHistPool) {
+            float r = float((dealRng.nextU64() >> 11) / double(1ULL << 53));
+            if (r < cfg.historicalProb) {
+                HistModelRef histRef = sampleHistRef();
+                // 50% chance: Landlord is LATEST vs Peasant team HISTORICAL
+                // 50% chance: Peasant team is LATEST vs Landlord HISTORICAL
+                if ((dealRng.nextU64() & 1) == 0) {
+                    gameSeats[gi][0].type = PLAYER_LATEST;
+                    gameSeats[gi][0].histRef = HistModelRef{};
+                    gameSeats[gi][1].type = PLAYER_HISTORICAL;
+                    gameSeats[gi][1].histRef = histRef;
+                    gameSeats[gi][2].type = PLAYER_HISTORICAL;
+                    gameSeats[gi][2].histRef = histRef;
+                } else {
+                    gameSeats[gi][0].type = PLAYER_HISTORICAL;
+                    gameSeats[gi][0].histRef = histRef;
+                    gameSeats[gi][1].type = PLAYER_LATEST;
+                    gameSeats[gi][1].histRef = HistModelRef{};
+                    gameSeats[gi][2].type = PLAYER_LATEST;
+                    gameSeats[gi][2].histRef = HistModelRef{};
                 }
+                continue;
             }
-            return {PLAYER_LATEST, HistModelRef{}};
-        };
+        }
 
-        // 1. Landlord camp (Seat 0)
-        auto [lType, lHistRef] = sampleSeatPlayer();
-        gameSeats[gi][0].type = lType;
-        gameSeats[gi][0].histRef = lHistRef;
-
-        // 2. Peasant camp (Seat 1 & 2): coupled teammate sampling
-        auto [pType, pHistRef] = sampleSeatPlayer();
-        gameSeats[gi][1].type = pType;
-        gameSeats[gi][1].histRef = pHistRef;
-        gameSeats[gi][2].type = pType;
-        gameSeats[gi][2].histRef = pHistRef;
-
-        // Guarantee at least one seat is learning (PLAYER_LATEST)
-        if (gameSeats[gi][0].type != PLAYER_LATEST &&
-            gameSeats[gi][1].type != PLAYER_LATEST &&
-            gameSeats[gi][2].type != PLAYER_LATEST) {
-            if ((dealRng.nextU64() & 1) == 0) {
-                gameSeats[gi][0].type = PLAYER_LATEST;
-                gameSeats[gi][0].histRef = HistModelRef{};
-            } else {
-                gameSeats[gi][1].type = PLAYER_LATEST;
-                gameSeats[gi][1].histRef = HistModelRef{};
-                gameSeats[gi][2].type = PLAYER_LATEST;
-                gameSeats[gi][2].histRef = HistModelRef{};
-            }
+        // Pure self-play: all 3 seats are PLAYER_LATEST
+        for (int s = 0; s < 3; ++s) {
+            gameSeats[gi][s].type = PLAYER_LATEST;
+            gameSeats[gi][s].histRef = HistModelRef{};
         }
     }
 
@@ -298,6 +294,13 @@ void runWorker(const ModelSet& models, const RolloutConfig& cfg, int nGames,
                         histGis.emplace_back(gi, gameSeats[gi][seat].histRef);
                     }
                 }
+            }
+
+            if (histGis.size() > 1) {
+                std::sort(histGis.begin(), histGis.end(),
+                          [](const auto& a, const auto& b) {
+                              return a.second < b.second;
+                          });
             }
 
             // 1. Process latest players (batched LibTorch forward)
