@@ -70,6 +70,7 @@ Testing/
 .cache/
 ckpt/
 ckpt_*/
+models/
 eval_runs/
 logs/
 third_party/
